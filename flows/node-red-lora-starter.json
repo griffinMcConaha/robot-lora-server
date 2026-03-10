@@ -1,0 +1,74 @@
+[
+  {
+    "id": "tab_robot_lora",
+    "type": "tab",
+    "label": "Robot LoRa Server",
+    "disabled": false,
+    "info": "Starter flow to forward parsed LoRa telemetry to local server"
+  },
+  {
+    "id": "inject_sample",
+    "type": "inject",
+    "z": "tab_robot_lora",
+    "name": "Sample Telemetry",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"robot\":{\"lat\":41.0762,\"lon\":-81.5139,\"heading\":0.0,\"speed\":0.2},\"source\":\"lora\"}",
+    "payloadType": "json",
+    "x": 170,
+    "y": 100,
+    "wires": [["http_telemetry"]]
+  },
+  {
+    "id": "http_telemetry",
+    "type": "http request",
+    "z": "tab_robot_lora",
+    "name": "POST /api/telemetry",
+    "method": "POST",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "http://localhost:8080/api/telemetry",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [
+      {
+        "keyType": "Content-Type",
+        "keyValue": "application/json",
+        "valueType": "application/json",
+        "valueValue": ""
+      }
+    ],
+    "x": 430,
+    "y": 100,
+    "wires": [["debug_out"]]
+  },
+  {
+    "id": "debug_out",
+    "type": "debug",
+    "z": "tab_robot_lora",
+    "name": "Server Response",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 690,
+    "y": 100,
+    "wires": []
+  }
+]
