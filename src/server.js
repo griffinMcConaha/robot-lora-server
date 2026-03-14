@@ -12,6 +12,7 @@ const { findPath } = require('./pathing');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
+app.use(express.text({ type: 'text/*', limit: '256kb' }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -23,7 +24,107 @@ const state = {
   robot: null,
   trail: [],
   lastPath: [],
+  lastCommand: null,
+  lastCommandAt: 0,
+  lastFault: null,
 };
+
+function parseMaybeJson(value) {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return value;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeCommand(raw) {
+  if (typeof raw !== 'string') return null;
+  // Strip optional CMD: prefix (STM32 LoRa protocol uses CMD:AUTO, CMD:MANUAL, etc.)
+  let token = raw.trim().toUpperCase();
+  if (token.startsWith('CMD:')) token = token.slice(4).trim();
+  // Strip SALT/BRINE params (e.g. AUTO,SALT:25,BRINE:75 -> AUTO)
+  const commaIdx = token.indexOf(',');
+  if (commaIdx !== -1) token = token.slice(0, commaIdx).trim();
+  if (!token) return null;
+
+  const aliases = {
+    FWD: 'FORWARD',
+    FORWARD: 'FORWARD',
+    BACK: 'BACKWARD',
+    BACKWARD: 'BACKWARD',
+    LEFT: 'LEFT',
+    RIGHT: 'RIGHT',
+    STOP: 'STOP',
+    PAUSE: 'PAUSE',
+    AUTO: 'AUTO',
+    MANUAL: 'MANUAL',
+    ESTOP: 'ESTOP',
+    RESET: 'RESET',   // clears ESTOP/ERROR latch → PAUSE
+  };
+
+  return aliases[token] ?? token;
+}
+
+function parseIncomingTelemetry(payload) {
+  let body = parseMaybeJson(payload) ?? {};
+
+  // Base station wraps last LoRa RX into a string field: {"last_lora":"<json>"}
+  // Unwrap and re-parse so we treat it like direct telemetry.
+  if (typeof body?.last_lora === 'string' && body.last_lora.trim().startsWith('{')) {
+    const inner = parseMaybeJson(body.last_lora);
+    if (inner && typeof inner === 'object') body = inner;
+  }
+
+  // Fault notification: {"fault":"IMU_TIMEOUT","action":"ESTOP"}
+  if (typeof body?.fault === 'string') {
+    return {
+      robot: null,
+      isFault: true,
+      fault: String(body.fault),
+      action: String(body.action ?? 'UNKNOWN'),
+      source: 'lora-fault',
+      raw: body,
+    };
+  }
+
+  if (body?.robot && typeof body.robot.lat === 'number' && typeof body.robot.lon === 'number') {
+    return {
+      robot: {
+        lat: body.robot.lat,
+        lon: body.robot.lon,
+        heading: Number(body.robot.heading ?? body.heading?.yaw ?? 0),
+        speed: Number(body.robot.speed ?? 0),
+      },
+      source: String(body.source ?? 'unknown'),
+      stateName: typeof body.state === 'string' ? body.state : null,
+      raw: body,
+    };
+  }
+
+  if (body?.gps && typeof body.gps.lat === 'number' && typeof body.gps.lon === 'number') {
+    const motorM1 = Number(body.motor?.m1 ?? 0);
+    const motorM2 = Number(body.motor?.m2 ?? 0);
+    const approxSpeed = Math.abs((motorM1 + motorM2) / 2) / 100;
+
+    return {
+      robot: {
+        lat: body.gps.lat,
+        lon: body.gps.lon,
+        heading: Number(body.heading?.yaw ?? 0),
+        speed: Number(body.speed ?? approxSpeed),
+      },
+      source: String(body.source ?? 'lora'),
+      stateName: typeof body.state === 'string' ? body.state : null,
+      raw: body,
+    };
+  }
+
+  return null;
+}
 
 function publish(event, payload) {
   const packet = JSON.stringify({ event, payload, at: Date.now() });
@@ -58,11 +159,53 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'robot-lora-server' });
 });
 
+app.get('/status', (_req, res) => {
+  res.json({
+    battery: 85,
+    state: state.robot?.state ?? 'IDLE',
+    mode: 'SERVER',
+    last_cmd: state.lastCommand,
+    last_fault: state.lastFault ?? null,
+    robot: state.robot
+      ? {
+          lat: state.robot.lat,
+          lon: state.robot.lon,
+          heading: state.robot.heading,
+          speed: state.robot.speed,
+          source: state.robot.source,
+          at: state.robot.timestampMs,
+        }
+      : null,
+  });
+});
+
+app.post('/command', (req, res) => {
+  const parsedBody = parseMaybeJson(req.body);
+  const rawCmd =
+    (typeof parsedBody === 'object' && parsedBody !== null && typeof parsedBody.cmd === 'string' && parsedBody.cmd) ||
+    (typeof parsedBody === 'string' && parsedBody) ||
+    (typeof req.body === 'string' && req.body) ||
+    null;
+
+  const cmd = normalizeCommand(rawCmd);
+  if (!cmd) {
+    return res.status(400).send('Missing cmd');
+  }
+
+  state.lastCommand = cmd;
+  state.lastCommandAt = Date.now();
+  publish('command.received', { cmd, at: state.lastCommandAt });
+
+  return res.type('text/plain').send('OK');
+});
+
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
     service: 'robot-lora-server',
     endpoints: [
+      'GET /status',
+      'POST /command',
       'GET /api/health',
       'POST /api/input-area',
       'POST /api/telemetry',
@@ -98,22 +241,27 @@ app.post('/api/input-area', (req, res) => {
 });
 
 app.post('/api/telemetry', (req, res) => {
-  if (!state.coverage) {
-    return res.status(400).json({ ok: false, error: 'input area is not initialized' });
+  const parsed = parseIncomingTelemetry(req.body);
+  if (!parsed) {
+    return res.status(400).json({ ok: false, error: 'Unsupported telemetry payload' });
   }
 
-  const { robot, source = 'unknown' } = req.body ?? {};
-  if (!robot || typeof robot.lat !== 'number' || typeof robot.lon !== 'number') {
-    return res.status(400).json({ ok: false, error: 'robot.lat/lon required' });
+  // Handle fault notification separately — don't overwrite robot position.
+  if (parsed.isFault) {
+    state.lastFault = { fault: parsed.fault, action: parsed.action, at: Date.now() };
+    publish('fault.received', { fault: parsed.fault, action: parsed.action, at: state.lastFault.at });
+    return res.json({ ok: true, fault: parsed.fault, action: parsed.action });
   }
 
   state.robot = {
-    lat: robot.lat,
-    lon: robot.lon,
-    heading: Number(robot.heading ?? 0),
-    speed: Number(robot.speed ?? 0),
-    source,
+    lat: parsed.robot.lat,
+    lon: parsed.robot.lon,
+    heading: parsed.robot.heading,
+    speed: parsed.robot.speed,
+    source: parsed.source,
+    state: parsed.stateName ?? state.robot?.state ?? 'IDLE',
     timestampMs: Date.now(),
+    raw: parsed.raw,
   };
 
   state.trail.push({ lat: state.robot.lat, lon: state.robot.lon, t: state.robot.timestampMs });
@@ -121,8 +269,11 @@ app.post('/api/telemetry', (req, res) => {
     state.trail = state.trail.slice(-5000);
   }
 
-  markCoverage(state.coverage, state.robot, 1.5, state.robot.timestampMs);
-  const stats = coverageStats(state.coverage);
+  let stats = null;
+  if (state.coverage) {
+    markCoverage(state.coverage, state.robot, 1.5, state.robot.timestampMs);
+    stats = coverageStats(state.coverage);
+  }
 
   publish('telemetry.updated', { robot: state.robot, coverage: stats });
 
