@@ -7,7 +7,26 @@ const {
   markCoverage,
   coverageStats,
 } = require('./coverage');
+const { latLonToLocal } = require('./geo');
 const { findPath } = require('./pathing');
+const {
+  ROBOT_STATE,
+  CMD,
+  CMD_ALIASES,
+  FAULT_CODE,
+  FAULT_ACTION,
+  MISSION_STATE,
+  EVENT_TYPE,
+  WS_EVENT,
+  API,
+  LORA_WIRE,
+} = require('./contracts');
+const db      = require('./db');
+const mission = require('./mission');
+const bridge  = require('./lora_bridge');
+
+// Publish mission transitions over WebSocket
+mission.onTransition((m) => publish(WS_EVENT.MISSION_UPDATED, m));
 
 const app = express();
 app.use(cors());
@@ -16,6 +35,11 @@ app.use(express.text({ type: 'text/*', limit: '256kb' }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
+
+const SUPERVISION_TELEMETRY_STALE_MS = Number(process.env.SUPERVISION_TELEMETRY_STALE_MS ?? 15000);
+const MAX_INPUT_AREA_CELLS = Number(process.env.MAX_INPUT_AREA_CELLS ?? 60000);
+const MIN_INPUT_AREA_CELL_SIZE_M = Number(process.env.MIN_INPUT_AREA_CELL_SIZE_M ?? 1.0);
+const MAX_INPUT_AREA_CELL_SIZE_M = Number(process.env.MAX_INPUT_AREA_CELL_SIZE_M ?? 8.0);
 
 const state = {
   baseStation: null,
@@ -27,7 +51,16 @@ const state = {
   lastCommand: null,
   lastCommandAt: 0,
   lastFault: null,
+  operator: createOperatorState(),
 };
+
+const DRIVE_COMMANDS = new Set([
+  CMD.FORWARD,
+  CMD.BACKWARD,
+  CMD.LEFT,
+  CMD.RIGHT,
+  CMD.STOP,
+]);
 
 function parseMaybeJson(value) {
   if (typeof value !== 'string') return value;
@@ -52,21 +85,485 @@ function normalizeCommand(raw) {
   if (!token) return null;
 
   const aliases = {
-    FWD: 'FORWARD',
-    FORWARD: 'FORWARD',
-    BACK: 'BACKWARD',
-    BACKWARD: 'BACKWARD',
-    LEFT: 'LEFT',
-    RIGHT: 'RIGHT',
-    STOP: 'STOP',
-    PAUSE: 'PAUSE',
-    AUTO: 'AUTO',
-    MANUAL: 'MANUAL',
-    ESTOP: 'ESTOP',
-    RESET: 'RESET',   // clears ESTOP/ERROR latch → PAUSE
+    ...CMD_ALIASES,
+    ...Object.fromEntries(Object.values(CMD).map((v) => [v, v])),
   };
 
   return aliases[token] ?? token;
+}
+
+function currentMissionState() {
+  return mission.publicMission()?.state ?? MISSION_STATE.IDLE;
+}
+
+function isWaypointCommand(cmd) {
+  return cmd === LORA_WIRE.WP_CLEAR ||
+    cmd.startsWith(`${LORA_WIRE.WP_ADD}:`) ||
+    cmd.startsWith(`${LORA_WIRE.WP_LOAD}:`);
+}
+
+function getCoveragePct(stats) {
+  return Number(stats?.coveredPct ?? stats?.coveragePercent ?? 0);
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function estimateGridCellCount(boundaryLatLon, cellSizeM) {
+  if (!Array.isArray(boundaryLatLon) || boundaryLatLon.length < 3 || !Number.isFinite(cellSizeM) || cellSizeM <= 0) {
+    return { width: 1, height: 1, cells: 1 };
+  }
+
+  const origin = {
+    lat: boundaryLatLon[0].lat,
+    lon: boundaryLatLon[0].lon,
+  };
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  for (const point of boundaryLatLon) {
+    const local = latLonToLocal(point, origin);
+    minX = Math.min(minX, local.x);
+    minY = Math.min(minY, local.y);
+    maxX = Math.max(maxX, local.x);
+    maxY = Math.max(maxY, local.y);
+  }
+
+  const width = Math.max(1, Math.ceil((maxX - minX) / cellSizeM));
+  const height = Math.max(1, Math.ceil((maxY - minY) / cellSizeM));
+  return { width, height, cells: width * height };
+}
+
+function resolveInputAreaCellSize(boundaryLatLon, requestedCellSizeM) {
+  const requested = Number.isFinite(requestedCellSizeM)
+    ? clampNumber(requestedCellSizeM, MIN_INPUT_AREA_CELL_SIZE_M, MAX_INPUT_AREA_CELL_SIZE_M)
+    : 2.0;
+
+  const firstEstimate = estimateGridCellCount(boundaryLatLon, requested);
+  if (firstEstimate.cells <= MAX_INPUT_AREA_CELLS) {
+    return {
+      requestedCellSizeM: requested,
+      effectiveCellSizeM: requested,
+      adjusted: false,
+      estimatedCells: firstEstimate.cells,
+    };
+  }
+
+  const scale = Math.sqrt(firstEstimate.cells / MAX_INPUT_AREA_CELLS);
+  const effectiveCellSizeM = clampNumber(requested * scale, requested, MAX_INPUT_AREA_CELL_SIZE_M);
+  const secondEstimate = estimateGridCellCount(boundaryLatLon, effectiveCellSizeM);
+
+  return {
+    requestedCellSizeM: requested,
+    effectiveCellSizeM,
+    adjusted: effectiveCellSizeM > requested,
+    estimatedCells: secondEstimate.cells,
+  };
+}
+
+function createOperatorState() {
+  return {
+    workflowAcks: {},
+    notes: [],
+  };
+}
+
+function resetOperatorState() {
+  state.operator = createOperatorState();
+}
+
+function telemetryAgeMs(now = Date.now()) {
+  if (!state.robot?.timestampMs) return null;
+  return Math.max(0, now - state.robot.timestampMs);
+}
+
+function isTelemetryStale(now = Date.now()) {
+  const ageMs = telemetryAgeMs(now);
+  return ageMs == null ? true : ageMs > SUPERVISION_TELEMETRY_STALE_MS;
+}
+
+function getWorkflowAck(workflowId, stepId) {
+  return state.operator.workflowAcks[workflowId]?.[stepId] ?? null;
+}
+
+function setWorkflowAck(workflowId, stepId, checked, meta = {}) {
+  if (!state.operator.workflowAcks[workflowId]) {
+    state.operator.workflowAcks[workflowId] = {};
+  }
+
+  if (!checked) {
+    delete state.operator.workflowAcks[workflowId][stepId];
+    if (Object.keys(state.operator.workflowAcks[workflowId]).length === 0) {
+      delete state.operator.workflowAcks[workflowId];
+    }
+    return null;
+  }
+
+  const ack = {
+    checked: true,
+    actor: meta.actor ?? 'operator',
+    note: meta.note ?? null,
+    at: Date.now(),
+  };
+  state.operator.workflowAcks[workflowId][stepId] = ack;
+  return ack;
+}
+
+function addOperatorNote({ text, category = 'general', actor = 'operator' }) {
+  const note = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    text,
+    category,
+    actor,
+    at: Date.now(),
+  };
+
+  state.operator.notes.push(note);
+  if (state.operator.notes.length > 100) {
+    state.operator.notes = state.operator.notes.slice(-100);
+  }
+  mission.addNote(`[${category}] ${actor}: ${text}`);
+  db.logEvent(mission.currentId(), EVENT_TYPE.OPERATOR_NOTE_ADDED, note);
+  return note;
+}
+
+function buildAllowedActions() {
+  const missionState = currentMissionState();
+  const wpPushState = bridge.getStatus().wpPushState;
+  const actions = [
+    { id: 'input-area', enabled: true, reason: null },
+    { id: 'path-plan', enabled: Boolean(state.coverage), reason: state.coverage ? null : 'Area is not configured' },
+    {
+      id: 'push-waypoints',
+      enabled: [MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && state.lastPath.length > 0,
+      reason: state.lastPath.length > 0 ? null : 'Path plan is required before waypoint push',
+    },
+    {
+      id: 'mission-start',
+      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || state.lastPath.length > 0),
+      reason: missionState === MISSION_STATE.CONFIGURING ? null : 'Mission must be CONFIGURING',
+    },
+    { id: 'mission-pause', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
+    { id: 'mission-resume', enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed', reason: missionState === MISSION_STATE.PAUSED ? null : 'Mission is not PAUSED' },
+    { id: 'mission-abort', enabled: [MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(missionState), reason: null },
+    { id: 'mission-complete', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
+    { id: 'command-manual', enabled: true, reason: null },
+    {
+      id: 'command-reset',
+      enabled: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
+      reason: null,
+    },
+  ];
+
+  return actions;
+}
+
+function buildAlerts(now = Date.now()) {
+  const alerts = [];
+  const missionState = currentMissionState();
+  const wpPushState = bridge.getStatus().wpPushState;
+  const ageMs = telemetryAgeMs(now);
+
+  if (!state.coverage) {
+    alerts.push({ level: 'warning', code: 'AREA_UNCONFIGURED', message: 'Input area has not been configured.' });
+  }
+  if (missionState === MISSION_STATE.CONFIGURING && state.lastPath.length === 0) {
+    alerts.push({ level: 'warning', code: 'PATH_MISSING', message: 'Mission has no planned path yet.' });
+  }
+  if ([MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && wpPushState !== 'committed') {
+    alerts.push({ level: 'warning', code: 'WAYPOINTS_UNCOMMITTED', message: 'Waypoints are not committed to the robot.' });
+  }
+  if (missionState === MISSION_STATE.RUNNING && isTelemetryStale(now)) {
+    alerts.push({
+      level: 'critical',
+      code: 'TELEMETRY_STALE',
+      message: ageMs == null
+        ? 'No telemetry received while mission is RUNNING.'
+        : `Telemetry is stale (${ageMs} ms since last update).`,
+    });
+  }
+  if (state.lastFault) {
+    alerts.push({
+      level: state.lastFault.action === FAULT_ACTION.ESTOP ? 'critical' : 'warning',
+      code: 'LAST_FAULT',
+      message: `Last fault ${state.lastFault.fault} requested ${state.lastFault.action}.`,
+      at: state.lastFault.at,
+    });
+  }
+
+  return alerts;
+}
+
+function buildOperatorWorkflows() {
+  const missionState = currentMissionState();
+  const wpPushState = bridge.getStatus().wpPushState;
+  const hasArea = Boolean(state.coverage);
+  const hasPath = state.lastPath.length > 0;
+  const latestNote = state.operator.notes.at(-1) ?? null;
+
+  const workflows = [
+    {
+      id: 'preflight',
+      title: 'Preflight',
+      active: [MISSION_STATE.IDLE, MISSION_STATE.CONFIGURING].includes(missionState),
+      steps: [
+        { id: 'area-configured', title: 'Area configured', kind: 'derived', checked: hasArea, ready: true },
+        { id: 'path-planned', title: 'Path planned', kind: 'derived', checked: hasPath, ready: hasArea },
+        { id: 'waypoints-committed', title: 'Waypoints committed', kind: 'derived', checked: wpPushState === 'committed', ready: hasPath },
+        {
+          id: 'radio-check',
+          title: 'Operator radio check complete',
+          kind: 'manual',
+          checked: Boolean(getWorkflowAck('preflight', 'radio-check')?.checked),
+          ready: hasArea,
+          ack: getWorkflowAck('preflight', 'radio-check'),
+        },
+        {
+          id: 'area-clear',
+          title: 'Operator confirmed area is clear',
+          kind: 'manual',
+          checked: Boolean(getWorkflowAck('preflight', 'area-clear')?.checked),
+          ready: hasArea,
+          ack: getWorkflowAck('preflight', 'area-clear'),
+        },
+      ],
+    },
+    {
+      id: 'recovery',
+      title: 'Recovery',
+      active: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState) || Boolean(state.lastFault),
+      steps: [
+        {
+          id: 'fault-reviewed',
+          title: 'Fault reviewed by operator',
+          kind: 'manual',
+          checked: Boolean(getWorkflowAck('recovery', 'fault-reviewed')?.checked),
+          ready: Boolean(state.lastFault),
+          ack: getWorkflowAck('recovery', 'fault-reviewed'),
+        },
+        {
+          id: 'field-clear',
+          title: 'Field clearance confirmed',
+          kind: 'manual',
+          checked: Boolean(getWorkflowAck('recovery', 'field-clear')?.checked),
+          ready: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
+          ack: getWorkflowAck('recovery', 'field-clear'),
+        },
+        {
+          id: 'reset-eligible',
+          title: 'Reset is allowed',
+          kind: 'derived',
+          checked: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
+          ready: true,
+        },
+      ],
+    },
+    {
+      id: 'shutdown',
+      title: 'Shutdown',
+      active: [MISSION_STATE.COMPLETED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR, MISSION_STATE.IDLE].includes(missionState),
+      steps: [
+        {
+          id: 'mission-safe',
+          title: 'Mission in safe terminal state',
+          kind: 'derived',
+          checked: [MISSION_STATE.COMPLETED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR, MISSION_STATE.IDLE].includes(missionState),
+          ready: true,
+        },
+        {
+          id: 'note-entered',
+          title: 'Operator shutdown note entered',
+          kind: 'derived',
+          checked: Boolean(latestNote),
+          ready: true,
+        },
+      ],
+    },
+  ];
+
+  return workflows.map((workflow) => ({
+    ...workflow,
+    complete: workflow.steps.every((step) => step.checked),
+  }));
+}
+
+function buildSupervisionSummary() {
+  const now = Date.now();
+  const robotAgeMs = telemetryAgeMs(now);
+  return {
+    mission: mission.publicMission(),
+    lora: bridge.getStatus(),
+    robot: state.robot
+      ? {
+          lat: state.robot.lat,
+          lon: state.robot.lon,
+          heading: state.robot.heading,
+          speed: state.robot.speed,
+          state: state.robot.state,
+          source: state.robot.source,
+          timestampMs: state.robot.timestampMs,
+          ageMs: robotAgeMs,
+          stale: isTelemetryStale(now),
+        }
+      : null,
+    coverage: state.coverage ? coverageStats(state.coverage) : null,
+    alerts: buildAlerts(now),
+    allowedActions: buildAllowedActions(),
+    workflows: buildOperatorWorkflows(),
+    notes: state.operator.notes,
+  };
+}
+
+function publishSupervision() {
+  publish(WS_EVENT.SUPERVISION_UPDATED, buildSupervisionSummary());
+}
+
+function publishOperator() {
+  publish(WS_EVENT.OPERATOR_UPDATED, {
+    workflows: buildOperatorWorkflows(),
+    notes: state.operator.notes,
+  });
+}
+
+function buildFinalMissionStats() {
+  const stats = state.coverage ? coverageStats(state.coverage) : null;
+  return {
+    coveragePct: getCoveragePct(stats),
+    faultCount: mission.publicMission()?.faultCount ?? 0,
+    cmdCount: mission.publicMission()?.cmdCount ?? 0,
+  };
+}
+
+function arbitrateCommand(cmd) {
+  const missionState = currentMissionState();
+  const wpPushState = bridge.getStatus().wpPushState;
+
+  if (Object.values(CMD).includes(cmd)) {
+    if (cmd === CMD.ESTOP || cmd === CMD.PAUSE || cmd === CMD.MANUAL || DRIVE_COMMANDS.has(cmd)) {
+      return { ok: true };
+    }
+    if (cmd === CMD.RESET) {
+      if ([MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState)) {
+        return { ok: true };
+      }
+      return { ok: false, status: 409, error: 'RESET allowed only when mission is PAUSED, ABORTED, or ERROR' };
+    }
+    if (cmd === CMD.AUTO) {
+      if (wpPushState === 'committed') {
+        return { ok: true };
+      }
+      return { ok: false, status: 409, error: 'AUTO requires committed waypoints' };
+    }
+  }
+
+  if (isWaypointCommand(cmd)) {
+    if ([MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState)) {
+      return { ok: true };
+    }
+    return { ok: false, status: 409, error: 'Waypoint commands are allowed only while mission is CONFIGURING or PAUSED' };
+  }
+
+  return { ok: false, status: 400, error: `Unsupported command: ${cmd}` };
+}
+
+function syncMissionToCommand(cmd) {
+  if (cmd === CMD.ESTOP) {
+    if (mission.isActive()) {
+      try {
+        mission.abort('operator_estop', buildFinalMissionStats());
+      } catch (_) {
+        // ignore invalid transition if mission already terminal
+      }
+    }
+    bridge.resetWpState();
+    return;
+  }
+
+  if (cmd === CMD.PAUSE) {
+    if (mission.isRunning()) {
+      try {
+        mission.pause('command:PAUSE');
+      } catch (_) {
+        // ignore invalid transition if mission already paused/terminal
+      }
+    }
+    return;
+  }
+
+  if (cmd === CMD.AUTO) {
+    const missionState = currentMissionState();
+    try {
+      if (missionState === MISSION_STATE.CONFIGURING) {
+        mission.start();
+      } else if (missionState === MISSION_STATE.PAUSED) {
+        mission.resume();
+      }
+    } catch (_) {
+      // ignore invalid transition if mission state changed concurrently
+    }
+    return;
+  }
+
+  if (cmd === CMD.MANUAL || DRIVE_COMMANDS.has(cmd)) {
+    if (mission.isRunning()) {
+      try {
+        mission.pause('command:manual_override');
+      } catch (_) {
+        // ignore invalid transition if mission is no longer running
+      }
+    }
+    return;
+  }
+
+  if (cmd === CMD.RESET) {
+    const missionState = currentMissionState();
+    if ([MISSION_STATE.ABORTED, MISSION_STATE.ERROR, MISSION_STATE.COMPLETED].includes(missionState)) {
+      mission.reset();
+      bridge.resetWpState();
+    }
+  }
+}
+
+async function dispatchCommand(cmd, options = {}) {
+  const { syncMission = true, source = 'api.command' } = options;
+
+  const decision = arbitrateCommand(cmd);
+  if (!decision.ok) {
+    return { ok: false, status: decision.status, error: decision.error };
+  }
+
+  const result = await bridge.sendCommand(cmd);
+  if (!result.ok) {
+    return {
+      ok: false,
+      status: 502,
+      error: result.error ?? `Base station command failed (${result.status ?? 'no status'})`,
+      detail: result,
+    };
+  }
+
+  if (isWaypointCommand(cmd)) {
+    bridge.observeCommand(cmd);
+  }
+
+  state.lastCommand = cmd;
+  state.lastCommandAt = Date.now();
+  publish(WS_EVENT.COMMAND_RECEIVED, { cmd, at: state.lastCommandAt });
+  db.logEvent(mission.currentId(), EVENT_TYPE.COMMAND_SENT, { cmd, source });
+  mission.recordCommand();
+
+  if (syncMission) {
+    syncMissionToCommand(cmd);
+  }
+
+  publishSupervision();
+  publishOperator();
+
+  return { ok: true, status: result.status, body: result.body };
 }
 
 function parseIncomingTelemetry(payload) {
@@ -81,11 +578,17 @@ function parseIncomingTelemetry(payload) {
 
   // Fault notification: {"fault":"IMU_TIMEOUT","action":"ESTOP"}
   if (typeof body?.fault === 'string') {
+    const faultCode = Object.values(FAULT_CODE).includes(body.fault)
+      ? body.fault
+      : FAULT_CODE.GENERIC;
+    const faultAction = Object.values(FAULT_ACTION).includes(body.action)
+      ? body.action
+      : FAULT_ACTION.LOG_ONLY;
     return {
       robot: null,
       isFault: true,
-      fault: String(body.fault),
-      action: String(body.action ?? 'UNKNOWN'),
+      fault: faultCode,
+      action: faultAction,
       source: 'lora-fault',
       raw: body,
     };
@@ -152,17 +655,26 @@ function publicState() {
         }
       : null,
     lastPath: state.lastPath,
+    mission: mission.publicMission(),
+    operator: {
+      notes: state.operator.notes,
+      workflows: buildOperatorWorkflows(),
+    },
   };
 }
 
-app.get('/api/health', (_req, res) => {
+app.get(API.HEALTH, (_req, res) => {
   res.json({ ok: true, service: 'robot-lora-server' });
 });
 
-app.get('/status', (_req, res) => {
+app.get(API.SUPERVISION_SUMMARY, (_req, res) => {
+  res.json({ ok: true, summary: buildSupervisionSummary() });
+});
+
+app.get(API.STATUS, (_req, res) => {
   res.json({
     battery: 85,
-    state: state.robot?.state ?? 'IDLE',
+    state: state.robot?.state ?? ROBOT_STATE.IDLE,
     mode: 'SERVER',
     last_cmd: state.lastCommand,
     last_fault: state.lastFault ?? null,
@@ -179,7 +691,7 @@ app.get('/status', (_req, res) => {
   });
 });
 
-app.post('/command', (req, res) => {
+app.post(API.COMMAND, async (req, res) => {
   const parsedBody = parseMaybeJson(req.body);
   const rawCmd =
     (typeof parsedBody === 'object' && parsedBody !== null && typeof parsedBody.cmd === 'string' && parsedBody.cmd) ||
@@ -192,32 +704,24 @@ app.post('/command', (req, res) => {
     return res.status(400).send('Missing cmd');
   }
 
-  state.lastCommand = cmd;
-  state.lastCommandAt = Date.now();
-  publish('command.received', { cmd, at: state.lastCommandAt });
+  const dispatched = await dispatchCommand(cmd);
+  if (!dispatched.ok) {
+    return res.status(dispatched.status ?? 500).type('text/plain').send(dispatched.error);
+  }
 
   return res.type('text/plain').send('OK');
 });
 
-app.get('/', (_req, res) => {
+app.get(API.ROOT, (_req, res) => {
   res.json({
     ok: true,
     service: 'robot-lora-server',
-    endpoints: [
-      'GET /status',
-      'POST /command',
-      'GET /api/health',
-      'POST /api/input-area',
-      'POST /api/telemetry',
-      'GET /api/state',
-      'GET /api/coverage',
-      'POST /api/path/plan',
-    ],
+    endpoints: Object.values(API),
   });
 });
-
-app.post('/api/input-area', (req, res) => {
+app.post(API.INPUT_AREA, (req, res) => {
   const { baseStation, boundary, cellSizeM = 2.0 } = req.body ?? {};
+  const startedAt = Date.now();
 
   if (!baseStation || typeof baseStation.lat !== 'number' || typeof baseStation.lon !== 'number') {
     return res.status(400).json({ ok: false, error: 'baseStation.lat/lon required' });
@@ -227,20 +731,57 @@ app.post('/api/input-area', (req, res) => {
     return res.status(400).json({ ok: false, error: 'boundary requires at least 3 points' });
   }
 
+  const cellPlan = resolveInputAreaCellSize(boundary, Number(cellSizeM));
+
   state.baseStation = baseStation;
   state.boundary = boundary;
-  state.coverage = buildCoverageMap(boundary, cellSizeM);
+  state.coverage = buildCoverageMap(boundary, cellPlan.effectiveCellSizeM);
   state.robot = null;
   state.trail = [];
   state.lastPath = [];
+  bridge.resetWpState();
+  resetOperatorState();
 
   const stats = coverageStats(state.coverage);
-  publish('area.updated', { baseStation, boundary, stats });
+  publish(WS_EVENT.AREA_UPDATED, { baseStation, boundary, stats });
 
-  return res.json({ ok: true, stats });
+  // Create / replace mission record in CONFIGURING state
+  // (Resetting area resets the mission lifecycle to CONFIGURING)
+  if (mission.isActive()) {
+    const missionState = mission.publicMission()?.state;
+    if (missionState === MISSION_STATE.CONFIGURING) {
+      try {
+        mission.reset();
+      } catch (_) { /* ignore */ }
+    } else {
+      try {
+        mission.abort('area_reset', {
+          coveragePct: getCoveragePct(stats),
+          faultCount:  mission.publicMission()?.faultCount ?? 0,
+          cmdCount:    mission.publicMission()?.cmdCount   ?? 0,
+        });
+      } catch (_) { /* ignore */ }
+      try {
+        mission.reset();
+      } catch (_) { /* ignore */ }
+    }
+  }
+  mission.configure({ baseStation, boundary, cellSizeM: cellPlan.effectiveCellSizeM });
+  publishOperator();
+  publishSupervision();
+
+  return res.json({
+    ok: true,
+    stats,
+    requestedCellSizeM: cellPlan.requestedCellSizeM,
+    cellSizeM: cellPlan.effectiveCellSizeM,
+    cellSizeAdjusted: cellPlan.adjusted,
+    estimatedCells: cellPlan.estimatedCells,
+    buildMs: Date.now() - startedAt,
+  });
 });
 
-app.post('/api/telemetry', (req, res) => {
+app.post(API.TELEMETRY, (req, res) => {
   const parsed = parseIncomingTelemetry(req.body);
   if (!parsed) {
     return res.status(400).json({ ok: false, error: 'Unsupported telemetry payload' });
@@ -249,7 +790,28 @@ app.post('/api/telemetry', (req, res) => {
   // Handle fault notification separately — don't overwrite robot position.
   if (parsed.isFault) {
     state.lastFault = { fault: parsed.fault, action: parsed.action, at: Date.now() };
-    publish('fault.received', { fault: parsed.fault, action: parsed.action, at: state.lastFault.at });
+    publish(WS_EVENT.FAULT_RECEIVED, { fault: parsed.fault, action: parsed.action, at: state.lastFault.at });
+
+    // Event log + mission counter
+    db.logEvent(mission.currentId(), EVENT_TYPE.FAULT_RECEIVED, {
+      fault:  parsed.fault,
+      action: parsed.action,
+    });
+    mission.recordFault();
+
+    // Auto-pause a running mission on ESTOP/PAUSE action
+    if (parsed.action === 'ESTOP') {
+      if ([MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+        try { mission.abort(`fault:${parsed.fault}`, buildFinalMissionStats()); } catch (_) { /* ignore */ }
+      }
+      bridge.resetWpState();
+    } else if (parsed.action === 'PAUSE' && mission.isRunning()) {
+      try { mission.pause(`fault:${parsed.fault}`); } catch (_) { /* ignore */ }
+    }
+
+    publishSupervision();
+    publishOperator();
+
     return res.json({ ok: true, fault: parsed.fault, action: parsed.action });
   }
 
@@ -259,7 +821,7 @@ app.post('/api/telemetry', (req, res) => {
     heading: parsed.robot.heading,
     speed: parsed.robot.speed,
     source: parsed.source,
-    state: parsed.stateName ?? state.robot?.state ?? 'IDLE',
+    state: parsed.stateName ?? state.robot?.state ?? ROBOT_STATE.IDLE,
     timestampMs: Date.now(),
     raw: parsed.raw,
   };
@@ -275,16 +837,29 @@ app.post('/api/telemetry', (req, res) => {
     stats = coverageStats(state.coverage);
   }
 
-  publish('telemetry.updated', { robot: state.robot, coverage: stats });
+  publish(WS_EVENT.TELEMETRY_UPDATED, { robot: state.robot, coverage: stats });
+
+  // Event log (sampled — log every telemetry update)
+  db.logEvent(mission.currentId(), EVENT_TYPE.TELEMETRY_RECEIVED, {
+    lat:     state.robot.lat,
+    lon:     state.robot.lon,
+    heading: state.robot.heading,
+    state:   state.robot.state,
+  });
+
+  // Update rolling coverage in mission row
+  if (stats) mission.updateCoverage(getCoveragePct(stats));
+
+  publishSupervision();
 
   return res.json({ ok: true, coverage: stats });
 });
 
-app.get('/api/state', (_req, res) => {
+app.get(API.STATE, (_req, res) => {
   res.json({ ok: true, state: publicState() });
 });
 
-app.get('/api/coverage', (_req, res) => {
+app.get(API.COVERAGE, (_req, res) => {
   if (!state.coverage) {
     return res.status(400).json({ ok: false, error: 'input area is not initialized' });
   }
@@ -310,15 +885,22 @@ app.get('/api/coverage', (_req, res) => {
   });
 });
 
-app.post('/api/path/plan', (req, res) => {
+app.post(API.PATH_PLAN, (req, res) => {
   if (!state.coverage) {
     return res.status(400).json({ ok: false, error: 'input area is not initialized' });
   }
 
-  const { goal, start } = req.body ?? {};
+  const { goal, start, saltPct, brinePct } = req.body ?? {};
   if (!goal || typeof goal.lat !== 'number' || typeof goal.lon !== 'number') {
     return res.status(400).json({ ok: false, error: 'goal.lat/lon required' });
   }
+
+  const normalizedSalt = Number.isFinite(Number(saltPct))
+    ? Math.max(0, Math.min(100, Math.round(Number(saltPct))))
+    : 100;
+  const normalizedBrine = Number.isFinite(Number(brinePct))
+    ? Math.max(0, Math.min(100, Math.round(Number(brinePct))))
+    : 100;
 
   const startPoint = start ?? state.robot ?? state.baseStation;
   if (!startPoint) {
@@ -331,13 +913,297 @@ app.post('/api/path/plan', (req, res) => {
     return res.status(400).json({ ok: false, error: path.reason });
   }
 
-  state.lastPath = path.points;
-  publish('path.updated', { points: state.lastPath });
+  state.lastPath = path.points.map((point) => ({
+    ...point,
+    salt: normalizedSalt,
+    brine: normalizedBrine,
+  }));
+  publish(WS_EVENT.PATH_UPDATED, { points: state.lastPath });
+  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
+    pointCount: state.lastPath.length,
+    saltPct: normalizedSalt,
+    brinePct: normalizedBrine,
+  });
+  publishSupervision();
+  publishOperator();
   res.json({ ok: true, points: state.lastPath });
 });
 
+// ---------------------------------------------------------------------------
+// Phase B: Mission lifecycle endpoints
+// ---------------------------------------------------------------------------
+
+// POST /api/mission/start  — transitions CONFIGURING → RUNNING
+// Also pushes staged waypoints (from lastPath) to STM32, then sends AUTO.
+app.post(API.MISSION_START, async (_req, res) => {
+  try {
+    if (currentMissionState() !== MISSION_STATE.CONFIGURING) {
+      return res.status(409).json({ ok: false, error: 'Mission must be CONFIGURING before start' });
+    }
+
+    const loraStatus = bridge.getStatus();
+
+    // Push waypoints if we have a path plan and no committed set yet.
+    if (loraStatus.wpPushState !== 'committed' && state.lastPath && state.lastPath.length > 0) {
+      const points = state.lastPath.map((p) => ({
+        lat:   p.lat,
+        lon:   p.lon,
+        salt:  p.salt  ?? 100,
+        brine: p.brine ?? 100,
+      }));
+      const pushResult = await bridge.pushWaypoints(points);
+      if (!pushResult.ok) {
+        return res.status(502).json({ ok: false, error: pushResult.error, sent: pushResult.sent });
+      }
+    }
+
+    if (bridge.getStatus().wpPushState !== 'committed') {
+      return res.status(409).json({ ok: false, error: 'Mission start requires a committed waypoint set' });
+    }
+
+    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.start' });
+    if (!dispatched.ok) {
+      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
+    }
+
+    const m = mission.start();
+    publishSupervision();
+    return res.json({ ok: true, mission: m });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/mission/pause  — transitions RUNNING → PAUSED
+app.post(API.MISSION_PAUSE, async (req, res) => {
+  const reason = req.body?.reason ?? null;
+  try {
+    if (currentMissionState() !== MISSION_STATE.RUNNING) {
+      return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before pause' });
+    }
+    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.pause' });
+    if (!dispatched.ok) {
+      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
+    }
+    const m = mission.pause(reason);
+    publishSupervision();
+    return res.json({ ok: true, mission: m });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/mission/resume  — transitions PAUSED → RUNNING
+app.post(API.MISSION_RESUME, async (_req, res) => {
+  try {
+    if (currentMissionState() !== MISSION_STATE.PAUSED) {
+      return res.status(409).json({ ok: false, error: 'Mission must be PAUSED before resume' });
+    }
+    if (bridge.getStatus().wpPushState !== 'committed') {
+      return res.status(409).json({ ok: false, error: 'Mission resume requires committed waypoints' });
+    }
+    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.resume' });
+    if (!dispatched.ok) {
+      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
+    }
+    const m = mission.resume();
+    publishSupervision();
+    return res.json({ ok: true, mission: m });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/mission/complete  — transitions RUNNING → COMPLETED  (operator-declared)
+app.post(API.MISSION_COMPLETE, async (_req, res) => {
+  try {
+    if (currentMissionState() !== MISSION_STATE.RUNNING) {
+      return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before complete' });
+    }
+    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.complete' });
+    if (!dispatched.ok) {
+      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
+    }
+    const stats = state.coverage ? coverageStats(state.coverage) : {};
+    const m = mission.complete({
+      coveragePct: getCoveragePct(stats),
+      faultCount:  mission.publicMission()?.faultCount ?? 0,
+      cmdCount:    mission.publicMission()?.cmdCount   ?? 0,
+    });
+    bridge.resetWpState();
+    publishSupervision();
+    return res.json({ ok: true, mission: m });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/mission/abort  — transitions RUNNING|PAUSED → ABORTED
+app.post(API.MISSION_ABORT, async (req, res) => {
+  const reason = req.body?.reason ?? 'operator';
+  try {
+    if (![MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+      return res.status(409).json({ ok: false, error: 'Mission must be RUNNING or PAUSED before abort' });
+    }
+    const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source: 'mission.abort' });
+    if (!dispatched.ok) {
+      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
+    }
+    const stats = state.coverage ? coverageStats(state.coverage) : {};
+    const m = mission.abort(reason, {
+      coveragePct: getCoveragePct(stats),
+      faultCount:  mission.publicMission()?.faultCount ?? 0,
+      cmdCount:    mission.publicMission()?.cmdCount   ?? 0,
+    });
+    bridge.resetWpState();
+    publishSupervision();
+    return res.json({ ok: true, mission: m });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/mission/current  — live snapshot
+app.get(API.MISSION_CURRENT, (_req, res) => {
+  const m = mission.publicMission();
+  if (!m) return res.status(404).json({ ok: false, error: 'No active mission' });
+  return res.json({ ok: true, mission: m });
+});
+
+// GET /api/mission/history?limit=50
+app.get(API.MISSION_HISTORY, (req, res) => {
+  const limit = Math.min(Number(req.query.limit ?? 50), 500);
+  const rows = db.listMissions(limit);
+  return res.json({ ok: true, missions: rows });
+});
+
+// GET /api/mission/:id/events?type=<EVENT_TYPE>
+app.get(API.MISSION_EVENTS, (req, res) => {
+  const id   = Number(req.params.id);
+  const type = req.query.type ?? null;
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid mission id' });
+  }
+  const m = db.getMission(id);
+  if (!m) return res.status(404).json({ ok: false, error: 'Mission not found' });
+  const events = type
+    ? db.getMissionEventsByType(id, type)
+    : db.getMissionEvents(id);
+  return res.json({ ok: true, mission: m, events });
+});
+
+// ---------------------------------------------------------------------------
+// Phase C: LoRa bridge endpoints
+// ---------------------------------------------------------------------------
+
+// GET /api/lora/status  — bridge + WP push state
+app.get(API.LORA_STATUS, (_req, res) => {
+  res.json({ ok: true, lora: bridge.getStatus() });
+});
+
+// POST /api/lora/push-waypoints  — manual WP push trigger
+// Body: { points: [{ lat, lon, salt, brine }, ...] }
+// If points is omitted uses state.lastPath.
+app.post(API.LORA_PUSH_WP, async (req, res) => {
+  if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+    return res.status(409).json({ ok: false, error: 'Waypoint push allowed only while mission is CONFIGURING or PAUSED' });
+  }
+
+  let rawPoints = req.body?.points;
+  if (!rawPoints && state.lastPath && state.lastPath.length > 0) {
+    rawPoints = state.lastPath.map((p) => ({
+      lat:   p.lat,
+      lon:   p.lon,
+      salt:  p.salt  ?? 100,
+      brine: p.brine ?? 100,
+    }));
+  }
+  if (!rawPoints || !Array.isArray(rawPoints) || rawPoints.length === 0) {
+    return res.status(400).json({ ok: false, error: 'No points provided and no cached path plan' });
+  }
+  const result = await bridge.pushWaypoints(rawPoints);
+  if (!result.ok) {
+    return res.status(502).json({ ok: false, error: result.error, sent: result.sent });
+  }
+  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, { wpPushCount: result.sent, source: 'lora_bridge' });
+  publishSupervision();
+  publishOperator();
+  return res.json({ ok: true, sent: result.sent });
+});
+
+app.get(API.OPERATOR_WORKFLOWS, (_req, res) => {
+  return res.json({
+    ok: true,
+    workflows: buildOperatorWorkflows(),
+    notes: state.operator.notes,
+    allowedActions: buildAllowedActions(),
+  });
+});
+
+app.post(API.OPERATOR_WORKFLOW_STEP, (req, res) => {
+  const { workflowId, stepId } = req.params;
+  const { checked = true, actor = 'operator', note = null } = req.body ?? {};
+
+  const workflow = buildOperatorWorkflows().find((candidate) => candidate.id === workflowId);
+  if (!workflow) {
+    return res.status(404).json({ ok: false, error: 'Workflow not found' });
+  }
+
+  const step = workflow.steps.find((candidate) => candidate.id === stepId);
+  if (!step) {
+    return res.status(404).json({ ok: false, error: 'Workflow step not found' });
+  }
+  if (step.kind !== 'manual') {
+    return res.status(409).json({ ok: false, error: 'Derived workflow steps cannot be acknowledged manually' });
+  }
+  if (!step.ready && checked) {
+    return res.status(409).json({ ok: false, error: 'Workflow step is not ready for acknowledgement yet' });
+  }
+
+  const ack = setWorkflowAck(workflowId, stepId, Boolean(checked), { actor, note });
+  db.logEvent(mission.currentId(), EVENT_TYPE.OPERATOR_WORKFLOW_UPDATED, {
+    workflowId,
+    stepId,
+    checked: Boolean(checked),
+    actor,
+    note,
+  });
+
+  publishOperator();
+  publishSupervision();
+
+  return res.json({
+    ok: true,
+    ack,
+    workflows: buildOperatorWorkflows(),
+  });
+});
+
+app.get(API.OPERATOR_NOTES, (_req, res) => {
+  return res.json({ ok: true, notes: state.operator.notes });
+});
+
+app.post(API.OPERATOR_NOTES, (req, res) => {
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  const category = typeof req.body?.category === 'string' && req.body.category.trim()
+    ? req.body.category.trim()
+    : 'general';
+  const actor = typeof req.body?.actor === 'string' && req.body.actor.trim()
+    ? req.body.actor.trim()
+    : 'operator';
+
+  if (!text) {
+    return res.status(400).json({ ok: false, error: 'text is required' });
+  }
+
+  const note = addOperatorNote({ text, category, actor });
+  publishOperator();
+  publishSupervision();
+  return res.json({ ok: true, note, notes: state.operator.notes });
+});
+
 wss.on('connection', (socket) => {
-  socket.send(JSON.stringify({ event: 'state.snapshot', payload: publicState(), at: Date.now() }));
+  socket.send(JSON.stringify({ event: WS_EVENT.STATE_SNAPSHOT, payload: publicState(), at: Date.now() }));
 });
 
 const port = Number(process.env.PORT ?? 8080);

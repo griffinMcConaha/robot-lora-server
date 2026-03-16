@@ -110,10 +110,13 @@ function coverageStats(map) {
     }
   }
 
+  const coveragePercent = insideCount ? (coveredCount / insideCount) * 100 : 0;
+
   return {
     insideCount,
     coveredCount,
-    coveragePercent: insideCount ? (coveredCount / insideCount) * 100 : 0,
+    coveragePercent,
+    coveredPct: coveragePercent,
   };
 }
 

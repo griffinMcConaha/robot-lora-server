@@ -6,9 +6,12 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test": "node --test tests/*.test.js",
+    "test:hil": "node --test tests/hil.test.js"
   },
   "dependencies": {
+    "better-sqlite3": "^12.8.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "ws": "^8.18.0"

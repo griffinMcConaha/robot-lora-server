@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build-verify-server-hil",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test:hil"
+			],
+			"isBackground": false
+		}
+	]
+}

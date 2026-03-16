@@ -22,6 +22,32 @@ function isWalkable(map, row, col) {
   return map.cells[row][col].inside;
 }
 
+function nearestWalkable(map, fromRow, fromCol) {
+  if (isWalkable(map, fromRow, fromCol)) {
+    return { row: fromRow, col: fromCol };
+  }
+
+  const maxRadius = Math.max(map.height, map.width);
+  for (let radius = 1; radius <= maxRadius; radius++) {
+    const minRow = fromRow - radius;
+    const maxRow = fromRow + radius;
+    const minCol = fromCol - radius;
+    const maxCol = fromCol + radius;
+
+    for (let row = minRow; row <= maxRow; row++) {
+      if (isWalkable(map, row, minCol)) return { row, col: minCol };
+      if (isWalkable(map, row, maxCol)) return { row, col: maxCol };
+    }
+
+    for (let col = minCol + 1; col <= maxCol - 1; col++) {
+      if (isWalkable(map, minRow, col)) return { row: minRow, col };
+      if (isWalkable(map, maxRow, col)) return { row: maxRow, col };
+    }
+  }
+
+  return null;
+}
+
 function reconstructPath(cameFrom, current) {
   const result = [current];
   let cursor = current;
@@ -33,11 +59,23 @@ function reconstructPath(cameFrom, current) {
 }
 
 function findPath(map, startLatLon, goalLatLon) {
-  const start = worldToGrid(map, startLatLon);
-  const goal = worldToGrid(map, goalLatLon);
+  let start = worldToGrid(map, startLatLon);
+  let goal = worldToGrid(map, goalLatLon);
 
-  if (!isWalkable(map, start.row, start.col) || !isWalkable(map, goal.row, goal.col)) {
-    return { ok: false, reason: 'Start or goal is outside mapped boundary', points: [] };
+  if (!isWalkable(map, start.row, start.col)) {
+    const snappedStart = nearestWalkable(map, start.row, start.col);
+    if (!snappedStart) {
+      return { ok: false, reason: 'Start is outside mapped boundary and no valid start cell found', points: [] };
+    }
+    start = snappedStart;
+  }
+
+  if (!isWalkable(map, goal.row, goal.col)) {
+    const snappedGoal = nearestWalkable(map, goal.row, goal.col);
+    if (!snappedGoal) {
+      return { ok: false, reason: 'Goal is outside mapped boundary and no valid goal cell found', points: [] };
+    }
+    goal = snappedGoal;
   }
 
   const open = [start];

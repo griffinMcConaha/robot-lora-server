@@ -50,6 +50,24 @@ Supported commands: `FORWARD`, `BACKWARD`, `LEFT`, `RIGHT`, `STOP`, `PAUSE`, `AU
 
 Responds with plain text `OK`.
 
+Phase E arbitration rules now apply:
+- `AUTO` is rejected unless waypoints are already committed to the robot.
+- `WPCLEAR`, `WP:...`, and `WPLOAD:...` are accepted only while the mission is `CONFIGURING` or `PAUSED`.
+- `RESET` is accepted only while the mission is `PAUSED`, `ABORTED`, or `ERROR`.
+- Server mission state is synchronized with direct operator commands: `AUTO` starts/resumes, `PAUSE` pauses, `ESTOP` aborts, and manual/drive commands pause a running mission.
+
+### 0.3) Supervision summary
+`GET /api/supervision/summary`
+
+Returns a single app-facing supervision payload with:
+- mission snapshot
+- LoRa bridge status
+- latest robot position and telemetry freshness
+- coverage stats
+- actionable alerts
+- allowed operator actions
+- operator workflows and notes
+
 ### 1) Initialize area
 `POST /api/input-area`
 
@@ -126,6 +144,78 @@ Base-station passthrough (when the base station ’s `/status` JSON is forwarded
 }
 ```
 
+### 6) Mission lifecycle
+
+`POST /api/mission/start`
+
+- Requires mission state `CONFIGURING`
+- Requires committed waypoints; if a cached path exists, the server will push it first
+- Sends `AUTO` to the robot and only then transitions the mission to `RUNNING`
+
+`POST /api/mission/pause`
+
+- Requires mission state `RUNNING`
+- Sends `PAUSE` to the robot and then transitions to `PAUSED`
+
+`POST /api/mission/resume`
+
+- Requires mission state `PAUSED`
+- Requires committed waypoints
+- Sends `AUTO` to the robot and then transitions to `RUNNING`
+
+`POST /api/mission/abort`
+
+- Requires mission state `RUNNING` or `PAUSED`
+- Sends `ESTOP` to the robot and then transitions to `ABORTED`
+
+`POST /api/mission/complete`
+
+- Requires mission state `RUNNING`
+- Sends `PAUSE` to the robot and then transitions to `COMPLETED`
+
+### 7) Operator workflows
+
+`GET /api/operator/workflows`
+
+Returns operator workflow state for:
+- `preflight`
+- `recovery`
+- `shutdown`
+
+Each workflow step is either:
+- `derived` from server state, or
+- `manual`, which an operator can acknowledge
+
+`POST /api/operator/workflows/:workflowId/steps/:stepId`
+
+Example body:
+
+```json
+{
+  "checked": true,
+  "actor": "field-op",
+  "note": "Radio check completed"
+}
+```
+
+`GET /api/operator/notes`
+
+Returns the current in-memory operator note list.
+
+`POST /api/operator/notes`
+
+Example body:
+
+```json
+{
+  "text": "Obstacle removed from lane 2",
+  "category": "recovery",
+  "actor": "field-op"
+}
+```
+
+Notes are also appended to the active mission record as free-form mission notes.
+
 ## Live updates for app
 
 A websocket is exposed at the same host/port. Messages are JSON packets:
@@ -135,6 +225,23 @@ A websocket is exposed at the same host/port. Messages are JSON packets:
 - `path.updated`
 - `command.received`
 - `fault.received` — payload: `{ fault: string, action: string, at: number }`
+- `mission.updated`
+- `supervision.updated`
+- `operator.updated`
+
+## HIL tests
+
+Run the hardware-in-the-loop style server validation suite with:
+
+```bash
+npm run test:hil
+```
+
+The test harness runs the server against a local mock base station and validates fail-safe scenarios such as:
+- stale telemetry while mission is `RUNNING`
+- operator manual override pausing a mission
+- ESTOP fault notifications aborting a mission
+- operator workflow acknowledgements and note capture
 
 ## Node-RED starter flow
 
