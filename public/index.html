@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LoRa Anti-Icing Server - Dashboard</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    header {
+      max-width: 1400px;
+      margin: 0 auto 30px;
+      text-align: center;
+    }
+
+    h1 {
+      font-size: 32px;
+      margin-bottom: 8px;
+      background: linear-gradient(135deg, #60a5fa, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .subtitle {
+      color: #94a3b8;
+      font-size: 14px;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 20px;
+    }
+
+    .card {
+      background: rgba(30, 41, 59, 0.8);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: 12px;
+      padding: 20px;
+      transition: all 0.3s ease;
+    }
+
+    .card:hover {
+      border-color: rgba(148, 163, 184, 0.4);
+      background: rgba(30, 41, 59, 0.95);
+    }
+
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #94a3b8;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-indicator {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #ef4444;
+      animation: pulse 2s infinite;
+    }
+
+    .status-indicator.active {
+      background: #10b981;
+      animation: pulse-green 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    @keyframes pulse-green {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.7; }
+    }
+
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 0;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+    }
+
+    .stat-row:last-child {
+      border-bottom: none;
+    }
+
+    .stat-label {
+      color: #cbd5e1;
+      font-size: 13px;
+    }
+
+    .stat-value {
+      font-size: 18px;
+      font-weight: 600;
+      color: #60a5fa;
+      font-family: 'Monaco', 'Courier New', monospace;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: rgba(148, 163, 184, 0.2);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #60a5fa, #a78bfa);
+      transition: width 0.3s ease;
+      border-radius: 3px;
+    }
+
+    .connection-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 6px;
+      font-size: 13px;
+      color: #10b981;
+    }
+
+    .connection-status.disconnected {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.3);
+      color: #ef4444;
+    }
+
+    .log-container {
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: 8px;
+      padding: 16px;
+      max-height: 300px;
+      overflow-y: auto;
+      font-family: 'Monaco', 'Courier New', monospace;
+      font-size: 12px;
+    }
+
+    .log-entry {
+      padding: 4px 0;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+    }
+
+    .log-entry:last-child {
+      border-bottom: none;
+    }
+
+    .log-time {
+      color: #64748b;
+      margin-right: 8px;
+    }
+
+    .log-event {
+      color: #a78bfa;
+    }
+
+    .log-value {
+      color: #60a5fa;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      background: rgba(96, 165, 250, 0.2);
+      border: 1px solid rgba(96, 165, 250, 0.3);
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #60a5fa;
+      margin-right: 4px;
+    }
+
+    .badge.success {
+      background: rgba(16, 185, 129, 0.2);
+      border-color: rgba(16, 185, 129, 0.3);
+      color: #10b981;
+    }
+
+    .badge.warning {
+      background: rgba(245, 158, 11, 0.2);
+      border-color: rgba(245, 158, 11, 0.3);
+      color: #f59e0b;
+    }
+
+    .badge.error {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: rgba(239, 68, 68, 0.3);
+      color: #ef4444;
+    }
+
+    .grid-2 {
+      grid-column: span 2;
+    }
+
+    @media (max-width: 768px) {
+      .grid-2 {
+        grid-column: span 1;
+      }
+
+      h1 {
+        font-size: 24px;
+      }
+    }
+
+    .refresh-badge {
+      font-size: 12px;
+      color: #64748b;
+      padding-left: 8px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🛰️ LoRa Anti-Icing Server</h1>
+    <p class="subtitle">Real-time mission control and coverage monitoring</p>
+    <div style="margin-top: 16px;">
+      <div class="connection-status" id="connectionStatus">
+        <span class="status-indicator"></span>
+        Connecting...
+      </div>
+    </div>
+  </header>
+
+  <div class="container">
+    <!-- Mission Status -->
+    <div class="card">
+      <div class="card-title">
+        <span class="status-indicator active"></span>
+        Mission State
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Current Mode</span>
+        <span class="stat-value" id="missionState">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Status</span>
+        <div id="missionStatus"></div>
+      </div>
+    </div>
+
+    <!-- Robot Position -->
+    <div class="card">
+      <div class="card-title">
+        <span class="status-indicator"></span>
+        Robot Position
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Latitude</span>
+        <span class="stat-value" id="robotLat">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Longitude</span>
+        <span class="stat-value" id="robotLon">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Last Seen</span>
+        <span class="stat-value" id="robotLastSeen">—</span>
+      </div>
+    </div>
+
+    <!-- Coverage Stats -->
+    <div class="card">
+      <div class="card-title">
+        <span class="status-indicator active"></span>
+        Coverage Progress
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Covered Cells</span>
+        <span class="stat-value" id="coveredCells">—</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="coverageProgress" style="width: 0%"></div>
+      </div>
+      <div class="stat-row" style="margin-top: 8px;">
+        <span class="stat-label">Coverage %</span>
+        <span class="stat-value" id="coveragePercent">0%</span>
+      </div>
+    </div>
+
+    <!-- Telemetry -->
+    <div class="card">
+      <div class="card-title">Telemetry</div>
+      <div class="stat-row">
+        <span class="stat-label">Battery Voltage</span>
+        <span class="stat-value" id="batteryVoltage">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Motor Current</span>
+        <span class="stat-value" id="motorCurrent">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Temperature</span>
+        <span class="stat-value" id="temperature">—</span>
+      </div>
+    </div>
+
+    <!-- Trail Statistics -->
+    <div class="card">
+      <div class="card-title">Trail Statistics</div>
+      <div class="stat-row">
+        <span class="stat-label">Trail Points</span>
+        <span class="stat-value" id="trailPoints">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Distance Traveled</span>
+        <span class="stat-value" id="distanceTraveled">—</span>
+      </div>
+    </div>
+
+    <!-- Latest Commands -->
+    <div class="card">
+      <div class="card-title">Last Command</div>
+      <div class="stat-row">
+        <span class="stat-label">Command</span>
+        <span class="stat-value" id="lastCommand">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Sent At</span>
+        <span class="stat-value" id="lastCommandTime">—</span>
+      </div>
+    </div>
+
+    <!-- Event Log (spans full width on medium+ screens) -->
+    <div class="card grid-2">
+      <div class="card-title">Recent Events</div>
+      <div class="log-container" id="eventLog">
+        <div style="color: #64748b; text-align: center; padding: 20px;">Waiting for events...</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}`;
+    let ws = null;
+    let state = {};
+    const maxLogEntries = 50;
+    const logEntries = [];
+
+    function connect() {
+      try {
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          document.getElementById('connectionStatus').innerHTML = '<span class="status-indicator active"></span> Connected';
+          document.getElementById('connectionStatus').classList.remove('disconnected');
+          addLogEntry('Connection', 'WebSocket connected', 'event');
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.event) {
+              handleEvent(message);
+            }
+          } catch (e) {
+            console.error('Failed to parse message:', e);
+          }
+        };
+
+        ws.onerror = (error) => {
+          console.error('WebSocket error:', error);
+          updateConnectionStatus(false);
+        };
+
+        ws.onclose = () => {
+          updateConnectionStatus(false);
+          addLogEntry('Connection', 'WebSocket disconnected, reconnecting...', 'warning');
+          setTimeout(connect, 3000);
+        };
+      } catch (e) {
+        console.error('Failed to create WebSocket:', e);
+        setTimeout(connect, 3000);
+      }
+    }
+
+    function updateConnectionStatus(connected) {
+      const status = document.getElementById('connectionStatus');
+      if (connected) {
+        status.innerHTML = '<span class="status-indicator active"></span> Connected';
+        status.classList.remove('disconnected');
+      } else {
+        status.innerHTML = '<span class="status-indicator"></span> Disconnected';
+        status.classList.add('disconnected');
+      }
+    }
+
+    function handleEvent(message) {
+      const { event, payload } = message;
+
+      if (event === 'state.snapshot') {
+        state = payload || {};
+        updateMissionDisplay(state.mission || {});
+        updateRobotDisplay(state.robot || null);
+        updateCoverageDisplay(state.coverage?.stats || null);
+        document.getElementById('trailPoints').textContent = String(state.trail?.length || 0);
+        addLogEntry('Snapshot', 'Initial state loaded', 'event');
+        return;
+      }
+
+      if (event === 'mission.updated') {
+        updateMissionDisplay(payload || {});
+        addLogEntry('Mission', `State changed to ${(payload || {}).state || 'unknown'}`, 'event');
+      } else if (event === 'telemetry.updated') {
+        const robot = payload?.robot || null;
+        updateRobotDisplay(robot);
+        updateCoverageDisplay(payload?.coverage || null);
+        updateTelemetryDisplay(robot?.raw || {});
+      } else if (event === 'area.updated') {
+        updateCoverageDisplay(payload?.stats || null);
+        addLogEntry('Area', 'Input area updated', 'value');
+      } else if (event === 'path.updated') {
+        const pointCount = Array.isArray(payload?.points) ? payload.points.length : 0;
+        document.getElementById('distanceTraveled').textContent = `${pointCount} path pts`;
+        addLogEntry('Path', `Path updated (${pointCount} points)`, 'event');
+      } else if (event === 'command.received') {
+        document.getElementById('lastCommand').textContent = payload?.cmd || '—';
+        document.getElementById('lastCommandTime').textContent = payload?.at ? new Date(payload.at).toLocaleTimeString() : '—';
+        addLogEntry('Command', `Sent ${payload?.cmd || 'unknown'}`, 'event');
+      } else if (event === 'fault.received') {
+        addLogEntry('Fault', `${payload?.fault || 'UNKNOWN'} (${payload?.action || 'LOG_ONLY'})`, 'warning');
+      }
+    }
+
+    function updateMissionDisplay(mission) {
+      document.getElementById('missionState').textContent = mission?.state || '—';
+      const statusEl = document.getElementById('missionStatus');
+      let statusHtml = '';
+      if (mission?.state === 'RUNNING') {
+        statusHtml = '<span class="badge success">Active</span>';
+      } else if (mission?.state === 'IDLE') {
+        statusHtml = '<span class="badge">Idle</span>';
+      } else if (mission?.state === 'PAUSED') {
+        statusHtml = '<span class="badge warning">Paused</span>';
+      } else if (mission?.state === 'ERROR' || mission?.state === 'ABORTED') {
+        statusHtml = '<span class="badge error">Fault</span>';
+      }
+      statusEl.innerHTML = statusHtml || '—';
+    }
+
+    function updateRobotDisplay(robot) {
+      if (robot && typeof robot.lat === 'number' && typeof robot.lon === 'number') {
+        document.getElementById('robotLat').textContent = robot.lat.toFixed(6);
+        document.getElementById('robotLon').textContent = robot.lon.toFixed(6);
+      }
+      if (robot?.timestampMs) {
+        const secondsAgo = Math.floor((Date.now() - robot.timestampMs) / 1000);
+        document.getElementById('robotLastSeen').textContent = `${secondsAgo}s ago`;
+      }
+    }
+
+    function updateCoverageDisplay(stats) {
+      if (!stats) return;
+      const total = Number(stats.insideCount || 0);
+      const covered = Number(stats.coveredCount || 0);
+      const percent = total ? Math.round((covered / total) * 100) : 0;
+      document.getElementById('coveredCells').textContent = `${covered}/${total}`;
+      document.getElementById('coverageProgress').style.width = `${percent}%`;
+      document.getElementById('coveragePercent').textContent = `${percent}%`;
+    }
+
+    function updateTelemetryDisplay(raw) {
+      if (raw?.battery?.voltage !== undefined) {
+        document.getElementById('batteryVoltage').textContent = `${Number(raw.battery.voltage).toFixed(1)}V`;
+      }
+      if (raw?.motor?.current !== undefined) {
+        document.getElementById('motorCurrent').textContent = `${Number(raw.motor.current).toFixed(1)}A`;
+      }
+      if (raw?.temperature !== undefined) {
+        document.getElementById('temperature').textContent = `${Number(raw.temperature).toFixed(0)}°C`;
+      }
+    }
+
+    function addLogEntry(category, message, type = 'log') {
+      const now = new Date().toLocaleTimeString();
+      logEntries.unshift({ time: now, category, message, type });
+      if (logEntries.length > maxLogEntries) {
+        logEntries.pop();
+      }
+      renderLog();
+    }
+
+    function renderLog() {
+      const logEl = document.getElementById('eventLog');
+      if (logEntries.length === 0) {
+        logEl.innerHTML = '<div style="color: #64748b; text-align: center; padding: 20px;">No events yet</div>';
+        return;
+      }
+
+      logEl.innerHTML = logEntries.map(entry => `
+        <div class="log-entry">
+          <span class="log-time">${entry.time}</span>
+          <span style="color: #a78bfa; font-weight: 600;">[${entry.category}]</span>
+          <span class="log-event">${entry.message}</span>
+        </div>
+      `).join('');
+    }
+
+    // Initialize
+    connect();
+    addLogEntry('System', 'Dashboard initialized', 'event');
+  </script>
+</body>
+</html>

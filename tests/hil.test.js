@@ -156,6 +156,15 @@ test('Phase E supervision summary and Phase F fail-safe scenarios', async () => 
     }
 
     {
+      const { res, json } = await getJson(`${SERVER_URL}/api/bridge/sync`);
+      assert.equal(res.status, 200);
+      assert.equal(json.ok, true);
+      assert.equal(json.mission.state, 'CONFIGURING');
+      assert.ok(Array.isArray(json.lastPath));
+      assert.ok(json.lora);
+    }
+
+    {
       const { res } = await postJson(`${SERVER_URL}/api/path/plan`, {
         goal: { lat: 40.9997, lon: -80.9997 },
       });

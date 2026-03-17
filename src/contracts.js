@@ -260,6 +260,7 @@ const API = Object.freeze({
   // LoRa bridge (Phase C)
   LORA_PUSH_WP:     '/api/lora/push-waypoints', // POST
   LORA_STATUS:      '/api/lora/status',          // GET
+  BRIDGE_SYNC:      '/api/bridge/sync',          // GET
 });
 
 // ---------------------------------------------------------------------------

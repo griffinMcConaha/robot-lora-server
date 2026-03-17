@@ -17,7 +17,37 @@ Server default: `http://localhost:8080`
 
 Open `http://localhost:8080` to confirm the server is running.
 
+## Hosting on Render
+
+This repo includes [render.yaml](render.yaml) for one-click service setup.
+
+### Quick steps
+
+1. Push this repo to GitHub.
+2. In Render, create a **Blueprint** from that repo.
+3. Set secret env vars in Render:
+  - `APP_API_KEY` (used by mobile app requests)
+  - `BOARD_API_KEY` (used by LoRa bridge/board requests)
+4. Keep the attached persistent disk mounted at `/var/data`.
+5. Deploy and use your Render URL as the app server endpoint.
+
+Notes:
+- Use the Render URL/domain, not a static IP.
+- SQLite persistence is kept via `ROBOT_LORA_DATA_DIR=/var/data`.
+
 ## API
+
+## API Authentication (optional, recommended for hosted use)
+
+If either `APP_API_KEY` or `BOARD_API_KEY` is set, API key auth is enabled.
+
+- Send key as header `x-api-key: <key>`
+- Or `Authorization: Bearer <key>`
+
+Role behavior:
+- app key (`APP_API_KEY`): operator/app actions (input area, path planning, mission actions, operator workflows/notes)
+- board key (`BOARD_API_KEY`): telemetry writes (`POST /api/telemetry`)
+- both keys can read shared state endpoints (status, state, supervision, mission snapshots, bridge sync)
 
 ### 0) Server root/status
 `GET /`
@@ -132,6 +162,11 @@ Base-station passthrough (when the base station ’s `/status` JSON is forwarded
 ### 3) Get current state
 `GET /api/state`
 
+### 3.1) Bridge sync (single pull endpoint for board/app)
+`GET /api/bridge/sync`
+
+Returns mission + LoRa bridge + boundary/path + robot/fault state in one payload, suitable for independent polling loops from both app and board-side integrations.
+
 ### 4) Get coverage grid
 `GET /api/coverage`
 
@@ -228,6 +263,17 @@ A websocket is exposed at the same host/port. Messages are JSON packets:
 - `mission.updated`
 - `supervision.updated`
 - `operator.updated`
+
+## Independent app + board integration model
+
+- App loop:
+  - Write: `/api/input-area`, `/api/path/plan`, mission/operator endpoints
+  - Read: `/api/supervision/summary`, `/api/state`, `/api/bridge/sync`, websocket events
+- Board/bridge loop:
+  - Write: `/api/telemetry`
+  - Read: `/api/bridge/sync` (or `/api/lora/status` + `/api/mission/current`)
+
+Both clients can operate independently as long as they target the same hosted base URL and send the appropriate API key.
 
 ## HIL tests
 

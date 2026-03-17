@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const path = require('path');
 const { WebSocketServer } = require('ws');
 const {
   buildCoverageMap,
@@ -32,6 +33,8 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.text({ type: 'text/*', limit: '256kb' }));
+// Serve dashboard UI
+app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -40,6 +43,9 @@ const SUPERVISION_TELEMETRY_STALE_MS = Number(process.env.SUPERVISION_TELEMETRY_
 const MAX_INPUT_AREA_CELLS = Number(process.env.MAX_INPUT_AREA_CELLS ?? 60000);
 const MIN_INPUT_AREA_CELL_SIZE_M = Number(process.env.MIN_INPUT_AREA_CELL_SIZE_M ?? 1.0);
 const MAX_INPUT_AREA_CELL_SIZE_M = Number(process.env.MAX_INPUT_AREA_CELL_SIZE_M ?? 8.0);
+const APP_API_KEY = typeof process.env.APP_API_KEY === 'string' ? process.env.APP_API_KEY.trim() : '';
+const BOARD_API_KEY = typeof process.env.BOARD_API_KEY === 'string' ? process.env.BOARD_API_KEY.trim() : '';
+const API_AUTH_ENABLED = APP_API_KEY.length > 0 || BOARD_API_KEY.length > 0;
 
 const state = {
   baseStation: null,
@@ -164,6 +170,54 @@ function resolveInputAreaCellSize(boundaryLatLon, requestedCellSizeM) {
     estimatedCells: secondEstimate.cells,
   };
 }
+
+function readApiKey(req) {
+  const directHeader = req.header('x-api-key');
+  if (typeof directHeader === 'string' && directHeader.trim()) {
+    return directHeader.trim();
+  }
+
+  const authHeader = req.header('authorization');
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice('Bearer '.length).trim();
+    if (token) return token;
+  }
+
+  return null;
+}
+
+function identifyClientRole(req) {
+  const apiKey = readApiKey(req);
+  if (!apiKey) return null;
+  if (APP_API_KEY && apiKey === APP_API_KEY) return 'app';
+  if (BOARD_API_KEY && apiKey === BOARD_API_KEY) return 'board';
+  return null;
+}
+
+function requireClientRole(allowedRoles) {
+  const allowed = new Set(allowedRoles);
+
+  return (req, res, next) => {
+    if (!API_AUTH_ENABLED) {
+      return next();
+    }
+
+    const role = identifyClientRole(req);
+    if (!role || !allowed.has(role)) {
+      return res.status(401).json({
+        ok: false,
+        error: `Unauthorized for role(s): ${Array.from(allowed).join(',')}`,
+      });
+    }
+
+    req.clientRole = role;
+    return next();
+  };
+}
+
+const requireApp = requireClientRole(['app']);
+const requireBoard = requireClientRole(['board']);
+const requireAppOrBoard = requireClientRole(['app', 'board']);
 
 function createOperatorState() {
   return {
@@ -667,11 +721,11 @@ app.get(API.HEALTH, (_req, res) => {
   res.json({ ok: true, service: 'robot-lora-server' });
 });
 
-app.get(API.SUPERVISION_SUMMARY, (_req, res) => {
+app.get(API.SUPERVISION_SUMMARY, requireAppOrBoard, (_req, res) => {
   res.json({ ok: true, summary: buildSupervisionSummary() });
 });
 
-app.get(API.STATUS, (_req, res) => {
+app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
   res.json({
     battery: 85,
     state: state.robot?.state ?? ROBOT_STATE.IDLE,
@@ -691,7 +745,7 @@ app.get(API.STATUS, (_req, res) => {
   });
 });
 
-app.post(API.COMMAND, async (req, res) => {
+app.post(API.COMMAND, requireApp, async (req, res) => {
   const parsedBody = parseMaybeJson(req.body);
   const rawCmd =
     (typeof parsedBody === 'object' && parsedBody !== null && typeof parsedBody.cmd === 'string' && parsedBody.cmd) ||
@@ -719,7 +773,7 @@ app.get(API.ROOT, (_req, res) => {
     endpoints: Object.values(API),
   });
 });
-app.post(API.INPUT_AREA, (req, res) => {
+app.post(API.INPUT_AREA, requireApp, (req, res) => {
   const { baseStation, boundary, cellSizeM = 2.0 } = req.body ?? {};
   const startedAt = Date.now();
 
@@ -781,7 +835,7 @@ app.post(API.INPUT_AREA, (req, res) => {
   });
 });
 
-app.post(API.TELEMETRY, (req, res) => {
+app.post(API.TELEMETRY, requireBoard, (req, res) => {
   const parsed = parseIncomingTelemetry(req.body);
   if (!parsed) {
     return res.status(400).json({ ok: false, error: 'Unsupported telemetry payload' });
@@ -855,11 +909,11 @@ app.post(API.TELEMETRY, (req, res) => {
   return res.json({ ok: true, coverage: stats });
 });
 
-app.get(API.STATE, (_req, res) => {
+app.get(API.STATE, requireAppOrBoard, (_req, res) => {
   res.json({ ok: true, state: publicState() });
 });
 
-app.get(API.COVERAGE, (_req, res) => {
+app.get(API.COVERAGE, requireAppOrBoard, (_req, res) => {
   if (!state.coverage) {
     return res.status(400).json({ ok: false, error: 'input area is not initialized' });
   }
@@ -885,7 +939,7 @@ app.get(API.COVERAGE, (_req, res) => {
   });
 });
 
-app.post(API.PATH_PLAN, (req, res) => {
+app.post(API.PATH_PLAN, requireApp, (req, res) => {
   if (!state.coverage) {
     return res.status(400).json({ ok: false, error: 'input area is not initialized' });
   }
@@ -935,7 +989,7 @@ app.post(API.PATH_PLAN, (req, res) => {
 
 // POST /api/mission/start  — transitions CONFIGURING → RUNNING
 // Also pushes staged waypoints (from lastPath) to STM32, then sends AUTO.
-app.post(API.MISSION_START, async (_req, res) => {
+app.post(API.MISSION_START, requireApp, async (_req, res) => {
   try {
     if (currentMissionState() !== MISSION_STATE.CONFIGURING) {
       return res.status(409).json({ ok: false, error: 'Mission must be CONFIGURING before start' });
@@ -975,7 +1029,7 @@ app.post(API.MISSION_START, async (_req, res) => {
 });
 
 // POST /api/mission/pause  — transitions RUNNING → PAUSED
-app.post(API.MISSION_PAUSE, async (req, res) => {
+app.post(API.MISSION_PAUSE, requireApp, async (req, res) => {
   const reason = req.body?.reason ?? null;
   try {
     if (currentMissionState() !== MISSION_STATE.RUNNING) {
@@ -994,7 +1048,7 @@ app.post(API.MISSION_PAUSE, async (req, res) => {
 });
 
 // POST /api/mission/resume  — transitions PAUSED → RUNNING
-app.post(API.MISSION_RESUME, async (_req, res) => {
+app.post(API.MISSION_RESUME, requireApp, async (_req, res) => {
   try {
     if (currentMissionState() !== MISSION_STATE.PAUSED) {
       return res.status(409).json({ ok: false, error: 'Mission must be PAUSED before resume' });
@@ -1015,7 +1069,7 @@ app.post(API.MISSION_RESUME, async (_req, res) => {
 });
 
 // POST /api/mission/complete  — transitions RUNNING → COMPLETED  (operator-declared)
-app.post(API.MISSION_COMPLETE, async (_req, res) => {
+app.post(API.MISSION_COMPLETE, requireApp, async (_req, res) => {
   try {
     if (currentMissionState() !== MISSION_STATE.RUNNING) {
       return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before complete' });
@@ -1039,7 +1093,7 @@ app.post(API.MISSION_COMPLETE, async (_req, res) => {
 });
 
 // POST /api/mission/abort  — transitions RUNNING|PAUSED → ABORTED
-app.post(API.MISSION_ABORT, async (req, res) => {
+app.post(API.MISSION_ABORT, requireApp, async (req, res) => {
   const reason = req.body?.reason ?? 'operator';
   try {
     if (![MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
@@ -1064,21 +1118,21 @@ app.post(API.MISSION_ABORT, async (req, res) => {
 });
 
 // GET /api/mission/current  — live snapshot
-app.get(API.MISSION_CURRENT, (_req, res) => {
+app.get(API.MISSION_CURRENT, requireAppOrBoard, (_req, res) => {
   const m = mission.publicMission();
   if (!m) return res.status(404).json({ ok: false, error: 'No active mission' });
   return res.json({ ok: true, mission: m });
 });
 
 // GET /api/mission/history?limit=50
-app.get(API.MISSION_HISTORY, (req, res) => {
+app.get(API.MISSION_HISTORY, requireAppOrBoard, (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 50), 500);
   const rows = db.listMissions(limit);
   return res.json({ ok: true, missions: rows });
 });
 
 // GET /api/mission/:id/events?type=<EVENT_TYPE>
-app.get(API.MISSION_EVENTS, (req, res) => {
+app.get(API.MISSION_EVENTS, requireAppOrBoard, (req, res) => {
   const id   = Number(req.params.id);
   const type = req.query.type ?? null;
   if (!Number.isInteger(id) || id < 1) {
@@ -1097,14 +1151,42 @@ app.get(API.MISSION_EVENTS, (req, res) => {
 // ---------------------------------------------------------------------------
 
 // GET /api/lora/status  — bridge + WP push state
-app.get(API.LORA_STATUS, (_req, res) => {
+app.get(API.LORA_STATUS, requireAppOrBoard, (_req, res) => {
   res.json({ ok: true, lora: bridge.getStatus() });
+});
+
+app.get(API.BRIDGE_SYNC, requireAppOrBoard, (_req, res) => {
+  const coverage = state.coverage
+    ? {
+        width: state.coverage.width,
+        height: state.coverage.height,
+        cellSizeM: state.coverage.cellSizeM,
+        stats: coverageStats(state.coverage),
+      }
+    : null;
+
+  res.json({
+    ok: true,
+    role: _req.clientRole ?? 'unknown',
+    now: Date.now(),
+    mission: mission.publicMission(),
+    lora: bridge.getStatus(),
+    baseStation: state.baseStation,
+    boundary: state.boundary,
+    lastPath: state.lastPath,
+    coverage,
+    robot: state.robot,
+    lastCommand: state.lastCommand,
+    lastCommandAt: state.lastCommandAt,
+    lastFault: state.lastFault,
+    telemetryStale: isTelemetryStale(),
+  });
 });
 
 // POST /api/lora/push-waypoints  — manual WP push trigger
 // Body: { points: [{ lat, lon, salt, brine }, ...] }
 // If points is omitted uses state.lastPath.
-app.post(API.LORA_PUSH_WP, async (req, res) => {
+app.post(API.LORA_PUSH_WP, requireApp, async (req, res) => {
   if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
     return res.status(409).json({ ok: false, error: 'Waypoint push allowed only while mission is CONFIGURING or PAUSED' });
   }
@@ -1131,7 +1213,7 @@ app.post(API.LORA_PUSH_WP, async (req, res) => {
   return res.json({ ok: true, sent: result.sent });
 });
 
-app.get(API.OPERATOR_WORKFLOWS, (_req, res) => {
+app.get(API.OPERATOR_WORKFLOWS, requireApp, (_req, res) => {
   return res.json({
     ok: true,
     workflows: buildOperatorWorkflows(),
@@ -1140,7 +1222,7 @@ app.get(API.OPERATOR_WORKFLOWS, (_req, res) => {
   });
 });
 
-app.post(API.OPERATOR_WORKFLOW_STEP, (req, res) => {
+app.post(API.OPERATOR_WORKFLOW_STEP, requireApp, (req, res) => {
   const { workflowId, stepId } = req.params;
   const { checked = true, actor = 'operator', note = null } = req.body ?? {};
 
@@ -1179,11 +1261,11 @@ app.post(API.OPERATOR_WORKFLOW_STEP, (req, res) => {
   });
 });
 
-app.get(API.OPERATOR_NOTES, (_req, res) => {
+app.get(API.OPERATOR_NOTES, requireApp, (_req, res) => {
   return res.json({ ok: true, notes: state.operator.notes });
 });
 
-app.post(API.OPERATOR_NOTES, (req, res) => {
+app.post(API.OPERATOR_NOTES, requireApp, (req, res) => {
   const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
   const category = typeof req.body?.category === 'string' && req.body.category.trim()
     ? req.body.category.trim()
