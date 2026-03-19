@@ -440,8 +440,10 @@
         addLogEntry('Area', 'Input area updated', 'value');
       } else if (event === 'path.updated') {
         const pointCount = Array.isArray(payload?.points) ? payload.points.length : 0;
-        document.getElementById('distanceTraveled').textContent = `${pointCount} path pts`;
-        addLogEntry('Path', `Path updated (${pointCount} points)`, 'event');
+        const mode = typeof payload?.mode === 'string' ? payload.mode.toLowerCase() : 'path';
+        const modeLabel = mode === 'coverage' ? 'Coverage plan' : 'Goal plan';
+        document.getElementById('distanceTraveled').textContent = `${pointCount} planned points`;
+        addLogEntry('Path', `${modeLabel} updated (${pointCount} points)`, 'event');
       } else if (event === 'command.received') {
         document.getElementById('lastCommand').textContent = payload?.cmd || '—';
         document.getElementById('lastCommandTime').textContent = payload?.at ? new Date(payload.at).toLocaleTimeString() : '—';

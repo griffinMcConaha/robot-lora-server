@@ -114,6 +114,10 @@ Returns a single app-facing supervision payload with:
 }
 ```
 
+`cellSizeM` now supports down to `0.5` meters (default minimum), which is recommended when planning 0.5m coverage passes.
+
+Coverage progress is updated from telemetry using a configurable mark radius (`COVERAGE_MARK_RADIUS_M`, default `0.5`).
+
 ### 2) Push telemetry
 `POST /api/telemetry`
 
@@ -173,11 +177,27 @@ Returns mission + LoRa bridge + boundary/path + robot/fault state in one payload
 ### 5) Plan path
 `POST /api/path/plan`
 
+Coverage plan mode (interior sweep; default when `goal` is omitted):
+
 ```json
 {
+  "mode": "coverage",
+  "coverageWidthM": 0.5
+}
+```
+
+Goal-to-goal mode (A* route):
+
+```json
+{
+  "mode": "goal",
   "goal": { "lat": 41.0759, "lon": -81.5137 }
 }
 ```
+
+Response waypoints include `headingDeg` on each point (except final point), which can be used to draw direction arrows in the map UI.
+
+`mode` must be either `coverage` or `goal`.
 
 ### 6) Mission lifecycle
 

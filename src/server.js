@@ -9,7 +9,7 @@ const {
   coverageStats,
 } = require('./coverage');
 const { latLonToLocal } = require('./geo');
-const { findPath } = require('./pathing');
+const { findPath, findCoveragePath } = require('./pathing');
 const {
   ROBOT_STATE,
   CMD,
@@ -41,8 +41,9 @@ const wss = new WebSocketServer({ server });
 
 const SUPERVISION_TELEMETRY_STALE_MS = Number(process.env.SUPERVISION_TELEMETRY_STALE_MS ?? 15000);
 const MAX_INPUT_AREA_CELLS = Number(process.env.MAX_INPUT_AREA_CELLS ?? 60000);
-const MIN_INPUT_AREA_CELL_SIZE_M = Number(process.env.MIN_INPUT_AREA_CELL_SIZE_M ?? 1.0);
+const MIN_INPUT_AREA_CELL_SIZE_M = Number(process.env.MIN_INPUT_AREA_CELL_SIZE_M ?? 0.5);
 const MAX_INPUT_AREA_CELL_SIZE_M = Number(process.env.MAX_INPUT_AREA_CELL_SIZE_M ?? 8.0);
+const COVERAGE_MARK_RADIUS_M = Number(process.env.COVERAGE_MARK_RADIUS_M ?? 0.5);
 const APP_API_KEY = typeof process.env.APP_API_KEY === 'string' ? process.env.APP_API_KEY.trim() : '';
 const BOARD_API_KEY = typeof process.env.BOARD_API_KEY === 'string' ? process.env.BOARD_API_KEY.trim() : '';
 const API_AUTH_ENABLED = APP_API_KEY.length > 0 || BOARD_API_KEY.length > 0;
@@ -114,6 +115,13 @@ function getCoveragePct(stats) {
 
 function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function resolveCoverageMarkRadiusM() {
+  if (!Number.isFinite(COVERAGE_MARK_RADIUS_M) || COVERAGE_MARK_RADIUS_M <= 0) {
+    return 0.5;
+  }
+  return COVERAGE_MARK_RADIUS_M;
 }
 
 function estimateGridCellCount(boundaryLatLon, cellSizeM) {
@@ -370,7 +378,7 @@ function buildOperatorWorkflows() {
         { id: 'waypoints-committed', title: 'Waypoints committed', kind: 'derived', checked: wpPushState === 'committed', ready: hasPath },
         {
           id: 'radio-check',
-          title: 'Operator radio check complete',
+          title: 'Radio check completed',
           kind: 'manual',
           checked: Boolean(getWorkflowAck('preflight', 'radio-check')?.checked),
           ready: hasArea,
@@ -378,7 +386,7 @@ function buildOperatorWorkflows() {
         },
         {
           id: 'area-clear',
-          title: 'Operator confirmed area is clear',
+          title: 'Area clearance confirmed',
           kind: 'manual',
           checked: Boolean(getWorkflowAck('preflight', 'area-clear')?.checked),
           ready: hasArea,
@@ -393,7 +401,7 @@ function buildOperatorWorkflows() {
       steps: [
         {
           id: 'fault-reviewed',
-          title: 'Fault reviewed by operator',
+          title: 'Fault review completed',
           kind: 'manual',
           checked: Boolean(getWorkflowAck('recovery', 'fault-reviewed')?.checked),
           ready: Boolean(state.lastFault),
@@ -409,7 +417,7 @@ function buildOperatorWorkflows() {
         },
         {
           id: 'reset-eligible',
-          title: 'Reset is allowed',
+          title: 'Reset eligibility confirmed',
           kind: 'derived',
           checked: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
           ready: true,
@@ -430,7 +438,7 @@ function buildOperatorWorkflows() {
         },
         {
           id: 'note-entered',
-          title: 'Operator shutdown note entered',
+          title: 'Shutdown note recorded',
           kind: 'derived',
           checked: Boolean(latestNote),
           ready: true,
@@ -887,7 +895,7 @@ app.post(API.TELEMETRY, requireBoard, (req, res) => {
 
   let stats = null;
   if (state.coverage) {
-    markCoverage(state.coverage, state.robot, 1.5, state.robot.timestampMs);
+    markCoverage(state.coverage, state.robot, resolveCoverageMarkRadiusM(), state.robot.timestampMs);
     stats = coverageStats(state.coverage);
   }
 
@@ -945,9 +953,10 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
   }
 
   const { goal, start, saltPct, brinePct } = req.body ?? {};
-  if (!goal || typeof goal.lat !== 'number' || typeof goal.lon !== 'number') {
-    return res.status(400).json({ ok: false, error: 'goal.lat/lon required' });
-  }
+  const requestedMode = typeof req.body?.mode === 'string' ? req.body.mode.trim().toLowerCase() : null;
+  const coverageWidthM = Number.isFinite(Number(req.body?.coverageWidthM)) && Number(req.body?.coverageWidthM) > 0
+    ? Number(req.body.coverageWidthM)
+    : 0.5;
 
   const normalizedSalt = Number.isFinite(Number(saltPct))
     ? Math.max(0, Math.min(100, Math.round(Number(saltPct))))
@@ -961,7 +970,23 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     return res.status(400).json({ ok: false, error: 'no start point available' });
   }
 
-  const path = findPath(state.coverage, startPoint, goal);
+  let mode = requestedMode;
+  if (!mode) {
+    mode = goal && typeof goal.lat === 'number' && typeof goal.lon === 'number' ? 'goal' : 'coverage';
+  }
+
+  if (!['coverage', 'goal'].includes(mode)) {
+    return res.status(400).json({ ok: false, error: 'mode must be either "coverage" or "goal"' });
+  }
+
+  if (mode !== 'coverage' && (!goal || typeof goal.lat !== 'number' || typeof goal.lon !== 'number')) {
+    return res.status(400).json({ ok: false, error: 'goal.lat/lon required for goal mode' });
+  }
+
+  const path = mode === 'coverage'
+    ? findCoveragePath(state.coverage, { swathWidthM: coverageWidthM })
+    : findPath(state.coverage, startPoint, goal);
+
   if (!path.ok) {
     state.lastPath = [];
     return res.status(400).json({ ok: false, error: path.reason });
@@ -972,15 +997,22 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     salt: normalizedSalt,
     brine: normalizedBrine,
   }));
-  publish(WS_EVENT.PATH_UPDATED, { points: state.lastPath });
+  publish(WS_EVENT.PATH_UPDATED, {
+    mode,
+    coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
+    points: state.lastPath,
+    meta: path.meta ?? null,
+  });
   db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
+    mode,
     pointCount: state.lastPath.length,
     saltPct: normalizedSalt,
     brinePct: normalizedBrine,
+    coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
   });
   publishSupervision();
   publishOperator();
-  res.json({ ok: true, points: state.lastPath });
+  res.json({ ok: true, mode, coverageWidthM: mode === 'coverage' ? coverageWidthM : null, points: state.lastPath, meta: path.meta ?? null });
 });
 
 // ---------------------------------------------------------------------------
