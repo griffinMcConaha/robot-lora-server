@@ -98,6 +98,11 @@ static char last_cmd[192]    = "none";
 
 // Phase D: separate verbatim store for last LoRa RX, served via GET /last_lora
 static char last_lora_rx[256] = "";
+static uint32_t lora_tx_ok_count = 0;
+static uint32_t lora_tx_fail_count = 0;
+static uint32_t lora_tx_fail_streak = 0;
+static uint32_t lora_last_tx_ok_ms = 0;
+static uint32_t lora_last_tx_fail_ms = 0;
 
 // ---------------- LoRa Queue ----------------
 typedef struct {
@@ -114,6 +119,26 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, status_json, HTTPD_RESP_USE_STRLEN);
     xSemaphoreGive(status_lock);
+    return ESP_OK;
+}
+
+static esp_err_t health_get_handler(httpd_req_t *req) {
+    int queue_depth = (int)uxQueueMessagesWaiting(lora_cmd_q);
+    bool degraded = lora_tx_fail_streak >= 3;
+
+    char health_json[256];
+    snprintf(health_json, sizeof(health_json),
+             "{\"ok\":%s,\"bridge_degraded\":%s,\"queue_depth\":%d,"
+             "\"lora_tx_ok\":%lu,\"lora_tx_fail\":%lu,\"lora_tx_fail_streak\":%lu}",
+             degraded ? "false" : "true",
+             degraded ? "true" : "false",
+             queue_depth,
+             (unsigned long)lora_tx_ok_count,
+             (unsigned long)lora_tx_fail_count,
+             (unsigned long)lora_tx_fail_streak);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, health_json, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -172,8 +197,13 @@ static esp_err_t command_post_handler(httpd_req_t *req) {
     xSemaphoreTake(status_lock, portMAX_DELAY);
     snprintf(status_json, sizeof(status_json),
              "{\"battery\":85,\"state\":\"CMD_QUEUED\",\"mode\":\"HTTP\","
-             "\"last_cmd\":\"%.120s\",\"queue_depth\":%d}",
-             last_cmd, (int)uxQueueMessagesWaiting(lora_cmd_q));
+             "\"last_cmd\":\"%.120s\",\"queue_depth\":%d,"
+             "\"lora_tx_ok\":%lu,\"lora_tx_fail\":%lu,\"lora_tx_fail_streak\":%lu}",
+             last_cmd,
+             (int)uxQueueMessagesWaiting(lora_cmd_q),
+             (unsigned long)lora_tx_ok_count,
+             (unsigned long)lora_tx_fail_count,
+             (unsigned long)lora_tx_fail_streak);
     xSemaphoreGive(status_lock);
 
     httpd_resp_sendstr(req, "OK");
@@ -195,6 +225,11 @@ static httpd_handle_t start_http_server(void) {
             .method  = HTTP_POST,
             .handler = command_post_handler
         };
+        httpd_uri_t health_uri = {
+            .uri     = "/health",
+            .method  = HTTP_GET,
+            .handler = health_get_handler
+        };
         // Phase D: new endpoint for raw LoRa RX polling
         httpd_uri_t last_lora_uri = {
             .uri     = "/last_lora",
@@ -204,9 +239,10 @@ static httpd_handle_t start_http_server(void) {
 
         httpd_register_uri_handler(server, &status_uri);
         httpd_register_uri_handler(server, &cmd_uri);
+        httpd_register_uri_handler(server, &health_uri);
         httpd_register_uri_handler(server, &last_lora_uri);
 
-        ESP_LOGI(TAG, "HTTP server: GET /status, POST /command, GET /last_lora");
+        ESP_LOGI(TAG, "HTTP server: GET /status, GET /health, POST /command, GET /last_lora");
     }
     return server;
 }
@@ -329,7 +365,30 @@ static void lora_tx_task(void *arg) {
                 }
 
                 if (!sent) {
+                    lora_tx_fail_count++;
+                    lora_tx_fail_streak++;
+                    lora_last_tx_fail_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
                     ESP_LOGE(TAG, "LoRaSend failed after 3 retries: %.*s", c.len, c.payload);
+                    xSemaphoreTake(status_lock, portMAX_DELAY);
+                    snprintf(status_json, sizeof(status_json),
+                             "{\"battery\":85,\"state\":\"LORA_TX_FAIL\",\"mode\":\"LORA\","
+                             "\"queue_depth\":%d,\"last_cmd\":\"%.120s\","
+                             "\"lora_tx_ok\":%lu,\"lora_tx_fail\":%lu,\"lora_tx_fail_streak\":%lu,"
+                             "\"lora_last_tx_ok_ms\":%lu,\"lora_last_tx_fail_ms\":%lu,"
+                             "\"bridge_degraded\":%s}",
+                             (int)uxQueueMessagesWaiting(lora_cmd_q),
+                             last_cmd,
+                             (unsigned long)lora_tx_ok_count,
+                             (unsigned long)lora_tx_fail_count,
+                             (unsigned long)lora_tx_fail_streak,
+                             (unsigned long)lora_last_tx_ok_ms,
+                             (unsigned long)lora_last_tx_fail_ms,
+                             (lora_tx_fail_streak >= 3) ? "true" : "false");
+                    xSemaphoreGive(status_lock);
+                } else {
+                    lora_tx_ok_count++;
+                    lora_tx_fail_streak = 0;
+                    lora_last_tx_ok_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
                 }
             }
         }
@@ -355,9 +414,18 @@ static void lora_rx_task(void *arg) {
             // Phase D: include queue depth in /status JSON
             snprintf(status_json, sizeof(status_json),
                      "{\"battery\":85,\"state\":\"IDLE\",\"mode\":\"LORA\","
-                     "\"queue_depth\":%d,\"last_lora\":\"%.200s\"}",
+                     "\"queue_depth\":%d,\"last_lora\":\"%.200s\","
+                     "\"lora_tx_ok\":%lu,\"lora_tx_fail\":%lu,\"lora_tx_fail_streak\":%lu,"
+                     "\"lora_last_tx_ok_ms\":%lu,\"lora_last_tx_fail_ms\":%lu,"
+                     "\"bridge_degraded\":%s}",
                      (int)uxQueueMessagesWaiting(lora_cmd_q),
-                     last_lora_rx);
+                     last_lora_rx,
+                     (unsigned long)lora_tx_ok_count,
+                     (unsigned long)lora_tx_fail_count,
+                     (unsigned long)lora_tx_fail_streak,
+                     (unsigned long)lora_last_tx_ok_ms,
+                     (unsigned long)lora_last_tx_fail_ms,
+                     (lora_tx_fail_streak >= 3) ? "true" : "false");
 
             xSemaphoreGive(status_lock);
 

@@ -53,6 +53,9 @@ const { LORA_WIRE, ARBITRATION } = require('./contracts');
 // ---------------------------------------------------------------------------
 const BASE_STATION_URL = (process.env.BASE_STATION_URL ?? 'http://192.168.4.1').replace(/\/$/, '');
 const REQUEST_TIMEOUT_MS = Number(process.env.LORA_REQUEST_TIMEOUT_MS ?? 3000);
+const TRANSIENT_RETRY_MAX = Number(process.env.LORA_TRANSIENT_RETRY_MAX ?? 2);
+const TRANSIENT_RETRY_MS = Number(process.env.LORA_TRANSIENT_RETRY_MS ?? 200);
+const BRIDGE_DEGRADED_FAILURE_THRESHOLD = Number(process.env.BRIDGE_DEGRADED_FAILURE_THRESHOLD ?? 3);
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -64,6 +67,10 @@ let _lastCmdError   = null;
 let _wpPushError    = null;
 let _wpPushCount    = 0;       // number of WP lines sent in last push
 let _wpPushAt       = null;    // timestamp of last committed push
+let _lastSuccessAt  = null;
+let _lastErrorAt    = null;
+let _consecutiveFailures = 0;
+let _degradedSince  = null;
 
 // ---------------------------------------------------------------------------
 // Low-level HTTP helper
@@ -150,11 +157,35 @@ async function _postWithRetry(path, body) {
     const r = await _post(path, body);
     if (r.ok) return r;
     const isQueueFull = r.status === 503 && r.body === 'queue_full';
-    if (!isQueueFull || attempt === QUEUE_FULL_RETRY_MAX) return r;
-    await _sleep(QUEUE_FULL_RETRY_MS);
+    const isTransient =
+      isQueueFull
+      || r.status == null
+      || r.status >= 500
+      || (typeof r.error === 'string' && r.error.toLowerCase().includes('timeout'));
+
+    const maxRetries = isQueueFull ? QUEUE_FULL_RETRY_MAX : TRANSIENT_RETRY_MAX;
+    const retryDelayMs = isQueueFull ? QUEUE_FULL_RETRY_MS : TRANSIENT_RETRY_MS;
+
+    if (!isTransient || attempt === maxRetries) return r;
+    await _sleep(retryDelayMs);
   }
   // unreachable
   return { ok: false, status: 503, body: 'queue_full', error: 'Max queue-full retries exceeded' };
+}
+
+function _recordResult(result) {
+  if (result?.ok) {
+    _lastSuccessAt = new Date().toISOString();
+    _consecutiveFailures = 0;
+    _degradedSince = null;
+    return;
+  }
+
+  _lastErrorAt = new Date().toISOString();
+  _consecutiveFailures += 1;
+  if (_consecutiveFailures >= BRIDGE_DEGRADED_FAILURE_THRESHOLD && !_degradedSince) {
+    _degradedSince = _lastErrorAt;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,11 +203,12 @@ async function sendCommand(cmd) {
     return { ok: false, status: null, body: '', error: 'cmd must be a non-empty string' };
   }
   const cmdStr = cmd.trim().toUpperCase();
-  const result = await _post('/command', cmdStr);
+  const result = await _postWithRetry('/command', cmdStr);
 
   _lastCmd      = cmdStr;
   _lastCmdAt    = new Date().toISOString();
   _lastCmdError = result.ok ? null : (result.error ?? `HTTP ${result.status}`);
+  _recordResult(result);
 
   return result;
 }
@@ -227,6 +259,7 @@ async function pushWaypoints(points) {
   // 1. WPCLEAR
   {
     const r = await _postWithRetry('/command', LORA_WIRE.WP_CLEAR);
+    _recordResult(r);
     if (!r.ok) return _wpFail(0, r.error ?? `WPCLEAR HTTP ${r.status}`);
   }
   await _sleep(LORA_WIRE.WP_INTERLINE_MS);
@@ -238,6 +271,7 @@ async function pushWaypoints(points) {
     const brine = Math.round(p.brine);
     const line  = `${LORA_WIRE.WP_ADD}:${i}:${p.lat.toFixed(6)},${p.lon.toFixed(6)},${salt},${brine}`;
     const r     = await _postWithRetry('/command', line);
+    _recordResult(r);
     if (!r.ok) return _wpFail(i, r.error ?? `WP:${i} HTTP ${r.status}`);
     if (i < points.length - 1) await _sleep(LORA_WIRE.WP_INTERLINE_MS);
   }
@@ -246,6 +280,7 @@ async function pushWaypoints(points) {
   // 3. WPLOAD:<count>
   {
     const r = await _postWithRetry('/command', `${LORA_WIRE.WP_LOAD}:${points.length}`);
+    _recordResult(r);
     if (!r.ok) return _wpFail(points.length, r.error ?? `WPLOAD HTTP ${r.status}`);
   }
 
@@ -253,6 +288,7 @@ async function pushWaypoints(points) {
   _wpPushCount = points.length;
   _wpPushAt    = new Date().toISOString();
   _wpPushError = null;
+  _recordResult({ ok: true });
   return { ok: true, sent: points.length, error: null };
 }
 
@@ -279,6 +315,12 @@ function getStatus() {
     lastCmd:        _lastCmd,
     lastCmdAt:      _lastCmdAt,
     lastCmdError:   _lastCmdError,
+    lastSuccessAt:  _lastSuccessAt,
+    lastErrorAt:    _lastErrorAt,
+    consecutiveFailures: _consecutiveFailures,
+    degraded: _consecutiveFailures >= BRIDGE_DEGRADED_FAILURE_THRESHOLD,
+    degradedSince: _degradedSince,
+    requestTimeoutMs: REQUEST_TIMEOUT_MS,
   };
 }
 
@@ -330,6 +372,7 @@ function observeCommand(cmd) {
 function _wpFail(sent, error) {
   _wpPushState = ARBITRATION.WP_FAILED;
   _wpPushError = error;
+  _recordResult({ ok: false, error });
   return { ok: false, sent, error };
 }
 

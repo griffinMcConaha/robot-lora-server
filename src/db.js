@@ -129,6 +129,14 @@ const stmts = {
   countEvents: db.prepare(`
     SELECT COUNT(*) as n FROM events WHERE mission_id = ?
   `),
+
+  deleteEventsBefore: db.prepare(`
+    DELETE FROM events WHERE at < @cutoff_ms
+  `),
+
+  ping: db.prepare(`
+    SELECT 1 as ok
+  `),
 };
 
 // ---------------------------------------------------------------------------
@@ -247,9 +255,26 @@ function countMissionEvents(missionId) {
   return stmts.countEvents.get(missionId)?.n ?? 0;
 }
 
+/** Prune old events before cutoff unix-ms timestamp. Returns deleted row count. */
+function pruneEventsBefore(cutoffMs) {
+  if (!Number.isFinite(cutoffMs)) return 0;
+  const result = stmts.deleteEventsBefore.run({ cutoff_ms: cutoffMs });
+  return Number(result?.changes ?? 0);
+}
+
 /** Close the database (for clean shutdown / tests). */
 function close() {
   db.close();
+}
+
+/** Lightweight DB liveness check for health/readiness probes. */
+function ping() {
+  try {
+    const row = stmts.ping.get();
+    return row?.ok === 1;
+  } catch (_) {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,5 +315,7 @@ module.exports = {
   getMissionEvents,
   getMissionEventsByType,
   countMissionEvents,
+  pruneEventsBefore,
+  ping,
   close,
 };

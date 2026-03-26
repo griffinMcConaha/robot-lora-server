@@ -7,6 +7,8 @@ const {
   buildCoverageMap,
   markCoverage,
   coverageStats,
+  worldToGrid,
+  withinGrid,
 } = require('./coverage');
 const { latLonToLocal } = require('./geo');
 const { findPath, findCoveragePath } = require('./pathing');
@@ -40,13 +42,55 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 const SUPERVISION_TELEMETRY_STALE_MS = Number(process.env.SUPERVISION_TELEMETRY_STALE_MS ?? 15000);
+const TELEMETRY_FAILSAFE_ENABLED = String(process.env.TELEMETRY_FAILSAFE_ENABLED ?? '1') !== '0';
+const TELEMETRY_FAILSAFE_ACTION = String(process.env.TELEMETRY_FAILSAFE_ACTION ?? CMD.ESTOP).trim().toUpperCase();
+const TELEMETRY_FAILSAFE_COOLDOWN_MS = Number(process.env.TELEMETRY_FAILSAFE_COOLDOWN_MS ?? Math.max(SUPERVISION_TELEMETRY_STALE_MS, 5000));
+const SAFETY_MONITOR_INTERVAL_MS = Number(process.env.SAFETY_MONITOR_INTERVAL_MS ?? 500);
+const GEOFENCE_FAILSAFE_ENABLED = String(process.env.GEOFENCE_FAILSAFE_ENABLED ?? '1') !== '0';
+const GEOFENCE_FAILSAFE_ACTION = String(process.env.GEOFENCE_FAILSAFE_ACTION ?? CMD.ESTOP).trim().toUpperCase();
+const GEOFENCE_FAILSAFE_COOLDOWN_MS = Number(process.env.GEOFENCE_FAILSAFE_COOLDOWN_MS ?? 5000);
+const EVENT_RETENTION_DAYS = Number(process.env.EVENT_RETENTION_DAYS ?? 30);
+const EVENT_RETENTION_PRUNE_INTERVAL_MS = Number(process.env.EVENT_RETENTION_PRUNE_INTERVAL_MS ?? 3600000);
 const MAX_INPUT_AREA_CELLS = Number(process.env.MAX_INPUT_AREA_CELLS ?? 60000);
 const MIN_INPUT_AREA_CELL_SIZE_M = Number(process.env.MIN_INPUT_AREA_CELL_SIZE_M ?? 0.5);
 const MAX_INPUT_AREA_CELL_SIZE_M = Number(process.env.MAX_INPUT_AREA_CELL_SIZE_M ?? 8.0);
 const COVERAGE_MARK_RADIUS_M = Number(process.env.COVERAGE_MARK_RADIUS_M ?? 0.5);
-const APP_API_KEY = typeof process.env.APP_API_KEY === 'string' ? process.env.APP_API_KEY.trim() : '';
-const BOARD_API_KEY = typeof process.env.BOARD_API_KEY === 'string' ? process.env.BOARD_API_KEY.trim() : '';
-const API_AUTH_ENABLED = APP_API_KEY.length > 0 || BOARD_API_KEY.length > 0;
+const REQUEST_RATE_LIMIT_WINDOW_MS = Number(process.env.REQUEST_RATE_LIMIT_WINDOW_MS ?? 60000);
+const COMMAND_RATE_LIMIT_PER_WINDOW = Number(process.env.COMMAND_RATE_LIMIT_PER_WINDOW ?? 240);
+const TELEMETRY_RATE_LIMIT_PER_WINDOW = Number(process.env.TELEMETRY_RATE_LIMIT_PER_WINDOW ?? 6000);
+
+function parseKeyList(value) {
+  if (typeof value !== 'string') return [];
+  return value
+    .split(',')
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+const APP_API_KEYS = new Set([
+  ...parseKeyList(process.env.APP_API_KEYS),
+  ...(typeof process.env.APP_API_KEY === 'string' && process.env.APP_API_KEY.trim() ? [process.env.APP_API_KEY.trim()] : []),
+]);
+const BOARD_API_KEYS = new Set([
+  ...parseKeyList(process.env.BOARD_API_KEYS),
+  ...(typeof process.env.BOARD_API_KEY === 'string' && process.env.BOARD_API_KEY.trim() ? [process.env.BOARD_API_KEY.trim()] : []),
+]);
+const API_AUTH_ENABLED = APP_API_KEYS.size > 0 || BOARD_API_KEYS.size > 0;
+
+const rateLimitStore = new Map();
+
+const metrics = {
+  startedAt: Date.now(),
+  authDenied: 0,
+  rateLimitDenied: 0,
+  commandsDispatched: 0,
+  commandsFailed: 0,
+  telemetryAccepted: 0,
+  telemetryRejected: 0,
+  safetyActions: 0,
+  eventPruneRuns: 0,
+  eventPrunedRows: 0,
+};
 
 const state = {
   baseStation: null,
@@ -58,8 +102,18 @@ const state = {
   lastCommand: null,
   lastCommandAt: 0,
   lastFault: null,
+  safety: {
+    telemetryFailsafeAt: 0,
+    telemetryFailsafeAction: null,
+    telemetryFailsafeReason: null,
+    geofenceFailsafeAt: 0,
+    geofenceFailsafeAction: null,
+    geofenceFailsafeReason: null,
+  },
   operator: createOperatorState(),
 };
+
+let safetyMonitorInFlight = false;
 
 const DRIVE_COMMANDS = new Set([
   CMD.FORWARD,
@@ -115,6 +169,23 @@ function getCoveragePct(stats) {
 
 function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function resolveTelemetryFailsafeAction() {
+  if (TELEMETRY_FAILSAFE_ACTION === CMD.PAUSE) return CMD.PAUSE;
+  return CMD.ESTOP;
+}
+
+function resolveGeofenceFailsafeAction() {
+  if (GEOFENCE_FAILSAFE_ACTION === CMD.PAUSE) return CMD.PAUSE;
+  return CMD.ESTOP;
+}
+
+function isRobotInsideCoverageArea(robotPoint) {
+  if (!state.coverage || !robotPoint) return true;
+  const { row, col } = worldToGrid(state.coverage, robotPoint);
+  if (!withinGrid(state.coverage, row, col)) return false;
+  return Boolean(state.coverage.cells[row][col]?.inside);
 }
 
 function resolveCoverageMarkRadiusM() {
@@ -197,8 +268,8 @@ function readApiKey(req) {
 function identifyClientRole(req) {
   const apiKey = readApiKey(req);
   if (!apiKey) return null;
-  if (APP_API_KEY && apiKey === APP_API_KEY) return 'app';
-  if (BOARD_API_KEY && apiKey === BOARD_API_KEY) return 'board';
+  if (APP_API_KEYS.has(apiKey)) return 'app';
+  if (BOARD_API_KEYS.has(apiKey)) return 'board';
   return null;
 }
 
@@ -212,6 +283,7 @@ function requireClientRole(allowedRoles) {
 
     const role = identifyClientRole(req);
     if (!role || !allowed.has(role)) {
+      metrics.authDenied += 1;
       return res.status(401).json({
         ok: false,
         error: `Unauthorized for role(s): ${Array.from(allowed).join(',')}`,
@@ -226,6 +298,38 @@ function requireClientRole(allowedRoles) {
 const requireApp = requireClientRole(['app']);
 const requireBoard = requireClientRole(['board']);
 const requireAppOrBoard = requireClientRole(['app', 'board']);
+
+function makeRateLimitMiddleware(bucketName, limitPerWindow, windowMs) {
+  return (req, res, next) => {
+    const role = req.clientRole ?? identifyClientRole(req) ?? 'anon';
+    const key = `${bucketName}:${role}:${req.ip ?? 'unknown'}`;
+    const now = Date.now();
+    const windowStart = now - windowMs;
+
+    const existing = rateLimitStore.get(key);
+    if (!existing || existing.windowStart < windowStart) {
+      rateLimitStore.set(key, { windowStart: now, count: 1 });
+      return next();
+    }
+
+    existing.count += 1;
+    if (existing.count > limitPerWindow) {
+      metrics.rateLimitDenied += 1;
+      return res.status(429).json({
+        ok: false,
+        error: `Rate limit exceeded for ${bucketName}`,
+        bucket: bucketName,
+        limitPerWindow,
+        windowMs,
+      });
+    }
+
+    return next();
+  };
+}
+
+const rateLimitCommand = makeRateLimitMiddleware('command', COMMAND_RATE_LIMIT_PER_WINDOW, REQUEST_RATE_LIMIT_WINDOW_MS);
+const rateLimitTelemetry = makeRateLimitMiddleware('telemetry', TELEMETRY_RATE_LIMIT_PER_WINDOW, REQUEST_RATE_LIMIT_WINDOW_MS);
 
 function createOperatorState() {
   return {
@@ -357,6 +461,24 @@ function buildAlerts(now = Date.now()) {
     });
   }
 
+  if (state.safety.telemetryFailsafeAt) {
+    alerts.push({
+      level: 'critical',
+      code: 'TELEMETRY_FAILSAFE_TRIGGERED',
+      message: `Telemetry fail-safe triggered ${state.safety.telemetryFailsafeAction ?? 'UNKNOWN'} at ${new Date(state.safety.telemetryFailsafeAt).toISOString()}.`,
+      at: state.safety.telemetryFailsafeAt,
+    });
+  }
+
+  if (state.safety.geofenceFailsafeAt) {
+    alerts.push({
+      level: 'critical',
+      code: 'GEOFENCE_FAILSAFE_TRIGGERED',
+      message: `Geofence fail-safe triggered ${state.safety.geofenceFailsafeAction ?? 'UNKNOWN'} at ${new Date(state.safety.geofenceFailsafeAt).toISOString()}.`,
+      at: state.safety.geofenceFailsafeAt,
+    });
+  }
+
   return alerts;
 }
 
@@ -473,11 +595,187 @@ function buildSupervisionSummary() {
         }
       : null,
     coverage: state.coverage ? coverageStats(state.coverage) : null,
+    safety: {
+      telemetryFailsafeEnabled: TELEMETRY_FAILSAFE_ENABLED,
+      telemetryFailsafeAction: resolveTelemetryFailsafeAction(),
+      telemetryFailsafeAt: state.safety.telemetryFailsafeAt || null,
+      telemetryFailsafeReason: state.safety.telemetryFailsafeReason,
+      telemetryFailsafeCooldownMs: TELEMETRY_FAILSAFE_COOLDOWN_MS,
+      geofenceFailsafeEnabled: GEOFENCE_FAILSAFE_ENABLED,
+      geofenceFailsafeAction: resolveGeofenceFailsafeAction(),
+      geofenceFailsafeAt: state.safety.geofenceFailsafeAt || null,
+      geofenceFailsafeReason: state.safety.geofenceFailsafeReason,
+      geofenceFailsafeCooldownMs: GEOFENCE_FAILSAFE_COOLDOWN_MS,
+    },
     alerts: buildAlerts(now),
     allowedActions: buildAllowedActions(),
     workflows: buildOperatorWorkflows(),
     notes: state.operator.notes,
   };
+}
+
+async function enforceGeofenceFailsafePolicy(triggerSource = 'telemetry') {
+  if (!GEOFENCE_FAILSAFE_ENABLED) return;
+  if (safetyMonitorInFlight) return;
+  if (!mission.isRunning()) return;
+  if (!state.robot || !state.coverage) return;
+  if (isRobotInsideCoverageArea(state.robot)) return;
+
+  const now = Date.now();
+  if ((now - (state.safety.geofenceFailsafeAt || 0)) < GEOFENCE_FAILSAFE_COOLDOWN_MS) {
+    return;
+  }
+
+  const action = resolveGeofenceFailsafeAction();
+  safetyMonitorInFlight = true;
+  try {
+    const dispatched = await dispatchCommand(action, {
+      syncMission: false,
+      source: `failsafe.geofence_breach.${triggerSource}`,
+    });
+
+    if (!dispatched.ok) {
+      db.logEvent(mission.currentId(), EVENT_TYPE.SAFETY_ACTION, {
+        policy: 'geofence_breach',
+        action,
+        ok: false,
+        error: dispatched.error ?? 'dispatch_failed',
+      });
+      return;
+    }
+
+    const actionAt = Date.now();
+    state.safety.geofenceFailsafeAt = actionAt;
+    state.safety.geofenceFailsafeAction = action;
+    state.safety.geofenceFailsafeReason = 'geofence_breach';
+    state.lastFault = {
+      fault: FAULT_CODE.GENERIC,
+      action: action === CMD.ESTOP ? FAULT_ACTION.ESTOP : FAULT_ACTION.PAUSE,
+      at: actionAt,
+    };
+
+    if (action === CMD.ESTOP) {
+      if ([MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+        try {
+          mission.abort('failsafe:geofence_breach', buildFinalMissionStats());
+        } catch (_) {
+          // ignore invalid transition if mission already terminal
+        }
+      }
+      bridge.resetWpState();
+    } else if (action === CMD.PAUSE && mission.isRunning()) {
+      try {
+        mission.pause('failsafe:geofence_breach');
+      } catch (_) {
+        // ignore invalid transition if mission already changed
+      }
+    }
+
+    publish(WS_EVENT.FAULT_RECEIVED, {
+      fault: 'GEOFENCE_BREACH',
+      action,
+      at: actionAt,
+      source: 'failsafe',
+    });
+
+    db.logEvent(mission.currentId(), EVENT_TYPE.SAFETY_ACTION, {
+      policy: 'geofence_breach',
+      action,
+      ok: true,
+      robot: {
+        lat: state.robot.lat,
+        lon: state.robot.lon,
+      },
+    });
+
+    metrics.safetyActions += 1;
+
+    publishSupervision();
+    publishOperator();
+  } finally {
+    safetyMonitorInFlight = false;
+  }
+}
+
+async function enforceTelemetryFailsafePolicy() {
+  if (!TELEMETRY_FAILSAFE_ENABLED) return;
+  if (safetyMonitorInFlight) return;
+  if (!mission.isRunning()) return;
+  if (!isTelemetryStale()) return;
+
+  const now = Date.now();
+  if ((now - (state.safety.telemetryFailsafeAt || 0)) < TELEMETRY_FAILSAFE_COOLDOWN_MS) {
+    return;
+  }
+
+  const action = resolveTelemetryFailsafeAction();
+  safetyMonitorInFlight = true;
+
+  try {
+    const dispatched = await dispatchCommand(action, {
+      syncMission: false,
+      source: 'failsafe.telemetry_stale',
+    });
+
+    if (!dispatched.ok) {
+      db.logEvent(mission.currentId(), EVENT_TYPE.SAFETY_ACTION, {
+        policy: 'telemetry_stale',
+        action,
+        ok: false,
+        error: dispatched.error ?? 'dispatch_failed',
+      });
+      return;
+    }
+
+    const actionAt = Date.now();
+    state.safety.telemetryFailsafeAt = actionAt;
+    state.safety.telemetryFailsafeAction = action;
+    state.safety.telemetryFailsafeReason = 'telemetry_stale';
+
+    state.lastFault = {
+      fault: FAULT_CODE.GENERIC,
+      action: action === CMD.ESTOP ? FAULT_ACTION.ESTOP : FAULT_ACTION.PAUSE,
+      at: actionAt,
+    };
+
+    if (action === CMD.ESTOP) {
+      if ([MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+        try {
+          mission.abort('failsafe:telemetry_stale', buildFinalMissionStats());
+        } catch (_) {
+          // ignore invalid transition if mission already terminal
+        }
+      }
+      bridge.resetWpState();
+    } else if (action === CMD.PAUSE && mission.isRunning()) {
+      try {
+        mission.pause('failsafe:telemetry_stale');
+      } catch (_) {
+        // ignore invalid transition if mission already changed
+      }
+    }
+
+    publish(WS_EVENT.FAULT_RECEIVED, {
+      fault: 'TELEMETRY_STALE',
+      action,
+      at: actionAt,
+      source: 'failsafe',
+    });
+
+    db.logEvent(mission.currentId(), EVENT_TYPE.SAFETY_ACTION, {
+      policy: 'telemetry_stale',
+      action,
+      ok: true,
+      staleAgeMs: telemetryAgeMs(actionAt),
+    });
+
+    metrics.safetyActions += 1;
+
+    publishSupervision();
+    publishOperator();
+  } finally {
+    safetyMonitorInFlight = false;
+  }
 }
 
 function publishSupervision() {
@@ -595,11 +893,13 @@ async function dispatchCommand(cmd, options = {}) {
 
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
+    metrics.commandsFailed += 1;
     return { ok: false, status: decision.status, error: decision.error };
   }
 
   const result = await bridge.sendCommand(cmd);
   if (!result.ok) {
+    metrics.commandsFailed += 1;
     return {
       ok: false,
       status: 502,
@@ -624,6 +924,8 @@ async function dispatchCommand(cmd, options = {}) {
 
   publishSupervision();
   publishOperator();
+
+  metrics.commandsDispatched += 1;
 
   return { ok: true, status: result.status, body: result.body };
 }
@@ -726,7 +1028,67 @@ function publicState() {
 }
 
 app.get(API.HEALTH, (_req, res) => {
-  res.json({ ok: true, service: 'robot-lora-server' });
+  const bridgeStatus = bridge.getStatus();
+  const dbOk = db.ping();
+  const missionState = currentMissionState();
+  const telemetryStaleWhileRunning = missionState === MISSION_STATE.RUNNING && isTelemetryStale();
+
+  const checks = {
+    db: dbOk,
+    bridge: !bridgeStatus.degraded,
+    telemetry: !telemetryStaleWhileRunning,
+  };
+
+  const ready = Object.values(checks).every(Boolean);
+  const status = ready ? 200 : 503;
+
+  res.status(status).json({
+    ok: ready,
+    ready,
+    service: 'robot-lora-server',
+    checks,
+    auth: {
+      enabled: API_AUTH_ENABLED,
+      appKeyCount: APP_API_KEYS.size,
+      boardKeyCount: BOARD_API_KEYS.size,
+    },
+    policies: {
+      telemetryFailsafeEnabled: TELEMETRY_FAILSAFE_ENABLED,
+      telemetryFailsafeAction: resolveTelemetryFailsafeAction(),
+      geofenceFailsafeEnabled: GEOFENCE_FAILSAFE_ENABLED,
+      geofenceFailsafeAction: resolveGeofenceFailsafeAction(),
+    },
+    missionState,
+    telemetryStale: isTelemetryStale(),
+    lora: {
+      degraded: bridgeStatus.degraded,
+      consecutiveFailures: bridgeStatus.consecutiveFailures,
+      lastSuccessAt: bridgeStatus.lastSuccessAt,
+      lastErrorAt: bridgeStatus.lastErrorAt,
+    },
+  });
+});
+
+app.get(API.METRICS, requireApp, (_req, res) => {
+  const bridgeStatus = bridge.getStatus();
+  res.json({
+    ok: true,
+    metrics: {
+      ...metrics,
+      uptimeMs: Date.now() - metrics.startedAt,
+      bridge: {
+        degraded: bridgeStatus.degraded,
+        consecutiveFailures: bridgeStatus.consecutiveFailures,
+        lastSuccessAt: bridgeStatus.lastSuccessAt,
+        lastErrorAt: bridgeStatus.lastErrorAt,
+      },
+      rateLimits: {
+        windowMs: REQUEST_RATE_LIMIT_WINDOW_MS,
+        commandPerWindow: COMMAND_RATE_LIMIT_PER_WINDOW,
+        telemetryPerWindow: TELEMETRY_RATE_LIMIT_PER_WINDOW,
+      },
+    },
+  });
 });
 
 app.get(API.SUPERVISION_SUMMARY, requireAppOrBoard, (_req, res) => {
@@ -753,7 +1115,7 @@ app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
   });
 });
 
-app.post(API.COMMAND, requireApp, async (req, res) => {
+app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
   const parsedBody = parseMaybeJson(req.body);
   const rawCmd =
     (typeof parsedBody === 'object' && parsedBody !== null && typeof parsedBody.cmd === 'string' && parsedBody.cmd) ||
@@ -843,11 +1205,14 @@ app.post(API.INPUT_AREA, requireApp, (req, res) => {
   });
 });
 
-app.post(API.TELEMETRY, requireBoard, (req, res) => {
+app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
   const parsed = parseIncomingTelemetry(req.body);
   if (!parsed) {
+    metrics.telemetryRejected += 1;
     return res.status(400).json({ ok: false, error: 'Unsupported telemetry payload' });
   }
+
+  metrics.telemetryAccepted += 1;
 
   // Handle fault notification separately — don't overwrite robot position.
   if (parsed.isFault) {
@@ -911,6 +1276,8 @@ app.post(API.TELEMETRY, requireBoard, (req, res) => {
 
   // Update rolling coverage in mission row
   if (stats) mission.updateCoverage(getCoveragePct(stats));
+
+  await enforceGeofenceFailsafePolicy('telemetry');
 
   publishSupervision();
 
@@ -1321,6 +1688,34 @@ wss.on('connection', (socket) => {
 });
 
 const port = Number(process.env.PORT ?? 8080);
+
+const safetyTimer = setInterval(() => {
+  void enforceTelemetryFailsafePolicy();
+  void enforceGeofenceFailsafePolicy('monitor');
+}, Math.max(100, SAFETY_MONITOR_INTERVAL_MS));
+if (typeof safetyTimer.unref === 'function') safetyTimer.unref();
+
+const retentionTimer = setInterval(() => {
+  if (!Number.isFinite(EVENT_RETENTION_DAYS) || EVENT_RETENTION_DAYS <= 0) {
+    return;
+  }
+  const cutoffMs = Date.now() - Math.floor(EVENT_RETENTION_DAYS * 86400000);
+  const pruned = db.pruneEventsBefore(cutoffMs);
+  metrics.eventPruneRuns += 1;
+  metrics.eventPrunedRows += pruned;
+}, Math.max(60000, EVENT_RETENTION_PRUNE_INTERVAL_MS));
+if (typeof retentionTimer.unref === 'function') retentionTimer.unref();
+
+const rateLimitGcTimer = setInterval(() => {
+  const cutoff = Date.now() - REQUEST_RATE_LIMIT_WINDOW_MS;
+  for (const [key, value] of rateLimitStore.entries()) {
+    if (value.windowStart < cutoff) {
+      rateLimitStore.delete(key);
+    }
+  }
+}, Math.max(30000, REQUEST_RATE_LIMIT_WINDOW_MS));
+if (typeof rateLimitGcTimer.unref === 'function') rateLimitGcTimer.unref();
+
 server.listen(port, () => {
   console.log(`[robot-lora-server] listening on http://localhost:${port}`);
 });

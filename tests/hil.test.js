@@ -90,7 +90,7 @@ function createMockBaseStation() {
   };
 }
 
-function startServer(dataDir) {
+function startServer(dataDir, envOverrides = {}) {
   const child = spawn(process.execPath, ['src/server.js'], {
     cwd: path.resolve(__dirname, '..'),
     env: {
@@ -99,6 +99,9 @@ function startServer(dataDir) {
       BASE_STATION_URL: BASE_URL,
       ROBOT_LORA_DATA_DIR: dataDir,
       SUPERVISION_TELEMETRY_STALE_MS: '200',
+      TELEMETRY_FAILSAFE_ENABLED: '0',
+      SAFETY_MONITOR_INTERVAL_MS: '100',
+      ...envOverrides,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -247,6 +250,216 @@ test('Phase E supervision summary and Phase F fail-safe scenarios', async () => 
       const { res, json } = await getJson(`${SERVER_URL}/api/operator/workflows`);
       assert.equal(res.status, 200);
       assert.ok(json.notes.some((note) => note.text === 'Preflight note recorded'));
+    }
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('P0 telemetry stale fail-safe issues ESTOP and aborts mission', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-failsafe-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    TELEMETRY_FAILSAFE_ENABLED: '1',
+    TELEMETRY_FAILSAFE_ACTION: 'ESTOP',
+    TELEMETRY_FAILSAFE_COOLDOWN_MS: '200',
+    SUPERVISION_TELEMETRY_STALE_MS: '200',
+    SAFETY_MONITOR_INTERVAL_MS: '50',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    const areaBody = {
+      baseStation: { lat: 41.0, lon: -81.0 },
+      boundary: [
+        { lat: 41.0, lon: -81.0 },
+        { lat: 41.0, lon: -80.9995 },
+        { lat: 40.9995, lon: -80.9995 },
+        { lat: 40.9995, lon: -81.0 },
+      ],
+      cellSizeM: 2.0,
+    };
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/input-area`, areaBody);
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/path/plan`, {
+        goal: { lat: 40.9997, lon: -80.9997 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/mission/start`, {});
+      assert.equal(res.status, 200);
+      assert.ok(base.commands.includes('AUTO'));
+    }
+
+    await wait(900);
+
+    assert.ok(base.commands.includes('ESTOP'));
+
+    {
+      const { res, json } = await getJson(`${SERVER_URL}/api/mission/current`);
+      assert.equal(res.status, 200);
+      assert.equal(json.mission.state, 'ABORTED');
+    }
+
+    {
+      const { res, json } = await getJson(`${SERVER_URL}/api/supervision/summary`);
+      assert.equal(res.status, 200);
+      assert.equal(json.summary.safety.telemetryFailsafeEnabled, true);
+      assert.equal(json.summary.safety.telemetryFailsafeAction, 'ESTOP');
+      assert.ok(json.summary.safety.telemetryFailsafeAt);
+      assert.ok(json.summary.alerts.some((alert) => alert.code === 'TELEMETRY_FAILSAFE_TRIGGERED'));
+    }
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('P0 geofence fail-safe issues ESTOP and aborts mission when robot exits boundary', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-geofence-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    TELEMETRY_FAILSAFE_ENABLED: '0',
+    GEOFENCE_FAILSAFE_ENABLED: '1',
+    GEOFENCE_FAILSAFE_ACTION: 'ESTOP',
+    GEOFENCE_FAILSAFE_COOLDOWN_MS: '100',
+    SAFETY_MONITOR_INTERVAL_MS: '50',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    const areaBody = {
+      baseStation: { lat: 41.0, lon: -81.0 },
+      boundary: [
+        { lat: 41.0, lon: -81.0 },
+        { lat: 41.0, lon: -80.9995 },
+        { lat: 40.9995, lon: -80.9995 },
+        { lat: 40.9995, lon: -81.0 },
+      ],
+      cellSizeM: 2.0,
+    };
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/input-area`, areaBody);
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/path/plan`, {
+        goal: { lat: 40.9997, lon: -80.9997 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/mission/start`, {});
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'AUTO',
+        gps: { lat: 41.01, lon: -81.01, fix: 1, sat: 8, hdop: 0.9 },
+        motor: { m1: 35, m2: 34 },
+        heading: { yaw: 45.0, pitch: 0.0 },
+        disp: { salt: 50, brine: 50 },
+        temp: 1.2,
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    await wait(500);
+    assert.ok(base.commands.includes('ESTOP'));
+
+    {
+      const { res, json } = await getJson(`${SERVER_URL}/api/mission/current`);
+      assert.equal(res.status, 200);
+      assert.equal(json.mission.state, 'ABORTED');
+    }
+
+    {
+      const { res, json } = await getJson(`${SERVER_URL}/api/supervision/summary`);
+      assert.equal(res.status, 200);
+      assert.equal(json.summary.safety.geofenceFailsafeEnabled, true);
+      assert.equal(json.summary.safety.geofenceFailsafeAction, 'ESTOP');
+      assert.ok(json.summary.safety.geofenceFailsafeAt);
+      assert.ok(json.summary.alerts.some((alert) => alert.code === 'GEOFENCE_FAILSAFE_TRIGGERED'));
+    }
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('P0 health endpoint reports degraded when telemetry is stale during running mission', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-health-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    TELEMETRY_FAILSAFE_ENABLED: '0',
+    GEOFENCE_FAILSAFE_ENABLED: '0',
+    SUPERVISION_TELEMETRY_STALE_MS: '200',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    const areaBody = {
+      baseStation: { lat: 41.0, lon: -81.0 },
+      boundary: [
+        { lat: 41.0, lon: -81.0 },
+        { lat: 41.0, lon: -80.9995 },
+        { lat: 40.9995, lon: -80.9995 },
+        { lat: 40.9995, lon: -81.0 },
+      ],
+      cellSizeM: 2.0,
+    };
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/input-area`, areaBody);
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/path/plan`, {
+        goal: { lat: 40.9997, lon: -80.9997 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/mission/start`, {});
+      assert.equal(res.status, 200);
+    }
+
+    await wait(350);
+
+    {
+      const res = await fetch(`${SERVER_URL}/api/health`);
+      const json = await res.json();
+      assert.equal(res.status, 503);
+      assert.equal(json.ok, false);
+      assert.equal(json.checks.telemetry, false);
+      assert.equal(json.missionState, 'RUNNING');
     }
   } finally {
     await server.stop();

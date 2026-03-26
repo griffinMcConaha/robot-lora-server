@@ -204,6 +204,7 @@ const EVENT_TYPE = Object.freeze({
   MISSION_RESUMED:    'mission.resumed',
   MISSION_COMPLETED:  'mission.completed',
   MISSION_ABORTED:    'mission.aborted',
+  SAFETY_ACTION:      'safety.action',
   TELEMETRY_RECEIVED: 'telemetry.received',
   COMMAND_SENT:       'command.sent',
   FAULT_RECEIVED:     'fault.received',
@@ -239,6 +240,7 @@ const API = Object.freeze({
   STATUS:           '/status',                // app-compat: GET
   COMMAND:          '/command',               // app-compat: POST
   HEALTH:           '/api/health',            // GET
+  METRICS:          '/api/metrics',           // GET
   SUPERVISION_SUMMARY: '/api/supervision/summary',
   INPUT_AREA:       '/api/input-area',        // POST
   TELEMETRY:        '/api/telemetry',         // POST
