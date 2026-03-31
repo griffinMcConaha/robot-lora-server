@@ -71,6 +71,20 @@ function gridToWorld(map, row, col) {
   return localToLatLon(local, map.origin);
 }
 
+function gridCellPolygon(map, row, col) {
+  const x0 = map.minX + col * map.cellSizeM;
+  const y0 = map.minY + row * map.cellSizeM;
+  const x1 = x0 + map.cellSizeM;
+  const y1 = y0 + map.cellSizeM;
+
+  return [
+    localToLatLon({ x: x0, y: y0 }, map.origin),
+    localToLatLon({ x: x1, y: y0 }, map.origin),
+    localToLatLon({ x: x1, y: y1 }, map.origin),
+    localToLatLon({ x: x0, y: y1 }, map.origin),
+  ];
+}
+
 function withinGrid(map, row, col) {
   return row >= 0 && row < map.height && col >= 0 && col < map.width;
 }
@@ -124,6 +138,7 @@ module.exports = {
   buildCoverageMap,
   worldToGrid,
   gridToWorld,
+  gridCellPolygon,
   withinGrid,
   markCoverage,
   coverageStats,

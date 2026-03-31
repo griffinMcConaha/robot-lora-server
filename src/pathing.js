@@ -172,13 +172,37 @@ function findCoveragePath(map, options = {}) {
   const swathWidthM = Number.isFinite(Number(options.swathWidthM)) && Number(options.swathWidthM) > 0
     ? Number(options.swathWidthM)
     : map.cellSizeM;
+  const startLatLon = options.startLatLon ?? null;
+  const goalLatLon = options.goalLatLon ?? null;
 
   const rowStep = Math.max(1, Math.round(swathWidthM / map.cellSizeM));
   const visitNodes = [];
   let prevNode = null;
   let forward = true;
 
-  for (let row = 0; row < map.height; row += rowStep) {
+  let rowStart = 0;
+  let rowLimit = map.height;
+  let rowIncrement = rowStep;
+
+  if (startLatLon && goalLatLon) {
+    const startGrid = worldToGrid(map, startLatLon);
+    const goalGrid = worldToGrid(map, goalLatLon);
+    const snappedStart = nearestWalkable(map, startGrid.row, startGrid.col);
+    const snappedGoal = nearestWalkable(map, goalGrid.row, goalGrid.col);
+
+    if (snappedStart && snappedGoal) {
+      const topAlignedRow = 0;
+      const bottomAlignedRow = Math.max(0, map.height - 1 - ((map.height - 1) % rowStep));
+      const rowDirection = snappedGoal.row >= snappedStart.row ? 1 : -1;
+
+      rowStart = rowDirection > 0 ? topAlignedRow : bottomAlignedRow;
+      rowLimit = rowDirection > 0 ? map.height : -1;
+      rowIncrement = rowDirection > 0 ? rowStep : -rowStep;
+      forward = snappedGoal.col >= snappedStart.col;
+    }
+  }
+
+  for (let row = rowStart; row !== rowLimit; row += rowIncrement) {
     const insideCols = [];
     for (let col = 0; col < map.width; col++) {
       if (map.cells[row][col].inside) insideCols.push(col);

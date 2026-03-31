@@ -9,6 +9,7 @@ const {
   coverageStats,
   worldToGrid,
   withinGrid,
+  gridCellPolygon,
 } = require('./coverage');
 const { latLonToLocal } = require('./geo');
 const { findPath, findCoveragePath } = require('./pathing');
@@ -122,6 +123,12 @@ const DRIVE_COMMANDS = new Set([
   CMD.RIGHT,
   CMD.STOP,
 ]);
+
+function pathHasZeroDispersion(points = state.lastPath) {
+  return Array.isArray(points)
+    && points.length > 0
+    && points.every((point) => Number(point?.salt ?? 0) <= 0 && Number(point?.brine ?? 0) <= 0);
+}
 
 function parseMaybeJson(value) {
   if (typeof value !== 'string') return value;
@@ -400,18 +407,27 @@ function addOperatorNote({ text, category = 'general', actor = 'operator' }) {
 function buildAllowedActions() {
   const missionState = currentMissionState();
   const wpPushState = bridge.getStatus().wpPushState;
+  const zeroDispersionPath = pathHasZeroDispersion();
   const actions = [
     { id: 'input-area', enabled: true, reason: null },
     { id: 'path-plan', enabled: Boolean(state.coverage), reason: state.coverage ? null : 'Area is not configured' },
     {
       id: 'push-waypoints',
-      enabled: [MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && state.lastPath.length > 0,
-      reason: state.lastPath.length > 0 ? null : 'Path plan is required before waypoint push',
+      enabled: [MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && state.lastPath.length > 0 && !zeroDispersionPath,
+      reason: state.lastPath.length === 0
+        ? 'Path plan is required before waypoint push'
+        : zeroDispersionPath
+          ? 'Zero-dispersion path cannot be committed'
+          : null,
     },
     {
       id: 'mission-start',
-      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || state.lastPath.length > 0),
-      reason: missionState === MISSION_STATE.CONFIGURING ? null : 'Mission must be CONFIGURING',
+      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || state.lastPath.length > 0) && !zeroDispersionPath,
+      reason: missionState !== MISSION_STATE.CONFIGURING
+        ? 'Mission must be CONFIGURING'
+        : zeroDispersionPath
+          ? 'Zero-dispersion path cannot be started'
+          : null,
     },
     { id: 'mission-pause', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
     { id: 'mission-resume', enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed', reason: missionState === MISSION_STATE.PAUSED ? null : 'Mission is not PAUSED' },
@@ -442,6 +458,13 @@ function buildAlerts(now = Date.now()) {
   }
   if ([MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && wpPushState !== 'committed') {
     alerts.push({ level: 'warning', code: 'WAYPOINTS_UNCOMMITTED', message: 'Waypoints are not committed to the robot.' });
+  }
+  if (pathHasZeroDispersion()) {
+    alerts.push({
+      level: 'warning',
+      code: 'ZERO_DISPERSION_PATH',
+      message: 'Current path uses 0% salt and 0% brine. Update dispersion before waypoint push or mission start.',
+    });
   }
   if (missionState === MISSION_STATE.RUNNING && isTelemetryStale(now)) {
     alerts.push({
@@ -1298,7 +1321,14 @@ app.get(API.COVERAGE, requireAppOrBoard, (_req, res) => {
     for (let col = 0; col < state.coverage.width; col++) {
       const cell = state.coverage.cells[row][col];
       if (!cell.inside) continue;
-      cells.push({ row, col, covered: cell.covered, hits: cell.hits, lastSeenMs: cell.lastSeenMs });
+      cells.push({
+        row,
+        col,
+        covered: cell.covered,
+        hits: cell.hits,
+        lastSeenMs: cell.lastSeenMs,
+        polygon: gridCellPolygon(state.coverage, row, col),
+      });
     }
   }
 
@@ -1351,7 +1381,7 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
   }
 
   const path = mode === 'coverage'
-    ? findCoveragePath(state.coverage, { swathWidthM: coverageWidthM })
+    ? findCoveragePath(state.coverage, { swathWidthM: coverageWidthM, startLatLon: startPoint, goalLatLon: goal ?? null })
     : findPath(state.coverage, startPoint, goal);
 
   if (!path.ok) {
@@ -1392,6 +1422,9 @@ app.post(API.MISSION_START, requireApp, async (_req, res) => {
   try {
     if (currentMissionState() !== MISSION_STATE.CONFIGURING) {
       return res.status(409).json({ ok: false, error: 'Mission must be CONFIGURING before start' });
+    }
+    if (pathHasZeroDispersion()) {
+      return res.status(409).json({ ok: false, error: 'Mission start blocked: path has 0% salt and 0% brine' });
     }
 
     const loraStatus = bridge.getStatus();
@@ -1601,6 +1634,9 @@ app.post(API.LORA_PUSH_WP, requireApp, async (req, res) => {
   }
   if (!rawPoints || !Array.isArray(rawPoints) || rawPoints.length === 0) {
     return res.status(400).json({ ok: false, error: 'No points provided and no cached path plan' });
+  }
+  if (pathHasZeroDispersion(rawPoints)) {
+    return res.status(409).json({ ok: false, error: 'Waypoint push blocked: path has 0% salt and 0% brine' });
   }
   const result = await bridge.pushWaypoints(rawPoints);
   if (!result.ok) {
