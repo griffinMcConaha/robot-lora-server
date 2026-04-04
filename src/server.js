@@ -5,6 +5,7 @@ const path = require('path');
 const { WebSocketServer } = require('ws');
 const {
   buildCoverageMap,
+  resolveCoverageFrame,
   markCoverage,
   coverageStats,
   worldToGrid,
@@ -13,6 +14,14 @@ const {
 } = require('./coverage');
 const { latLonToLocal } = require('./geo');
 const { findPath, findCoveragePath } = require('./pathing');
+const {
+  createOperatorState,
+  telemetryAgeMs: supervisionTelemetryAgeMs,
+  isTelemetryStale: supervisionIsTelemetryStale,
+  buildAllowedActions: buildSupervisionAllowedActions,
+  buildAlerts: buildSupervisionAlerts,
+  buildOperatorWorkflows: buildSupervisionWorkflows,
+} = require('./supervision');
 const {
   ROBOT_STATE,
   CMD,
@@ -212,21 +221,10 @@ function estimateGridCellCount(boundaryLatLon, cellSizeM) {
     lon: boundaryLatLon[0].lon,
   };
 
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-
-  for (const point of boundaryLatLon) {
-    const local = latLonToLocal(point, origin);
-    minX = Math.min(minX, local.x);
-    minY = Math.min(minY, local.y);
-    maxX = Math.max(maxX, local.x);
-    maxY = Math.max(maxY, local.y);
-  }
-
-  const width = Math.max(1, Math.ceil((maxX - minX) / cellSizeM));
-  const height = Math.max(1, Math.ceil((maxY - minY) / cellSizeM));
+  const localPolygon = boundaryLatLon.map((point) => latLonToLocal(point, origin));
+  const frame = resolveCoverageFrame(localPolygon);
+  const width = Math.max(1, Math.ceil((frame.maxX - frame.minX) / cellSizeM));
+  const height = Math.max(1, Math.ceil((frame.maxY - frame.minY) / cellSizeM));
   return { width, height, cells: width * height };
 }
 
@@ -338,25 +336,16 @@ function makeRateLimitMiddleware(bucketName, limitPerWindow, windowMs) {
 const rateLimitCommand = makeRateLimitMiddleware('command', COMMAND_RATE_LIMIT_PER_WINDOW, REQUEST_RATE_LIMIT_WINDOW_MS);
 const rateLimitTelemetry = makeRateLimitMiddleware('telemetry', TELEMETRY_RATE_LIMIT_PER_WINDOW, REQUEST_RATE_LIMIT_WINDOW_MS);
 
-function createOperatorState() {
-  return {
-    workflowAcks: {},
-    notes: [],
-  };
-}
-
 function resetOperatorState() {
   state.operator = createOperatorState();
 }
 
 function telemetryAgeMs(now = Date.now()) {
-  if (!state.robot?.timestampMs) return null;
-  return Math.max(0, now - state.robot.timestampMs);
+  return supervisionTelemetryAgeMs(state.robot, now);
 }
 
 function isTelemetryStale(now = Date.now()) {
-  const ageMs = telemetryAgeMs(now);
-  return ageMs == null ? true : ageMs > SUPERVISION_TELEMETRY_STALE_MS;
+  return supervisionIsTelemetryStale(state.robot, SUPERVISION_TELEMETRY_STALE_MS, now);
 }
 
 function getWorkflowAck(workflowId, stepId) {
@@ -405,197 +394,40 @@ function addOperatorNote({ text, category = 'general', actor = 'operator' }) {
 }
 
 function buildAllowedActions() {
-  const missionState = currentMissionState();
-  const wpPushState = bridge.getStatus().wpPushState;
-  const zeroDispersionPath = pathHasZeroDispersion();
-  const actions = [
-    { id: 'input-area', enabled: true, reason: null },
-    { id: 'path-plan', enabled: Boolean(state.coverage), reason: state.coverage ? null : 'Area is not configured' },
-    {
-      id: 'push-waypoints',
-      enabled: [MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && state.lastPath.length > 0 && !zeroDispersionPath,
-      reason: state.lastPath.length === 0
-        ? 'Path plan is required before waypoint push'
-        : zeroDispersionPath
-          ? 'Zero-dispersion path cannot be committed'
-          : null,
-    },
-    {
-      id: 'mission-start',
-      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || state.lastPath.length > 0) && !zeroDispersionPath,
-      reason: missionState !== MISSION_STATE.CONFIGURING
-        ? 'Mission must be CONFIGURING'
-        : zeroDispersionPath
-          ? 'Zero-dispersion path cannot be started'
-          : null,
-    },
-    { id: 'mission-pause', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
-    { id: 'mission-resume', enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed', reason: missionState === MISSION_STATE.PAUSED ? null : 'Mission is not PAUSED' },
-    { id: 'mission-abort', enabled: [MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(missionState), reason: null },
-    { id: 'mission-complete', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
-    { id: 'command-manual', enabled: true, reason: null },
-    {
-      id: 'command-reset',
-      enabled: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
-      reason: null,
-    },
-  ];
-
-  return actions;
+  return buildSupervisionAllowedActions({
+    missionState: currentMissionState(),
+    wpPushState: bridge.getStatus().wpPushState,
+    hasCoverage: Boolean(state.coverage),
+    hasPath: state.lastPath.length > 0,
+    zeroDispersionPath: pathHasZeroDispersion(),
+  });
 }
 
 function buildAlerts(now = Date.now()) {
-  const alerts = [];
-  const missionState = currentMissionState();
-  const wpPushState = bridge.getStatus().wpPushState;
-  const ageMs = telemetryAgeMs(now);
-
-  if (!state.coverage) {
-    alerts.push({ level: 'warning', code: 'AREA_UNCONFIGURED', message: 'Input area has not been configured.' });
-  }
-  if (missionState === MISSION_STATE.CONFIGURING && state.lastPath.length === 0) {
-    alerts.push({ level: 'warning', code: 'PATH_MISSING', message: 'Mission has no planned path yet.' });
-  }
-  if ([MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && wpPushState !== 'committed') {
-    alerts.push({ level: 'warning', code: 'WAYPOINTS_UNCOMMITTED', message: 'Waypoints are not committed to the robot.' });
-  }
-  if (pathHasZeroDispersion()) {
-    alerts.push({
-      level: 'warning',
-      code: 'ZERO_DISPERSION_PATH',
-      message: 'Current path uses 0% salt and 0% brine. Update dispersion before waypoint push or mission start.',
-    });
-  }
-  if (missionState === MISSION_STATE.RUNNING && isTelemetryStale(now)) {
-    alerts.push({
-      level: 'critical',
-      code: 'TELEMETRY_STALE',
-      message: ageMs == null
-        ? 'No telemetry received while mission is RUNNING.'
-        : `Telemetry is stale (${ageMs} ms since last update).`,
-    });
-  }
-  if (state.lastFault) {
-    alerts.push({
-      level: state.lastFault.action === FAULT_ACTION.ESTOP ? 'critical' : 'warning',
-      code: 'LAST_FAULT',
-      message: `Last fault ${state.lastFault.fault} requested ${state.lastFault.action}.`,
-      at: state.lastFault.at,
-    });
-  }
-
-  if (state.safety.telemetryFailsafeAt) {
-    alerts.push({
-      level: 'critical',
-      code: 'TELEMETRY_FAILSAFE_TRIGGERED',
-      message: `Telemetry fail-safe triggered ${state.safety.telemetryFailsafeAction ?? 'UNKNOWN'} at ${new Date(state.safety.telemetryFailsafeAt).toISOString()}.`,
-      at: state.safety.telemetryFailsafeAt,
-    });
-  }
-
-  if (state.safety.geofenceFailsafeAt) {
-    alerts.push({
-      level: 'critical',
-      code: 'GEOFENCE_FAILSAFE_TRIGGERED',
-      message: `Geofence fail-safe triggered ${state.safety.geofenceFailsafeAction ?? 'UNKNOWN'} at ${new Date(state.safety.geofenceFailsafeAt).toISOString()}.`,
-      at: state.safety.geofenceFailsafeAt,
-    });
-  }
-
-  return alerts;
+  return buildSupervisionAlerts({
+    missionState: currentMissionState(),
+    wpPushState: bridge.getStatus().wpPushState,
+    hasCoverage: Boolean(state.coverage),
+    hasPath: state.lastPath.length > 0,
+    zeroDispersionPath: pathHasZeroDispersion(),
+    telemetryStale: isTelemetryStale(now),
+    telemetryAge: telemetryAgeMs(now),
+    lastFault: state.lastFault,
+    safety: state.safety,
+    now,
+  });
 }
 
 function buildOperatorWorkflows() {
-  const missionState = currentMissionState();
-  const wpPushState = bridge.getStatus().wpPushState;
-  const hasArea = Boolean(state.coverage);
-  const hasPath = state.lastPath.length > 0;
-  const latestNote = state.operator.notes.at(-1) ?? null;
-
-  const workflows = [
-    {
-      id: 'preflight',
-      title: 'Preflight',
-      active: [MISSION_STATE.IDLE, MISSION_STATE.CONFIGURING].includes(missionState),
-      steps: [
-        { id: 'area-configured', title: 'Area configured', kind: 'derived', checked: hasArea, ready: true },
-        { id: 'path-planned', title: 'Path planned', kind: 'derived', checked: hasPath, ready: hasArea },
-        { id: 'waypoints-committed', title: 'Waypoints committed', kind: 'derived', checked: wpPushState === 'committed', ready: hasPath },
-        {
-          id: 'radio-check',
-          title: 'Radio check completed',
-          kind: 'manual',
-          checked: Boolean(getWorkflowAck('preflight', 'radio-check')?.checked),
-          ready: hasArea,
-          ack: getWorkflowAck('preflight', 'radio-check'),
-        },
-        {
-          id: 'area-clear',
-          title: 'Area clearance confirmed',
-          kind: 'manual',
-          checked: Boolean(getWorkflowAck('preflight', 'area-clear')?.checked),
-          ready: hasArea,
-          ack: getWorkflowAck('preflight', 'area-clear'),
-        },
-      ],
-    },
-    {
-      id: 'recovery',
-      title: 'Recovery',
-      active: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState) || Boolean(state.lastFault),
-      steps: [
-        {
-          id: 'fault-reviewed',
-          title: 'Fault review completed',
-          kind: 'manual',
-          checked: Boolean(getWorkflowAck('recovery', 'fault-reviewed')?.checked),
-          ready: Boolean(state.lastFault),
-          ack: getWorkflowAck('recovery', 'fault-reviewed'),
-        },
-        {
-          id: 'field-clear',
-          title: 'Field clearance confirmed',
-          kind: 'manual',
-          checked: Boolean(getWorkflowAck('recovery', 'field-clear')?.checked),
-          ready: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
-          ack: getWorkflowAck('recovery', 'field-clear'),
-        },
-        {
-          id: 'reset-eligible',
-          title: 'Reset eligibility confirmed',
-          kind: 'derived',
-          checked: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
-          ready: true,
-        },
-      ],
-    },
-    {
-      id: 'shutdown',
-      title: 'Shutdown',
-      active: [MISSION_STATE.COMPLETED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR, MISSION_STATE.IDLE].includes(missionState),
-      steps: [
-        {
-          id: 'mission-safe',
-          title: 'Mission in safe terminal state',
-          kind: 'derived',
-          checked: [MISSION_STATE.COMPLETED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR, MISSION_STATE.IDLE].includes(missionState),
-          ready: true,
-        },
-        {
-          id: 'note-entered',
-          title: 'Shutdown note recorded',
-          kind: 'derived',
-          checked: Boolean(latestNote),
-          ready: true,
-        },
-      ],
-    },
-  ];
-
-  return workflows.map((workflow) => ({
-    ...workflow,
-    complete: workflow.steps.every((step) => step.checked),
-  }));
+  return buildSupervisionWorkflows({
+    missionState: currentMissionState(),
+    wpPushState: bridge.getStatus().wpPushState,
+    hasArea: Boolean(state.coverage),
+    hasPath: state.lastPath.length > 0,
+    latestNote: state.operator.notes.at(-1) ?? null,
+    lastFault: state.lastFault,
+    getWorkflowAck,
+  });
 }
 
 function buildSupervisionSummary() {

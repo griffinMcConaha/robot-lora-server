@@ -1,27 +1,102 @@
 const { latLonToLocal, localToLatLon, pointInPolygon } = require('./geo');
 
-function buildCoverageMap(boundaryLatLon, cellSizeM = 2.0) {
-  const origin = {
-    lat: boundaryLatLon[0].lat,
-    lon: boundaryLatLon[0].lon,
-  };
+function magnitude(vector) {
+  return Math.hypot(vector.x, vector.y);
+}
 
-  const polygon = boundaryLatLon.map((point) => latLonToLocal(point, origin));
+function normalize(vector) {
+  const length = magnitude(vector) || 1;
+  return { x: vector.x / length, y: vector.y / length };
+}
+
+function dot(a, b) {
+  return a.x * b.x + a.y * b.y;
+}
+
+function resolveCoverageFrame(localPolygon) {
+  if (localPolygon.length < 3) {
+    return {
+      axisU: { x: 1, y: 0 },
+      axisV: { x: 0, y: 1 },
+      polygon: localPolygon.map((point) => ({ x: point.x, y: point.y })),
+      minX: 0,
+      minY: 0,
+      maxX: 0,
+      maxY: 0,
+    };
+  }
+
+  const rawU = {
+    x: localPolygon[1].x - localPolygon[0].x,
+    y: localPolygon[1].y - localPolygon[0].y,
+  };
+  const axisU = normalize(magnitude(rawU) > 0 ? rawU : {
+    x: localPolygon[2].x - localPolygon[0].x,
+    y: localPolygon[2].y - localPolygon[0].y,
+  });
+  let axisV = { x: -axisU.y, y: axisU.x };
+
+  const sideVector = {
+    x: (localPolygon[localPolygon.length - 1]?.x ?? 0) - localPolygon[0].x,
+    y: (localPolygon[localPolygon.length - 1]?.y ?? 0) - localPolygon[0].y,
+  };
+  if (dot(sideVector, axisV) < 0) {
+    axisV = { x: -axisV.x, y: -axisV.y };
+  }
+
+  const projectedPolygon = localPolygon.map((point) => ({
+    x: dot(point, axisU),
+    y: dot(point, axisV),
+  }));
 
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
 
-  for (const point of polygon) {
+  for (const point of projectedPolygon) {
     minX = Math.min(minX, point.x);
     minY = Math.min(minY, point.y);
     maxX = Math.max(maxX, point.x);
     maxY = Math.max(maxY, point.y);
   }
 
-  const width = Math.max(1, Math.ceil((maxX - minX) / cellSizeM));
-  const height = Math.max(1, Math.ceil((maxY - minY) / cellSizeM));
+  return {
+    axisU,
+    axisV,
+    polygon: projectedPolygon,
+    minX,
+    minY,
+    maxX,
+    maxY,
+  };
+}
+
+function localToFrame(localPoint, map) {
+  return {
+    x: dot(localPoint, map.axisU),
+    y: dot(localPoint, map.axisV),
+  };
+}
+
+function frameToLocal(framePoint, map) {
+  return {
+    x: framePoint.x * map.axisU.x + framePoint.y * map.axisV.x,
+    y: framePoint.x * map.axisU.y + framePoint.y * map.axisV.y,
+  };
+}
+
+function buildCoverageMap(boundaryLatLon, cellSizeM = 2.0) {
+  const origin = {
+    lat: boundaryLatLon[0].lat,
+    lon: boundaryLatLon[0].lon,
+  };
+
+  const localPolygon = boundaryLatLon.map((point) => latLonToLocal(point, origin));
+  const frame = resolveCoverageFrame(localPolygon);
+
+  const width = Math.max(1, Math.ceil((frame.maxX - frame.minX) / cellSizeM));
+  const height = Math.max(1, Math.ceil((frame.maxY - frame.minY) / cellSizeM));
 
   const cells = Array.from({ length: height }, () =>
     Array.from({ length: width }, () => ({
@@ -35,20 +110,23 @@ function buildCoverageMap(boundaryLatLon, cellSizeM = 2.0) {
   for (let row = 0; row < height; row++) {
     for (let col = 0; col < width; col++) {
       const center = {
-        x: minX + (col + 0.5) * cellSizeM,
-        y: minY + (row + 0.5) * cellSizeM,
+        x: frame.minX + (col + 0.5) * cellSizeM,
+        y: frame.minY + (row + 0.5) * cellSizeM,
       };
-      cells[row][col].inside = pointInPolygon(center, polygon);
+      cells[row][col].inside = pointInPolygon(center, frame.polygon);
     }
   }
 
   return {
     origin,
-    polygon,
-    minX,
-    minY,
-    maxX,
-    maxY,
+    polygon: localPolygon,
+    axisU: frame.axisU,
+    axisV: frame.axisV,
+    projectedPolygon: frame.polygon,
+    minX: frame.minX,
+    minY: frame.minY,
+    maxX: frame.maxX,
+    maxY: frame.maxY,
     width,
     height,
     cellSizeM,
@@ -58,16 +136,18 @@ function buildCoverageMap(boundaryLatLon, cellSizeM = 2.0) {
 
 function worldToGrid(map, pointLatLon) {
   const local = latLonToLocal(pointLatLon, map.origin);
-  const col = Math.floor((local.x - map.minX) / map.cellSizeM);
-  const row = Math.floor((local.y - map.minY) / map.cellSizeM);
+  const framePoint = localToFrame(local, map);
+  const col = Math.floor((framePoint.x - map.minX) / map.cellSizeM);
+  const row = Math.floor((framePoint.y - map.minY) / map.cellSizeM);
   return { row, col };
 }
 
 function gridToWorld(map, row, col) {
-  const local = {
+  const framePoint = {
     x: map.minX + (col + 0.5) * map.cellSizeM,
     y: map.minY + (row + 0.5) * map.cellSizeM,
   };
+  const local = frameToLocal(framePoint, map);
   return localToLatLon(local, map.origin);
 }
 
@@ -78,10 +158,10 @@ function gridCellPolygon(map, row, col) {
   const y1 = y0 + map.cellSizeM;
 
   return [
-    localToLatLon({ x: x0, y: y0 }, map.origin),
-    localToLatLon({ x: x1, y: y0 }, map.origin),
-    localToLatLon({ x: x1, y: y1 }, map.origin),
-    localToLatLon({ x: x0, y: y1 }, map.origin),
+    localToLatLon(frameToLocal({ x: x0, y: y0 }, map), map.origin),
+    localToLatLon(frameToLocal({ x: x1, y: y0 }, map), map.origin),
+    localToLatLon(frameToLocal({ x: x1, y: y1 }, map), map.origin),
+    localToLatLon(frameToLocal({ x: x0, y: y1 }, map), map.origin),
   ];
 }
 
@@ -136,6 +216,7 @@ function coverageStats(map) {
 
 module.exports = {
   buildCoverageMap,
+  resolveCoverageFrame,
   worldToGrid,
   gridToWorld,
   gridCellPolygon,
