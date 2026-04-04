@@ -1,0 +1,31 @@
+{
+  "folders": [
+    {
+      "name": "robot-lora-server",
+      "path": "C:\\Users\\gdm35\\Documents\\robot-lora-server"
+    },
+    {
+      "name": "robot-app-main",
+      "path": "C:\\Users\\gdm35\\Documents\\robot-app-main"
+    },
+    {
+      "name": "base_station",
+      "path": "C:\\Users\\gdm35\\Downloads\\base_station-master"
+    },
+    {
+      "name": "gateway",
+      "path": "C:\\Users\\gdm35\\Downloads\\gateway-master"
+    },
+    {
+      "name": "sb-esp32-code-DT10",
+      "path": "C:\\Users\\gdm35\\SB ESP32 Code"
+    },
+    {
+      "name": "Senior-Design-Project-DT10",
+      "path": "C:\\Users\\gdm35\\STM32CubeIDE\\workspace_1.19.0\\Robotic Anti-Icing System"
+    }
+  ],
+  "settings": {
+    "git.openRepositoryInParentFolders": "never"
+  }
+}
