@@ -744,7 +744,7 @@ function syncMissionToCommand(cmd) {
 }
 
 async function dispatchCommand(cmd, options = {}) {
-  const { syncMission = true, source = 'api.command' } = options;
+  const { syncMission = true, source = 'api.command', waitForAck = false } = options;
 
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
@@ -752,7 +752,7 @@ async function dispatchCommand(cmd, options = {}) {
     return { ok: false, status: decision.status, error: decision.error };
   }
 
-  const result = await bridge.sendCommand(cmd);
+  const result = await bridge.sendCommand(cmd, { waitForAck });
   if (!result.ok) {
     metrics.commandsFailed += 1;
     return {
@@ -1279,7 +1279,7 @@ app.post(API.MISSION_START, requireApp, async (_req, res) => {
       return res.status(409).json({ ok: false, error: 'Mission start requires a committed waypoint set' });
     }
 
-    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.start' });
+    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.start', waitForAck: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1299,7 +1299,7 @@ app.post(API.MISSION_PAUSE, requireApp, async (req, res) => {
     if (currentMissionState() !== MISSION_STATE.RUNNING) {
       return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before pause' });
     }
-    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.pause' });
+    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.pause', waitForAck: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1320,7 +1320,7 @@ app.post(API.MISSION_RESUME, requireApp, async (_req, res) => {
     if (bridge.getStatus().wpPushState !== 'committed') {
       return res.status(409).json({ ok: false, error: 'Mission resume requires committed waypoints' });
     }
-    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.resume' });
+    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.resume', waitForAck: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1338,7 +1338,7 @@ app.post(API.MISSION_COMPLETE, requireApp, async (_req, res) => {
     if (currentMissionState() !== MISSION_STATE.RUNNING) {
       return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before complete' });
     }
-    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.complete' });
+    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.complete', waitForAck: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1363,7 +1363,7 @@ app.post(API.MISSION_ABORT, requireApp, async (req, res) => {
     if (![MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
       return res.status(409).json({ ok: false, error: 'Mission must be RUNNING or PAUSED before abort' });
     }
-    const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source: 'mission.abort' });
+    const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source: 'mission.abort', waitForAck: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }

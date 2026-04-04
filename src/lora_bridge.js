@@ -56,6 +56,8 @@ const REQUEST_TIMEOUT_MS = Number(process.env.LORA_REQUEST_TIMEOUT_MS ?? 3000);
 const TRANSIENT_RETRY_MAX = Number(process.env.LORA_TRANSIENT_RETRY_MAX ?? 2);
 const TRANSIENT_RETRY_MS = Number(process.env.LORA_TRANSIENT_RETRY_MS ?? 200);
 const BRIDGE_DEGRADED_FAILURE_THRESHOLD = Number(process.env.BRIDGE_DEGRADED_FAILURE_THRESHOLD ?? 3);
+const ACK_WAIT_TIMEOUT_MS = Number(process.env.LORA_ACK_WAIT_TIMEOUT_MS ?? 3000);
+const ACK_POLL_MS = Number(process.env.LORA_ACK_POLL_MS ?? 120);
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -130,11 +132,133 @@ async function _post(path, body) {
 }
 
 /**
+ * GET helper for base-station endpoints.
+ * Returns { ok, status, body, error } and never throws.
+ */
+async function _get(path) {
+  return new Promise((resolve) => {
+    const urlStr = `${BASE_STATION_URL}${path}`;
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(urlStr);
+    } catch {
+      resolve({ ok: false, status: null, body: '', error: `Invalid URL: ${urlStr}` });
+      return;
+    }
+
+    const lib = parsedUrl.protocol === 'https:' ? https : http;
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+    };
+
+    const req = lib.request(options, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const respBody = Buffer.concat(chunks).toString('utf8');
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, body: respBody, error: null });
+      });
+    });
+
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      req.destroy();
+      resolve({ ok: false, status: null, body: '', error: `Request timeout (${REQUEST_TIMEOUT_MS} ms)` });
+    });
+
+    req.on('error', (err) => {
+      resolve({ ok: false, status: null, body: '', error: err.message });
+    });
+
+    req.end();
+  });
+}
+
+/**
  * Sleep helper for inter-line delay between WP commands.
  * @param {number} ms
  */
 function _sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function _normalizeFrameText(text) {
+  return String(text ?? '').trim();
+}
+
+function _unwrapAckFrame(text) {
+  const raw = _normalizeFrameText(text);
+  if (!raw) return null;
+
+  const wrapped = raw.match(/^S:\d+:(?:M|E):(.*)$/);
+  if (wrapped) {
+    const payload = _normalizeFrameText(wrapped[1]);
+    return {
+      raw,
+      wrapped: true,
+      payload,
+      ack: payload.startsWith('ACK:') ? payload : null,
+    };
+  }
+
+  return {
+    raw,
+    wrapped: false,
+    payload: raw,
+    ack: raw.startsWith('ACK:') ? raw : null,
+  };
+}
+
+function _expectedAckForCommand(cmd) {
+  switch (cmd) {
+    case 'AUTO':
+      return 'ACK:STATE:AUTO';
+    case 'MANUAL':
+      return 'ACK:STATE:MANUAL';
+    case 'PAUSE':
+      return 'ACK:STATE:PAUSE';
+    case 'ESTOP':
+      return 'ACK:STATE:ESTOP';
+    case 'RESET':
+      return 'ACK:STATE:PAUSE';
+    default:
+      return null;
+  }
+}
+
+async function _readLastLoRa() {
+  const result = await _get('/last_lora');
+  if (!result.ok) return { ok: false, error: result.error ?? `HTTP ${result.status}` };
+  return { ok: true, frame: _unwrapAckFrame(result.body) };
+}
+
+async function _waitForAck(expectedAck, options = {}) {
+  const { baselineRaw = null, wrappedOnly = true, timeoutMs = ACK_WAIT_TIMEOUT_MS } = options;
+  const startedAt = Date.now();
+  let lastSeenRaw = baselineRaw;
+
+  while ((Date.now() - startedAt) < timeoutMs) {
+    const snapshot = await _readLastLoRa();
+    if (snapshot.ok && snapshot.frame?.ack) {
+      const { frame } = snapshot;
+      lastSeenRaw = frame.raw;
+
+      if ((!wrappedOnly || frame.wrapped) && frame.ack === expectedAck && frame.raw !== baselineRaw) {
+        return { ok: true, ack: frame.ack, raw: frame.raw };
+      }
+    }
+
+    await _sleep(ACK_POLL_MS);
+  }
+
+  return {
+    ok: false,
+    error: `Timed out waiting for ${expectedAck}`,
+    lastSeenRaw,
+  };
 }
 
 // Phase D: retry budget and delay when the base station returns 503 queue_full.
@@ -198,17 +322,37 @@ function _recordResult(result) {
  * @param {string} cmd  Plain-text command token (e.g. "ESTOP", "PAUSE", "AUTO")
  * @returns {Promise<{ ok: boolean, status: number|null, body: string, error: string|null }>}
  */
-async function sendCommand(cmd) {
+async function sendCommand(cmd, options = {}) {
   if (!cmd || typeof cmd !== 'string') {
     return { ok: false, status: null, body: '', error: 'cmd must be a non-empty string' };
   }
   const cmdStr = cmd.trim().toUpperCase();
+  const { waitForAck = false } = options;
+  const expectedAck = waitForAck ? _expectedAckForCommand(cmdStr) : null;
+  const baseline = expectedAck ? await _readLastLoRa() : null;
   const result = await _postWithRetry('/command', cmdStr);
 
   _lastCmd      = cmdStr;
   _lastCmdAt    = new Date().toISOString();
   _lastCmdError = result.ok ? null : (result.error ?? `HTTP ${result.status}`);
   _recordResult(result);
+
+  if (!result.ok) {
+    return result;
+  }
+
+  if (expectedAck) {
+    const ack = await _waitForAck(expectedAck, {
+      baselineRaw: baseline?.ok ? baseline.frame?.raw ?? null : null,
+      wrappedOnly: true,
+    });
+    if (!ack.ok) {
+      _lastCmdError = ack.error;
+      _recordResult({ ok: false, error: ack.error });
+      return { ok: false, status: 504, body: '', error: ack.error, ack };
+    }
+    return { ...result, ack };
+  }
 
   return result;
 }
@@ -255,12 +399,18 @@ async function pushWaypoints(points) {
 
   _wpPushState = ARBITRATION.WP_PENDING;
   _wpPushError = null;
+  const baselineClear = await _readLastLoRa();
 
   // 1. WPCLEAR
   {
     const r = await _postWithRetry('/command', LORA_WIRE.WP_CLEAR);
     _recordResult(r);
     if (!r.ok) return _wpFail(0, r.error ?? `WPCLEAR HTTP ${r.status}`);
+    const ack = await _waitForAck(LORA_WIRE.WP_ACK_CLEAR, {
+      baselineRaw: baselineClear.ok ? baselineClear.frame?.raw ?? null : null,
+      wrappedOnly: true,
+    });
+    if (!ack.ok) return _wpFail(0, ack.error);
   }
   await _sleep(LORA_WIRE.WP_INTERLINE_MS);
 
@@ -270,18 +420,30 @@ async function pushWaypoints(points) {
     const salt  = Math.round(p.salt);
     const brine = Math.round(p.brine);
     const line  = `${LORA_WIRE.WP_ADD}:${i}:${p.lat.toFixed(6)},${p.lon.toFixed(6)},${salt},${brine}`;
+    const baseline = await _readLastLoRa();
     const r     = await _postWithRetry('/command', line);
     _recordResult(r);
     if (!r.ok) return _wpFail(i, r.error ?? `WP:${i} HTTP ${r.status}`);
+    const ack = await _waitForAck(`${LORA_WIRE.WP_ACK_ADD}:${i}`, {
+      baselineRaw: baseline.ok ? baseline.frame?.raw ?? null : null,
+      wrappedOnly: true,
+    });
+    if (!ack.ok) return _wpFail(i, ack.error);
     if (i < points.length - 1) await _sleep(LORA_WIRE.WP_INTERLINE_MS);
   }
   await _sleep(LORA_WIRE.WP_INTERLINE_MS);
 
   // 3. WPLOAD:<count>
   {
+    const baseline = await _readLastLoRa();
     const r = await _postWithRetry('/command', `${LORA_WIRE.WP_LOAD}:${points.length}`);
     _recordResult(r);
     if (!r.ok) return _wpFail(points.length, r.error ?? `WPLOAD HTTP ${r.status}`);
+    const ack = await _waitForAck(`${LORA_WIRE.WP_ACK_LOAD}:${points.length}`, {
+      baselineRaw: baseline.ok ? baseline.frame?.raw ?? null : null,
+      wrappedOnly: true,
+    });
+    if (!ack.ok) return _wpFail(points.length, ack.error);
   }
 
   _wpPushState = ARBITRATION.WP_COMMITTED;
