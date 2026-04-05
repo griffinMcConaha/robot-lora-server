@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 const {
@@ -37,6 +38,11 @@ const {
 const db      = require('./db');
 const mission = require('./mission');
 const bridge  = require('./lora_bridge');
+const {
+  RUNTIME_STATE_PATH,
+  loadRuntimeState,
+  saveRuntimeState,
+} = require('./runtime_state');
 
 // Publish mission transitions over WebSocket
 mission.onTransition((m) => publish(WS_EVENT.MISSION_UPDATED, m));
@@ -75,6 +81,8 @@ const GPS_READY_MAX_HDOP = Number(process.env.GPS_READY_MAX_HDOP ?? 3.0);
 const GPS_FAILSAFE_ENABLED = String(process.env.GPS_FAILSAFE_ENABLED ?? '1') !== '0';
 const GPS_FAILSAFE_ACTION = String(process.env.GPS_FAILSAFE_ACTION ?? CMD.PAUSE).trim().toUpperCase();
 const GPS_FAILSAFE_COOLDOWN_MS = Number(process.env.GPS_FAILSAFE_COOLDOWN_MS ?? 5000);
+const RUNTIME_STATE_SAVE_DEBOUNCE_MS = Number(process.env.RUNTIME_STATE_SAVE_DEBOUNCE_MS ?? 750);
+const RUNTIME_STATE_TRAIL_LIMIT = Number(process.env.RUNTIME_STATE_TRAIL_LIMIT ?? 300);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -107,6 +115,8 @@ const metrics = {
   safetyActions: 0,
   eventPruneRuns: 0,
   eventPrunedRows: 0,
+  runtimeStateWrites: 0,
+  runtimeStateWriteFailures: 0,
 };
 
 const state = {
@@ -131,9 +141,17 @@ const state = {
     geofenceFailsafeReason: null,
   },
   operator: createOperatorState(),
+  persistence: {
+    restoredAt: null,
+    lastSavedAt: null,
+    lastSaveReason: null,
+    lastSaveError: null,
+    source: RUNTIME_STATE_PATH,
+  },
 };
 
 let safetyMonitorInFlight = false;
+let runtimeStateSaveTimer = null;
 
 const DRIVE_COMMANDS = new Set([
   CMD.FORWARD,
@@ -195,6 +213,165 @@ function getCoveragePct(stats) {
 
 function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function cloneJsonSafe(value, fallback) {
+  if (value == null) return fallback;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function serializeCoverageRuntime(map) {
+  if (!map) return null;
+
+  const cells = [];
+  for (let row = 0; row < map.height; row++) {
+    for (let col = 0; col < map.width; col++) {
+      const cell = map.cells[row][col];
+      if (!cell?.inside) continue;
+      if (!cell.covered && !cell.hits && !cell.lastSeenMs) continue;
+      cells.push({
+        row,
+        col,
+        covered: Boolean(cell.covered),
+        hits: Number(cell.hits ?? 0),
+        lastSeenMs: Number(cell.lastSeenMs ?? 0),
+      });
+    }
+  }
+
+  return {
+    cellSizeM: map.cellSizeM,
+    cells,
+    stats: coverageStats(map),
+  };
+}
+
+function applyCoverageRuntime(map, snapshot) {
+  if (!map || !snapshot || !Array.isArray(snapshot.cells)) return;
+  for (const saved of snapshot.cells) {
+    const row = Number(saved?.row);
+    const col = Number(saved?.col);
+    if (!withinGrid(map, row, col)) continue;
+    const cell = map.cells[row][col];
+    if (!cell?.inside) continue;
+    cell.covered = Boolean(saved.covered);
+    cell.hits = Number(saved.hits ?? 0);
+    cell.lastSeenMs = Number(saved.lastSeenMs ?? 0);
+  }
+}
+
+function buildRuntimeSnapshot(reason = 'unspecified') {
+  return {
+    version: 1,
+    savedAt: Date.now(),
+    reason,
+    state: {
+      baseStation: cloneJsonSafe(state.baseStation, null),
+      boundary: cloneJsonSafe(state.boundary, null),
+      coverage: serializeCoverageRuntime(state.coverage),
+      robot: cloneJsonSafe(state.robot, null),
+      trail: Array.isArray(state.trail)
+        ? cloneJsonSafe(state.trail.slice(-Math.max(1, RUNTIME_STATE_TRAIL_LIMIT)), [])
+        : [],
+      lastPath: cloneJsonSafe(state.lastPath, []),
+      lastFault: cloneJsonSafe(state.lastFault, null),
+      safety: cloneJsonSafe(state.safety, {}),
+      operator: cloneJsonSafe({
+        workflowAcks: state.operator.workflowAcks,
+        notes: state.operator.notes,
+      }, createOperatorState()),
+      bridge: cloneJsonSafe(bridge.getStatus(), null),
+      mission: cloneJsonSafe(mission.publicMission(), null),
+    },
+  };
+}
+
+function flushRuntimeState(reason = 'unspecified') {
+  if (runtimeStateSaveTimer) {
+    clearTimeout(runtimeStateSaveTimer);
+    runtimeStateSaveTimer = null;
+  }
+
+  try {
+    saveRuntimeState(buildRuntimeSnapshot(reason));
+    metrics.runtimeStateWrites += 1;
+    state.persistence.lastSavedAt = Date.now();
+    state.persistence.lastSaveReason = reason;
+    state.persistence.lastSaveError = null;
+  } catch (error) {
+    metrics.runtimeStateWriteFailures += 1;
+    state.persistence.lastSaveError = error.message;
+    console.error('[runtime] failed to save runtime state:', error.message);
+  }
+}
+
+function scheduleRuntimeStateSave(reason = 'unspecified', options = {}) {
+  const { immediate = false } = options;
+  if (immediate) {
+    flushRuntimeState(reason);
+    return;
+  }
+  if (runtimeStateSaveTimer) {
+    return;
+  }
+  runtimeStateSaveTimer = setTimeout(() => {
+    flushRuntimeState(reason);
+  }, Math.max(0, RUNTIME_STATE_SAVE_DEBOUNCE_MS));
+}
+
+function restoreRuntimeState() {
+  let snapshot = null;
+  try {
+    snapshot = loadRuntimeState();
+  } catch (error) {
+    state.persistence.lastSaveError = `restore failed: ${error.message}`;
+    console.error('[runtime] failed to load runtime state:', error.message);
+  }
+
+  const saved = snapshot?.state ?? null;
+  const missionSnapshot = mission.publicMission();
+  const boundary = Array.isArray(saved?.boundary) && saved.boundary.length >= 3
+    ? saved.boundary
+    : (Array.isArray(missionSnapshot?.boundary) && missionSnapshot.boundary.length >= 3 ? missionSnapshot.boundary : null);
+  const baseStation = saved?.baseStation ?? missionSnapshot?.baseStation ?? null;
+  const cellSizeM = Number(saved?.coverage?.cellSizeM ?? missionSnapshot?.cellSizeM ?? 2.0);
+
+  state.baseStation = baseStation;
+  state.boundary = boundary;
+  state.robot = cloneJsonSafe(saved?.robot, null);
+  state.trail = Array.isArray(saved?.trail) ? cloneJsonSafe(saved.trail, []) : [];
+  state.lastPath = Array.isArray(saved?.lastPath) ? cloneJsonSafe(saved.lastPath, []) : [];
+  state.lastFault = cloneJsonSafe(saved?.lastFault, null);
+  state.safety = {
+    ...state.safety,
+    ...(cloneJsonSafe(saved?.safety, {}) ?? {}),
+  };
+  state.operator = createOperatorState();
+  state.operator.workflowAcks = cloneJsonSafe(saved?.operator?.workflowAcks, {});
+  state.operator.notes = Array.isArray(saved?.operator?.notes) ? cloneJsonSafe(saved.operator.notes, []) : [];
+
+  if (boundary) {
+    state.coverage = buildCoverageMap(boundary, cellSizeM);
+    applyCoverageRuntime(state.coverage, saved?.coverage);
+  }
+
+  if (saved?.bridge) {
+    bridge.restoreStatus(saved.bridge);
+  }
+
+  if (snapshot) {
+    state.persistence.restoredAt = Date.now();
+    state.persistence.lastSavedAt = Number(snapshot.savedAt ?? 0) || null;
+    state.persistence.lastSaveReason = snapshot.reason ?? 'restored';
+    state.persistence.lastSaveError = null;
+  } else if (missionSnapshot) {
+    state.persistence.restoredAt = Date.now();
+    state.persistence.lastSaveReason = 'mission-db-fallback';
+  }
 }
 
 function sleep(ms) {
@@ -382,6 +559,7 @@ const rateLimitTelemetry = makeRateLimitMiddleware('telemetry', TELEMETRY_RATE_L
 
 function resetOperatorState() {
   state.operator = createOperatorState();
+  scheduleRuntimeStateSave('operator.reset', { immediate: true });
 }
 
 function telemetryAgeMs(now = Date.now()) {
@@ -406,6 +584,7 @@ function setWorkflowAck(workflowId, stepId, checked, meta = {}) {
     if (Object.keys(state.operator.workflowAcks[workflowId]).length === 0) {
       delete state.operator.workflowAcks[workflowId];
     }
+    scheduleRuntimeStateSave('operator.workflow_ack_clear', { immediate: true });
     return null;
   }
 
@@ -416,6 +595,7 @@ function setWorkflowAck(workflowId, stepId, checked, meta = {}) {
     at: Date.now(),
   };
   state.operator.workflowAcks[workflowId][stepId] = ack;
+  scheduleRuntimeStateSave('operator.workflow_ack', { immediate: true });
   return ack;
 }
 
@@ -434,6 +614,7 @@ function addOperatorNote({ text, category = 'general', actor = 'operator' }) {
   }
   mission.addNote(`[${category}] ${actor}: ${text}`);
   db.logEvent(mission.currentId(), EVENT_TYPE.OPERATOR_NOTE_ADDED, note);
+  scheduleRuntimeStateSave('operator.note_added', { immediate: true });
   return note;
 }
 
@@ -605,7 +786,7 @@ async function enforceGeofenceFailsafePolicy(triggerSource = 'telemetry') {
     });
 
     metrics.safetyActions += 1;
-
+    scheduleRuntimeStateSave('failsafe.telemetry', { immediate: true });
     publishSupervision();
     publishOperator();
   } finally {
@@ -777,7 +958,7 @@ async function enforceGpsFailsafePolicy() {
     });
 
     metrics.safetyActions += 1;
-
+    scheduleRuntimeStateSave('failsafe.gps', { immediate: true });
     publishSupervision();
     publishOperator();
   } finally {
@@ -795,6 +976,9 @@ function publishOperator() {
     notes: state.operator.notes,
   });
 }
+
+restoreRuntimeState();
+scheduleRuntimeStateSave('startup.reconciled', { immediate: true });
 
 function buildFinalMissionStats() {
   const stats = state.coverage ? coverageStats(state.coverage) : null;
@@ -847,6 +1031,7 @@ function syncMissionToCommand(cmd) {
       }
     }
     bridge.resetWpState();
+    scheduleRuntimeStateSave('command.estop', { immediate: true });
     return;
   }
 
@@ -858,6 +1043,7 @@ function syncMissionToCommand(cmd) {
         // ignore invalid transition if mission already paused/terminal
       }
     }
+    scheduleRuntimeStateSave('command.pause', { immediate: true });
     return;
   }
 
@@ -872,6 +1058,7 @@ function syncMissionToCommand(cmd) {
     } catch (_) {
       // ignore invalid transition if mission state changed concurrently
     }
+    scheduleRuntimeStateSave('command.auto', { immediate: true });
     return;
   }
 
@@ -883,6 +1070,7 @@ function syncMissionToCommand(cmd) {
         // ignore invalid transition if mission is no longer running
       }
     }
+    scheduleRuntimeStateSave('command.manual_override');
     return;
   }
 
@@ -892,6 +1080,7 @@ function syncMissionToCommand(cmd) {
       mission.reset();
       bridge.resetWpState();
     }
+    scheduleRuntimeStateSave('command.reset', { immediate: true });
   }
 }
 
@@ -993,6 +1182,7 @@ async function dispatchCommand(cmd, options = {}) {
     }
   }
 
+  scheduleRuntimeStateSave(`dispatch.${cmd}`, { immediate: !DRIVE_COMMANDS.has(cmd) });
   publishSupervision();
   publishOperator();
 
@@ -1050,6 +1240,7 @@ async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge') {
     return { ok: false, status: 502, error: result.error, sent: result.sent };
   }
   db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, { wpPushCount: result.sent, source });
+  scheduleRuntimeStateSave('waypoints.committed', { immediate: true });
   publishSupervision();
   publishOperator();
   return { ok: true, status: 200, sent: result.sent, points };
@@ -1083,6 +1274,7 @@ async function startMissionAction(source = 'mission.start') {
   }
 
   const current = mission.start();
+  scheduleRuntimeStateSave('mission.start', { immediate: true });
   publishSupervision();
   return { ok: true, status: 200, mission: current };
 }
@@ -1096,6 +1288,7 @@ async function pauseMissionAction(reason = null, source = 'mission.pause') {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
   const current = mission.pause(reason);
+  scheduleRuntimeStateSave('mission.pause', { immediate: true });
   publishSupervision();
   return { ok: true, status: 200, mission: current };
 }
@@ -1116,6 +1309,7 @@ async function resumeMissionAction(source = 'mission.resume') {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
   const current = mission.resume();
+  scheduleRuntimeStateSave('mission.resume', { immediate: true });
   publishSupervision();
   return { ok: true, status: 200, mission: current };
 }
@@ -1129,12 +1323,14 @@ async function completeMissionAction(source = 'mission.complete') {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
   const stats = state.coverage ? coverageStats(state.coverage) : {};
+  const missionSnapshot = mission.publicMission();
   const current = mission.complete({
     coveragePct: getCoveragePct(stats),
-    faultCount: db.getMissionEventSummary(mission.currentId() ?? 0)?.faultCount ?? 0,
-    cmdCount: db.getMissionEventSummary(mission.currentId() ?? 0)?.cmdCount ?? 0,
+    faultCount: missionSnapshot?.faultCount ?? 0,
+    cmdCount: missionSnapshot?.cmdCount ?? 0,
   });
   bridge.resetWpState();
+  scheduleRuntimeStateSave('mission.complete', { immediate: true });
   publishSupervision();
   return { ok: true, status: 200, mission: current };
 }
@@ -1148,12 +1344,14 @@ async function abortMissionAction(reason = 'operator', source = 'mission.abort')
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
   const stats = state.coverage ? coverageStats(state.coverage) : {};
+  const missionSnapshot = mission.publicMission();
   const current = mission.abort(reason, {
     coveragePct: getCoveragePct(stats),
-    faultCount: db.getMissionEventSummary(mission.currentId() ?? 0)?.faultCount ?? 0,
-    cmdCount: db.getMissionEventSummary(mission.currentId() ?? 0)?.cmdCount ?? 0,
+    faultCount: missionSnapshot?.faultCount ?? 0,
+    cmdCount: missionSnapshot?.cmdCount ?? 0,
   });
   bridge.resetWpState();
+  scheduleRuntimeStateSave('mission.abort', { immediate: true });
   publishSupervision();
   return { ok: true, status: 200, mission: current };
 }
@@ -1852,6 +2050,7 @@ function publicState() {
       notes: state.operator.notes,
       workflows: buildOperatorWorkflows(),
     },
+    persistence: state.persistence,
   };
 }
 
@@ -1893,6 +2092,14 @@ app.get(API.HEALTH, (_req, res) => {
       consecutiveFailures: bridgeStatus.consecutiveFailures,
       lastSuccessAt: bridgeStatus.lastSuccessAt,
       lastErrorAt: bridgeStatus.lastErrorAt,
+    },
+    persistence: {
+      source: state.persistence.source,
+      restoredAt: state.persistence.restoredAt,
+      lastSavedAt: state.persistence.lastSavedAt,
+      lastSaveReason: state.persistence.lastSaveReason,
+      lastSaveError: state.persistence.lastSaveError,
+      exists: fs.existsSync(RUNTIME_STATE_PATH),
     },
   });
 });
@@ -2019,6 +2226,7 @@ app.post(API.INPUT_AREA, requireApp, (req, res) => {
     }
   }
   mission.configure({ baseStation, boundary, cellSizeM: cellPlan.effectiveCellSizeM });
+  scheduleRuntimeStateSave('area.set', { immediate: true });
   publishOperator();
   publishSupervision();
 
@@ -2066,6 +2274,7 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
 
     publishSupervision();
     publishOperator();
+    scheduleRuntimeStateSave('telemetry.fault', { immediate: true });
 
     return res.json({ ok: true, fault: parsed.fault, action: parsed.action });
   }
@@ -2110,6 +2319,7 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
 
   await enforceGeofenceFailsafePolicy('telemetry');
 
+  scheduleRuntimeStateSave('telemetry.update');
   publishSupervision();
 
   return res.json({ ok: true, coverage: stats });
@@ -2215,6 +2425,7 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     brinePct: normalizedBrine,
     coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
   });
+  scheduleRuntimeStateSave('path.planned', { immediate: true });
   publishSupervision();
   publishOperator();
   res.json({ ok: true, mode, coverageWidthM: mode === 'coverage' ? coverageWidthM : null, points: state.lastPath, meta: path.meta ?? null });
@@ -2356,6 +2567,7 @@ app.get(API.BRIDGE_SYNC, requireAppOrBoard, async (_req, res) => {
     lastCommandAt: state.lastCommandAt,
     lastFault: state.lastFault,
     telemetryStale: isTelemetryStale(),
+    persistence: state.persistence,
   });
 });
 
@@ -2371,6 +2583,7 @@ app.get(API.TEST_MENU, requireAppOrBoard, async (_req, res) => {
     mission: mission.publicMission(),
     robot: state.robot,
     safety: state.safety,
+    persistence: state.persistence,
     allowedActions: buildAllowedActions(),
     alerts: buildAlerts(),
   });

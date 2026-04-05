@@ -644,6 +644,29 @@ function observeCommand(cmd) {
   }
 }
 
+function restoreStatus(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+
+  if (typeof snapshot.wpPushState === 'string') _wpPushState = snapshot.wpPushState;
+  if (Number.isFinite(Number(snapshot.wpPushCount))) _wpPushCount = Number(snapshot.wpPushCount);
+  if (typeof snapshot.wpPushAt === 'string' || snapshot.wpPushAt === null) _wpPushAt = snapshot.wpPushAt ?? null;
+  if (typeof snapshot.wpPushError === 'string' || snapshot.wpPushError === null) _wpPushError = snapshot.wpPushError ?? null;
+  if (typeof snapshot.lastCmd === 'string' || snapshot.lastCmd === null) _lastCmd = snapshot.lastCmd ?? null;
+  if (typeof snapshot.lastCmdAt === 'string' || snapshot.lastCmdAt === null) _lastCmdAt = snapshot.lastCmdAt ?? null;
+  if (typeof snapshot.lastCmdError === 'string' || snapshot.lastCmdError === null) _lastCmdError = snapshot.lastCmdError ?? null;
+  if (typeof snapshot.lastSuccessAt === 'string' || snapshot.lastSuccessAt === null) _lastSuccessAt = snapshot.lastSuccessAt ?? null;
+  if (typeof snapshot.lastErrorAt === 'string' || snapshot.lastErrorAt === null) _lastErrorAt = snapshot.lastErrorAt ?? null;
+  if (Number.isFinite(Number(snapshot.consecutiveFailures))) _consecutiveFailures = Number(snapshot.consecutiveFailures);
+  if (typeof snapshot.degradedSince === 'string' || snapshot.degradedSince === null) _degradedSince = snapshot.degradedSince ?? null;
+
+  if (snapshot.baseStation && typeof snapshot.baseStation === 'object') {
+    _baseStationSnapshot = {
+      ..._baseStationSnapshot,
+      ...snapshot.baseStation,
+    };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -657,4 +680,4 @@ function _wpFail(sent, error) {
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
-module.exports = { sendCommand, pushWaypoints, resetWpState, getStatus, refreshStatus, observeCommand };
+module.exports = { sendCommand, pushWaypoints, resetWpState, getStatus, refreshStatus, observeCommand, restoreStatus };
