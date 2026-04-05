@@ -85,6 +85,7 @@ const GPS_FAILSAFE_ACTION = String(process.env.GPS_FAILSAFE_ACTION ?? CMD.PAUSE)
 const GPS_FAILSAFE_COOLDOWN_MS = Number(process.env.GPS_FAILSAFE_COOLDOWN_MS ?? 5000);
 const RUNTIME_STATE_SAVE_DEBOUNCE_MS = Number(process.env.RUNTIME_STATE_SAVE_DEBOUNCE_MS ?? 750);
 const RUNTIME_STATE_TRAIL_LIMIT = Number(process.env.RUNTIME_STATE_TRAIL_LIMIT ?? 300);
+const COMMAND_HISTORY_LIMIT = Number(process.env.COMMAND_HISTORY_LIMIT ?? 50);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -132,6 +133,7 @@ const state = {
   lastCommandId: null,
   lastCommandStatus: null,
   lastCommandAt: 0,
+  commandHistory: [],
   lastFault: null,
   safety: {
     telemetryFailsafeAt: 0,
@@ -282,6 +284,9 @@ function buildRuntimeSnapshot(reason = 'unspecified') {
         ? cloneJsonSafe(state.trail.slice(-Math.max(1, RUNTIME_STATE_TRAIL_LIMIT)), [])
         : [],
       lastPath: cloneJsonSafe(state.lastPath, []),
+      commandHistory: Array.isArray(state.commandHistory)
+        ? cloneJsonSafe(state.commandHistory.slice(0, Math.max(1, COMMAND_HISTORY_LIMIT)), [])
+        : [],
       lastFault: cloneJsonSafe(state.lastFault, null),
       safety: cloneJsonSafe(state.safety, {}),
       operator: cloneJsonSafe({
@@ -349,6 +354,7 @@ function restoreRuntimeState() {
   state.robot = cloneJsonSafe(saved?.robot, null);
   state.trail = Array.isArray(saved?.trail) ? cloneJsonSafe(saved.trail, []) : [];
   state.lastPath = Array.isArray(saved?.lastPath) ? cloneJsonSafe(saved.lastPath, []) : [];
+  state.commandHistory = Array.isArray(saved?.commandHistory) ? cloneJsonSafe(saved.commandHistory, []) : [];
   state.lastFault = cloneJsonSafe(saved?.lastFault, null);
   state.safety = {
     ...state.safety,
@@ -384,6 +390,66 @@ function sleep(ms) {
 
 function createCommandId() {
   return `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function trimCommandHistory() {
+  if (!Array.isArray(state.commandHistory)) {
+    state.commandHistory = [];
+    return;
+  }
+  if (state.commandHistory.length > COMMAND_HISTORY_LIMIT) {
+    state.commandHistory = state.commandHistory.slice(0, COMMAND_HISTORY_LIMIT);
+  }
+}
+
+function upsertCommandHistory(entry) {
+  if (!entry?.commandId) return;
+  if (!Array.isArray(state.commandHistory)) {
+    state.commandHistory = [];
+  }
+
+  const existingIndex = state.commandHistory.findIndex((item) => item?.commandId === entry.commandId);
+  const next = {
+    ...(existingIndex >= 0 ? state.commandHistory[existingIndex] : {}),
+    ...entry,
+    updatedAt: Date.now(),
+  };
+
+  if (existingIndex >= 0) {
+    state.commandHistory.splice(existingIndex, 1);
+  }
+  state.commandHistory.unshift(next);
+  trimCommandHistory();
+}
+
+function updateCommandTracking(commandId, patch = {}) {
+  if (!commandId) return;
+  const timestamp = Date.now();
+  const status = patch.status ?? state.lastCommandStatus ?? null;
+  state.lastCommand = patch.cmd ?? state.lastCommand;
+  state.lastCommandId = commandId;
+  state.lastCommandStatus = status;
+  state.lastCommandAt = timestamp;
+
+  upsertCommandHistory({
+    commandId,
+    cmd: patch.cmd ?? state.lastCommand ?? null,
+    source: patch.source ?? null,
+    status,
+    error: patch.error ?? null,
+    bridgeAckSource: patch.bridgeAckSource ?? null,
+    detail: patch.detail ?? null,
+    at: patch.at ?? timestamp,
+  });
+
+  publish(WS_EVENT.COMMAND_RECEIVED, {
+    cmd: patch.cmd ?? state.lastCommand ?? null,
+    commandId,
+    status,
+    at: state.lastCommandAt,
+    error: patch.error ?? null,
+    bridgeAckSource: patch.bridgeAckSource ?? null,
+  });
 }
 
 function resolveGpsFailsafeAction() {
@@ -1271,22 +1337,32 @@ async function dispatchCommand(cmd, options = {}) {
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
     metrics.commandsFailed += 1;
-    state.lastCommand = cmd;
-    state.lastCommandId = commandId;
-    state.lastCommandStatus = COMMAND_STATUS.FAILED;
-    state.lastCommandAt = Date.now();
+    updateCommandTracking(commandId, {
+      cmd,
+      source,
+      status: COMMAND_STATUS.FAILED,
+      error: decision.error,
+      detail: { stage: 'arbitration', status: decision.status },
+    });
     return { ok: false, status: decision.status, error: decision.error };
   }
 
-  state.lastCommand = cmd;
-  state.lastCommandId = commandId;
-  state.lastCommandStatus = COMMAND_STATUS.QUEUED;
-  state.lastCommandAt = Date.now();
+  updateCommandTracking(commandId, {
+    cmd,
+    source,
+    status: COMMAND_STATUS.QUEUED,
+  });
 
   const result = await bridge.sendCommand(cmd, { waitForAck, commandId, commandSource: source });
   if (!result.ok) {
     metrics.commandsFailed += 1;
-    state.lastCommandStatus = COMMAND_STATUS.FAILED;
+    updateCommandTracking(commandId, {
+      cmd,
+      source,
+      status: COMMAND_STATUS.FAILED,
+      error: result.error ?? `Base station command failed (${result.status ?? 'no status'})`,
+      detail: result,
+    });
     return {
       ok: false,
       status: 502,
@@ -1299,13 +1375,16 @@ async function dispatchCommand(cmd, options = {}) {
     bridge.observeCommand(cmd);
   }
 
-  state.lastCommand = cmd;
-  state.lastCommandAt = Date.now();
-  state.lastCommandStatus = waitForState
+  const forwardedStatus = waitForState
     ? COMMAND_STATUS.FORWARDED
     : (waitForAck ? COMMAND_STATUS.ACKNOWLEDGED : COMMAND_STATUS.SENT);
-  publish(WS_EVENT.COMMAND_RECEIVED, { cmd, commandId, status: state.lastCommandStatus, at: state.lastCommandAt });
-  db.logEvent(mission.currentId(), EVENT_TYPE.COMMAND_SENT, { cmd, commandId, status: state.lastCommandStatus, source });
+  updateCommandTracking(commandId, {
+    cmd,
+    source,
+    status: forwardedStatus,
+    bridgeAckSource: result.ack?.source ?? null,
+  });
+  db.logEvent(mission.currentId(), EVENT_TYPE.COMMAND_SENT, { cmd, commandId, status: forwardedStatus, source });
   mission.recordCommand();
 
   if (syncMission) {
@@ -1319,7 +1398,13 @@ async function dispatchCommand(cmd, options = {}) {
     });
     if (!confirmation.ok) {
       metrics.commandsFailed += 1;
-      state.lastCommandStatus = COMMAND_STATUS.TIMED_OUT;
+      updateCommandTracking(commandId, {
+        cmd,
+        source,
+        status: COMMAND_STATUS.TIMED_OUT,
+        error: confirmation.error,
+        detail: confirmation,
+      });
       return {
         ok: false,
         status: 504,
@@ -1327,7 +1412,12 @@ async function dispatchCommand(cmd, options = {}) {
         detail: confirmation,
       };
     }
-    state.lastCommandStatus = COMMAND_STATUS.APPLIED;
+    updateCommandTracking(commandId, {
+      cmd,
+      source,
+      status: COMMAND_STATUS.APPLIED,
+      detail: confirmation,
+    });
   }
 
   scheduleRuntimeStateSave(`dispatch.${cmd}`, { immediate: !DRIVE_COMMANDS.has(cmd) });
@@ -2195,6 +2285,7 @@ function publicState() {
     lastPath: state.lastPath,
     lastCommandId: state.lastCommandId,
     lastCommandStatus: state.lastCommandStatus,
+    commandHistory: state.commandHistory,
     mission: mission.publicMission(),
     operator: {
       notes: state.operator.notes,
@@ -2244,6 +2335,7 @@ app.get(API.HEALTH, (_req, res) => {
       lastSuccessAt: bridgeStatus.lastSuccessAt,
       lastErrorAt: bridgeStatus.lastErrorAt,
     },
+    commandHistory: state.commandHistory,
     connectivity: connection,
     persistence: {
       source: state.persistence.source,
@@ -2291,6 +2383,7 @@ app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
     last_cmd: state.lastCommand,
     last_cmd_id: state.lastCommandId,
     last_cmd_status: state.lastCommandStatus,
+    command_history: state.commandHistory,
     last_fault: state.lastFault ?? null,
     connectivity: connection.overall,
     robot: state.robot
@@ -2723,6 +2816,7 @@ app.get(API.BRIDGE_SYNC, requireAppOrBoard, async (_req, res) => {
     lastCommandId: state.lastCommandId,
     lastCommandStatus: state.lastCommandStatus,
     lastCommandAt: state.lastCommandAt,
+    commandHistory: state.commandHistory,
     lastFault: state.lastFault,
     telemetryStale: isTelemetryStale(),
     connectivity: buildConnectionState(),
@@ -2746,6 +2840,7 @@ app.get(API.TEST_MENU, requireAppOrBoard, async (_req, res) => {
     connectivity: buildConnectionState(),
     allowedActions: buildAllowedActions(),
     alerts: buildAlerts(),
+    commandHistory: state.commandHistory,
   });
 });
 
