@@ -1170,27 +1170,57 @@
       const gps = latestTestSnapshot?.gps || {};
       const mission = latestTestSnapshot?.mission || {};
       const robot = latestTestSnapshot?.robot || {};
-      const loraClass = lora.statusOk === false ? 'critical' : ((lora.queueDepth || 0) > 0 ? 'warn' : 'ok');
-      const gpsClass = gps.ready ? 'ok' : 'warn';
-      const missionClass = ['ABORTED', 'ERROR', 'ESTOP'].includes(mission.state) ? 'critical' : (mission.state === 'RUNNING' ? 'ok' : 'warn');
+      const connectivity = latestTestSnapshot?.connectivity || {};
+      const overall = connectivity.overall || {};
+      const backend = connectivity.backend || {};
+      const baseStation = connectivity.baseStation || {};
+      const commandPath = connectivity.commandPath || {};
+      const robotLink = connectivity.robot || {};
+      const backendClass = backend.state === 'online' ? 'ok' : 'critical';
+      const baseClass = baseStation.state === 'online' ? 'ok' : (baseStation.state === 'degraded' ? 'warn' : 'critical');
+      const robotClass = robotLink.state === 'online' ? 'ok' : (robotLink.state === 'degraded' || robotLink.state === 'stale' ? 'warn' : 'critical');
+      const commandClass = commandPath.state === 'ready' ? 'ok' : (commandPath.state === 'degraded' ? 'warn' : 'critical');
 
       container.innerHTML = `
-        <div class="monitor-card ${loraClass}">
-          <div class="monitor-title">LoRa / ACK</div>
-          <div class="monitor-row"><span>State</span><strong>${lora.state || '—'}</strong></div>
-          <div class="monitor-row"><span>Mode</span><strong>${lora.mode || '—'}</strong></div>
-          <div class="monitor-row"><span>Queue</span><strong>${lora.queueDepth ?? '—'}</strong></div>
-          <div class="monitor-row"><span>ACK Count</span><strong>${lora.ackCount ?? '—'}</strong></div>
-          <div class="monitor-row"><span>Last ACK</span><strong>${lora.lastAck || '—'}</strong></div>
+        <div class="monitor-card ${backendClass}">
+          <div class="monitor-title">Backend</div>
+          <div class="monitor-row"><span>State</span><strong>${backend.state || '—'}</strong></div>
+          <div class="monitor-row"><span>DB</span><strong>${backend.dbOk ? 'OK' : 'Issue'}</strong></div>
+          <div class="monitor-row"><span>Overall</span><strong>${overall.state || '—'}</strong></div>
+          <div class="monitor-row"><span>Reason</span><strong>${overall.reason || '—'}</strong></div>
         </div>
-        <div class="monitor-card ${missionClass}">
+        <div class="monitor-card ${baseClass}">
+          <div class="monitor-title">Base Station</div>
+          <div class="monitor-row"><span>State</span><strong>${baseStation.state || '—'}</strong></div>
+          <div class="monitor-row"><span>Wi-Fi</span><strong>${lora.wifi_link_state || '—'}</strong></div>
+          <div class="monitor-row"><span>LoRa</span><strong>${lora.lora_link_state || '—'}</strong></div>
+          <div class="monitor-row"><span>Queue</span><strong>${baseStation.queueDepth ?? lora.queueDepth ?? '—'}</strong></div>
+          <div class="monitor-row"><span>Last ACK</span><strong>${baseStation.lastAck || lora.lastAck || '—'}</strong></div>
+        </div>
+        <div class="monitor-card ${robotClass}">
+          <div class="monitor-title">Robot Link</div>
+          <div class="monitor-row"><span>State</span><strong>${robotLink.state || '—'}</strong></div>
+          <div class="monitor-row"><span>Robot</span><strong>${robot.state || robotLink.robotState || '—'}</strong></div>
+          <div class="monitor-row"><span>Telemetry</span><strong>${robotLink.telemetryStale ? 'Stale' : 'Live'}</strong></div>
+          <div class="monitor-row"><span>GPS Ready</span><strong>${(robotLink.gpsReady ?? gps.ready) ? 'Yes' : 'No'}</strong></div>
+          <div class="monitor-row"><span>Sat / HDOP</span><strong>${robot.gpsSat ?? '—'} / ${robot.gpsHdop ?? '—'}</strong></div>
+        </div>
+        <div class="monitor-card ${commandClass}">
+          <div class="monitor-title">Command Path</div>
+          <div class="monitor-row"><span>State</span><strong>${commandPath.state || '—'}</strong></div>
+          <div class="monitor-row"><span>Mission</span><strong>${mission.state || overall.missionState || '—'}</strong></div>
+          <div class="monitor-row"><span>Waypoints</span><strong>${latestTestSnapshot?.lora?.wpPushState || '—'}</strong></div>
+          <div class="monitor-row"><span>Last Cmd</span><strong>${commandPath.lastCmd || latestTestSnapshot?.lora?.lastCmd || '—'}</strong></div>
+          <div class="monitor-row"><span>Status</span><strong>${commandPath.lastCommandStatus || latestTestSnapshot?.lora?.lastCommandStatus || '—'}</strong></div>
+        </div>
+        <div class="monitor-card ${mission.state === 'RUNNING' ? 'ok' : 'warn'}">
           <div class="monitor-title">Mission</div>
           <div class="monitor-row"><span>State</span><strong>${mission.state || '—'}</strong></div>
           <div class="monitor-row"><span>Coverage</span><strong>${mission.coveragePct != null ? `${Number(mission.coveragePct).toFixed(1)}%` : '—'}</strong></div>
-          <div class="monitor-row"><span>Waypoints</span><strong>${latestTestSnapshot?.lora?.wpPushState || '—'}</strong></div>
-          <div class="monitor-row"><span>Robot</span><strong>${robot.state || '—'}</strong></div>
+          <div class="monitor-row"><span>Command ID</span><strong>${commandPath.lastCommandId || '—'}</strong></div>
+          <div class="monitor-row"><span>Ready</span><strong>${overall.ready ? 'Yes' : 'No'}</strong></div>
         </div>
-        <div class="monitor-card ${gpsClass}">
+        <div class="monitor-card ${gps.ready ? 'ok' : 'warn'}">
           <div class="monitor-title">GPS / Telemetry</div>
           <div class="monitor-row"><span>Ready</span><strong>${gps.ready ? 'Yes' : 'No'}</strong></div>
           <div class="monitor-row"><span>Fix</span><strong>${robot.gpsFix == null ? '—' : (robot.gpsFix ? 'Yes' : 'No')}</strong></div>
@@ -1203,12 +1233,14 @@
     }
 
     function updateControllerStatus() {
-      const missionState = latestTestSnapshot?.mission?.state || state?.mission?.state || '—';
-      const robotState = latestTestSnapshot?.robot?.state || state?.robot?.state || '—';
-      const linkState = latestTestSnapshot?.lora?.baseStation?.mode || latestTestSnapshot?.lora?.baseStation?.state || 'Idle';
+      const missionState = latestTestSnapshot?.mission?.state || latestTestSnapshot?.connectivity?.overall?.missionState || state?.mission?.state || '—';
+      const robotState = latestTestSnapshot?.robot?.state || latestTestSnapshot?.connectivity?.robot?.robotState || state?.robot?.state || '—';
+      const linkState = latestTestSnapshot?.connectivity?.commandPath?.state || latestTestSnapshot?.lora?.baseStation?.mode || latestTestSnapshot?.lora?.baseStation?.state || 'Idle';
       const alerts = Array.isArray(latestTestSnapshot?.alerts) ? latestTestSnapshot.alerts : [];
       const criticalAlert = alerts.some(alert => alert.level === 'critical');
-      const gpsReady = latestTestSnapshot?.gps?.ready;
+      const gpsReady = latestTestSnapshot?.connectivity?.robot?.gpsReady ?? latestTestSnapshot?.gps?.ready;
+      const backendState = latestTestSnapshot?.connectivity?.backend?.state || 'offline';
+      const commandPathState = latestTestSnapshot?.connectivity?.commandPath?.state || 'offline';
 
       document.getElementById('controllerMissionState').textContent = missionState;
       document.getElementById('controllerRobotState').textContent = robotState;
@@ -1227,7 +1259,7 @@
 
       if (robotCard) robotCard.classList.add(gpsReady === false ? 'warn' : 'ok');
       if (missionCard) missionCard.classList.add(criticalAlert ? 'critical' : (missionState === 'RUNNING' ? 'ok' : 'warn'));
-      if (linkCard) linkCard.classList.add(latestTestSnapshot?.lora?.baseStation?.statusOk === false ? 'critical' : 'ok');
+      if (linkCard) linkCard.classList.add(backendState === 'online' && commandPathState === 'ready' ? 'ok' : (commandPathState === 'degraded' ? 'warn' : 'critical'));
       if (heldCard) heldCard.classList.add(heldDriveAction ? 'warn' : 'ok');
 
       ['drive-forward', 'drive-left', 'drive-right', 'drive-backward'].forEach((id) => {
@@ -1248,6 +1280,7 @@
       const robotState = latestTestSnapshot?.robot?.state || state?.robot?.state || 'UNKNOWN';
       const alerts = Array.isArray(latestTestSnapshot?.alerts) ? latestTestSnapshot.alerts : [];
       const gps = latestTestSnapshot?.gps || {};
+      const connectivity = latestTestSnapshot?.connectivity || {};
       const criticalAlert = alerts.find((alert) => alert.level === 'critical');
       const warningAlert = alerts.find((alert) => alert.level === 'warning');
 
@@ -1262,6 +1295,12 @@
       if (criticalAlert) {
         banner.classList.add('critical');
         banner.textContent = criticalAlert.message;
+        return;
+      }
+
+      if (connectivity?.overall?.state && connectivity.overall.state !== 'online') {
+        banner.classList.add(connectivity.overall.state === 'degraded' || connectivity.overall.state === 'stale' ? 'warn' : 'critical');
+        banner.textContent = connectivity.overall.reason || 'Connection path is not fully ready for autonomy.';
         return;
       }
 
