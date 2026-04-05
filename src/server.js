@@ -25,6 +25,8 @@ const {
 } = require('./supervision');
 const {
   ROBOT_STATE,
+  CONNECTION_STATE,
+  COMMAND_STATUS,
   CMD,
   CMD_ALIASES,
   FAULT_CODE,
@@ -127,6 +129,8 @@ const state = {
   trail: [],
   lastPath: [],
   lastCommand: null,
+  lastCommandId: null,
+  lastCommandStatus: null,
   lastCommandAt: 0,
   lastFault: null,
   safety: {
@@ -376,6 +380,10 @@ function restoreRuntimeState() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createCommandId() {
+  return `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function resolveGpsFailsafeAction() {
@@ -661,6 +669,122 @@ function buildOperatorWorkflows() {
   });
 }
 
+function buildConnectionState(now = Date.now()) {
+  const bridgeStatus = bridge.getStatus();
+  const dbOk = db.ping();
+  const telemetryStale = isTelemetryStale(now);
+  const gpsStatus = getRobotGpsStatus();
+  const missionState = currentMissionState();
+  const baseStationReachable = bridgeStatus.baseStation?.statusOk === true;
+  const robotReachable = Boolean(state.robot);
+
+  const backend = {
+    state: dbOk ? CONNECTION_STATE.ONLINE : CONNECTION_STATE.DEGRADED,
+    dbOk,
+    uptimeMs: Date.now() - metrics.startedAt,
+    persistence: {
+      restoredAt: state.persistence.restoredAt,
+      lastSavedAt: state.persistence.lastSavedAt,
+      lastSaveReason: state.persistence.lastSaveReason,
+      lastSaveError: state.persistence.lastSaveError,
+      exists: fs.existsSync(RUNTIME_STATE_PATH),
+    },
+  };
+
+  const baseStationState = !baseStationReachable
+    ? CONNECTION_STATE.OFFLINE
+    : bridgeStatus.degraded
+      ? CONNECTION_STATE.DEGRADED
+      : CONNECTION_STATE.ONLINE;
+
+  const baseStation = {
+    state: baseStationState,
+    reachable: baseStationReachable,
+    mode: bridgeStatus.baseStation?.mode ?? null,
+    stationState: bridgeStatus.baseStation?.state ?? null,
+    queueDepth: bridgeStatus.baseStation?.queueDepth ?? null,
+    ackCount: bridgeStatus.baseStation?.ackCount ?? null,
+    lastAck: bridgeStatus.baseStation?.lastAck ?? null,
+    lastLoRa: bridgeStatus.baseStation?.lastLoRa ?? null,
+    lastSuccessAt: bridgeStatus.lastSuccessAt ?? null,
+    lastErrorAt: bridgeStatus.lastErrorAt ?? null,
+    lastError: bridgeStatus.lastCmdError ?? bridgeStatus.baseStation?.statusError ?? null,
+    degraded: Boolean(bridgeStatus.degraded),
+    consecutiveFailures: bridgeStatus.consecutiveFailures ?? 0,
+  };
+
+  const robotState = !robotReachable
+    ? CONNECTION_STATE.OFFLINE
+    : telemetryStale
+      ? CONNECTION_STATE.STALE
+      : gpsStatus.ready
+        ? CONNECTION_STATE.ONLINE
+        : CONNECTION_STATE.DEGRADED;
+
+  const robot = {
+    state: robotState,
+    reachable: robotReachable,
+    telemetryStale,
+    ageMs: telemetryAgeMs(now),
+    robotState: state.robot?.state ?? null,
+    gpsReady: gpsStatus.ready,
+    gpsReason: gpsStatus.reason,
+    gpsFix: state.robot?.gpsFix ?? null,
+    gpsHdop: state.robot?.gpsHdop ?? null,
+    gpsSat: state.robot?.gpsSat ?? null,
+    source: state.robot?.source ?? null,
+    timestampMs: state.robot?.timestampMs ?? null,
+  };
+
+  const commandPathReady = dbOk && baseStationReachable && robotReachable && !telemetryStale;
+  const commandPath = {
+    state: commandPathReady ? CONNECTION_STATE.READY : (baseStationReachable ? CONNECTION_STATE.DEGRADED : CONNECTION_STATE.OFFLINE),
+    ready: commandPathReady,
+    wpPushState: bridgeStatus.wpPushState,
+    lastCmd: bridgeStatus.lastCmd ?? state.lastCommand ?? null,
+    lastCommandId: state.lastCommandId,
+    lastCommandStatus: state.lastCommandStatus,
+    lastCmdAt: bridgeStatus.lastCmdAt ?? (state.lastCommandAt || null),
+    lastCmdError: bridgeStatus.lastCmdError ?? null,
+    missionState,
+  };
+
+  let overallState = CONNECTION_STATE.ONLINE;
+  let reason = null;
+  if (!dbOk) {
+    overallState = CONNECTION_STATE.DEGRADED;
+    reason = 'Server database is unavailable';
+  } else if (!baseStationReachable) {
+    overallState = CONNECTION_STATE.DEGRADED;
+    reason = 'Backend cannot reach the base station';
+  } else if (!robotReachable) {
+    overallState = CONNECTION_STATE.DEGRADED;
+    reason = 'Robot telemetry has not been received yet';
+  } else if (telemetryStale) {
+    overallState = CONNECTION_STATE.DEGRADED;
+    reason = 'Robot telemetry is stale';
+  } else if (!gpsStatus.ready && [MISSION_STATE.CONFIGURING, MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(missionState)) {
+    overallState = CONNECTION_STATE.DEGRADED;
+    reason = gpsStatus.reason ?? 'Robot GPS readiness is not met';
+  } else if (bridgeStatus.degraded) {
+    overallState = CONNECTION_STATE.DEGRADED;
+    reason = 'Base station link is degraded';
+  }
+
+  return {
+    overall: {
+      state: overallState,
+      ready: overallState === CONNECTION_STATE.ONLINE,
+      reason,
+      missionState,
+    },
+    backend,
+    baseStation,
+    robot,
+    commandPath,
+  };
+}
+
 function buildSupervisionSummary() {
   const now = Date.now();
   const robotAgeMs = telemetryAgeMs(now);
@@ -704,6 +828,7 @@ function buildSupervisionSummary() {
       geofenceFailsafeReason: state.safety.geofenceFailsafeReason,
       geofenceFailsafeCooldownMs: GEOFENCE_FAILSAFE_COOLDOWN_MS,
     },
+    connectivity: buildConnectionState(now),
     alerts: buildAlerts(now),
     allowedActions: buildAllowedActions(),
     workflows: buildOperatorWorkflows(),
@@ -1134,16 +1259,27 @@ async function waitForRobotState(expectedState, options = {}) {
 
 async function dispatchCommand(cmd, options = {}) {
   const { syncMission = true, source = 'api.command', waitForAck = false, waitForState = false } = options;
+  const commandId = createCommandId();
 
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
     metrics.commandsFailed += 1;
+    state.lastCommand = cmd;
+    state.lastCommandId = commandId;
+    state.lastCommandStatus = COMMAND_STATUS.FAILED;
+    state.lastCommandAt = Date.now();
     return { ok: false, status: decision.status, error: decision.error };
   }
 
-  const result = await bridge.sendCommand(cmd, { waitForAck });
+  state.lastCommand = cmd;
+  state.lastCommandId = commandId;
+  state.lastCommandStatus = COMMAND_STATUS.QUEUED;
+  state.lastCommandAt = Date.now();
+
+  const result = await bridge.sendCommand(cmd, { waitForAck, commandId, commandSource: source });
   if (!result.ok) {
     metrics.commandsFailed += 1;
+    state.lastCommandStatus = COMMAND_STATUS.FAILED;
     return {
       ok: false,
       status: 502,
@@ -1158,8 +1294,11 @@ async function dispatchCommand(cmd, options = {}) {
 
   state.lastCommand = cmd;
   state.lastCommandAt = Date.now();
-  publish(WS_EVENT.COMMAND_RECEIVED, { cmd, at: state.lastCommandAt });
-  db.logEvent(mission.currentId(), EVENT_TYPE.COMMAND_SENT, { cmd, source });
+  state.lastCommandStatus = waitForState
+    ? COMMAND_STATUS.FORWARDED
+    : (waitForAck ? COMMAND_STATUS.ACKNOWLEDGED : COMMAND_STATUS.SENT);
+  publish(WS_EVENT.COMMAND_RECEIVED, { cmd, commandId, status: state.lastCommandStatus, at: state.lastCommandAt });
+  db.logEvent(mission.currentId(), EVENT_TYPE.COMMAND_SENT, { cmd, commandId, status: state.lastCommandStatus, source });
   mission.recordCommand();
 
   if (syncMission) {
@@ -1173,6 +1312,7 @@ async function dispatchCommand(cmd, options = {}) {
     });
     if (!confirmation.ok) {
       metrics.commandsFailed += 1;
+      state.lastCommandStatus = COMMAND_STATUS.TIMED_OUT;
       return {
         ok: false,
         status: 504,
@@ -1180,6 +1320,7 @@ async function dispatchCommand(cmd, options = {}) {
         detail: confirmation,
       };
     }
+    state.lastCommandStatus = COMMAND_STATUS.APPLIED;
   }
 
   scheduleRuntimeStateSave(`dispatch.${cmd}`, { immediate: !DRIVE_COMMANDS.has(cmd) });
@@ -1188,7 +1329,7 @@ async function dispatchCommand(cmd, options = {}) {
 
   metrics.commandsDispatched += 1;
 
-  return { ok: true, status: result.status, body: result.body };
+  return { ok: true, status: result.status, body: result.body, commandId };
 }
 
 function buildSampleWaypointSet() {
@@ -2045,6 +2186,8 @@ function publicState() {
         }
       : null,
     lastPath: state.lastPath,
+    lastCommandId: state.lastCommandId,
+    lastCommandStatus: state.lastCommandStatus,
     mission: mission.publicMission(),
     operator: {
       notes: state.operator.notes,
@@ -2056,9 +2199,10 @@ function publicState() {
 
 app.get(API.HEALTH, (_req, res) => {
   const bridgeStatus = bridge.getStatus();
-  const dbOk = db.ping();
+  const connection = buildConnectionState();
+  const dbOk = connection.backend.dbOk;
   const missionState = currentMissionState();
-  const telemetryStaleWhileRunning = missionState === MISSION_STATE.RUNNING && isTelemetryStale();
+  const telemetryStaleWhileRunning = missionState === MISSION_STATE.RUNNING && connection.robot.telemetryStale;
 
   const checks = {
     db: dbOk,
@@ -2086,13 +2230,14 @@ app.get(API.HEALTH, (_req, res) => {
       geofenceFailsafeAction: resolveGeofenceFailsafeAction(),
     },
     missionState,
-    telemetryStale: isTelemetryStale(),
+    telemetryStale: connection.robot.telemetryStale,
     lora: {
       degraded: bridgeStatus.degraded,
       consecutiveFailures: bridgeStatus.consecutiveFailures,
       lastSuccessAt: bridgeStatus.lastSuccessAt,
       lastErrorAt: bridgeStatus.lastErrorAt,
     },
+    connectivity: connection,
     persistence: {
       source: state.persistence.source,
       restoredAt: state.persistence.restoredAt,
@@ -2131,12 +2276,16 @@ app.get(API.SUPERVISION_SUMMARY, requireAppOrBoard, (_req, res) => {
 });
 
 app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
+  const connection = buildConnectionState();
   res.json({
     battery: 85,
     state: state.robot?.state ?? ROBOT_STATE.IDLE,
     mode: 'SERVER',
     last_cmd: state.lastCommand,
+    last_cmd_id: state.lastCommandId,
+    last_cmd_status: state.lastCommandStatus,
     last_fault: state.lastFault ?? null,
+    connectivity: connection.overall,
     robot: state.robot
       ? {
           lat: state.robot.lat,
@@ -2564,9 +2713,12 @@ app.get(API.BRIDGE_SYNC, requireAppOrBoard, async (_req, res) => {
     coverage,
     robot: state.robot,
     lastCommand: state.lastCommand,
+    lastCommandId: state.lastCommandId,
+    lastCommandStatus: state.lastCommandStatus,
     lastCommandAt: state.lastCommandAt,
     lastFault: state.lastFault,
     telemetryStale: isTelemetryStale(),
+    connectivity: buildConnectionState(),
     persistence: state.persistence,
   });
 });
@@ -2584,6 +2736,7 @@ app.get(API.TEST_MENU, requireAppOrBoard, async (_req, res) => {
     robot: state.robot,
     safety: state.safety,
     persistence: state.persistence,
+    connectivity: buildConnectionState(),
     allowedActions: buildAllowedActions(),
     alerts: buildAlerts(),
   });

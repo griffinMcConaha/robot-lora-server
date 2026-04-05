@@ -95,7 +95,7 @@ let _baseStationSnapshot = {
  * Returns { ok: boolean, status: number|null, body: string, error: string|null }.
  * Never throws.
  */
-async function _post(path, body) {
+async function _post(path, body, extraHeaders = {}) {
   return new Promise((resolve) => {
     const bodyBuf = Buffer.from(body, 'utf8');
     const urlStr  = `${BASE_STATION_URL}${path}`;
@@ -117,6 +117,7 @@ async function _post(path, body) {
       headers:  {
         'Content-Type':   'text/plain',
         'Content-Length': bodyBuf.length,
+        ...extraHeaders,
       },
     };
 
@@ -373,9 +374,9 @@ const QUEUE_FULL_RETRY_MS  = 250;
  * @param {string} body
  * @returns {Promise<{ ok, status, body, error }>}
  */
-async function _postWithRetry(path, body) {
+async function _postWithRetry(path, body, extraHeaders = {}) {
   for (let attempt = 0; attempt <= QUEUE_FULL_RETRY_MAX; attempt++) {
-    const r = await _post(path, body);
+    const r = await _post(path, body, extraHeaders);
     if (r.ok) return r;
     const isQueueFull = r.status === 503 && r.body === 'queue_full';
     const isTransient =
@@ -424,10 +425,17 @@ async function sendCommand(cmd, options = {}) {
     return { ok: false, status: null, body: '', error: 'cmd must be a non-empty string' };
   }
   const cmdStr = cmd.trim().toUpperCase();
-  const { waitForAck = false } = options;
+  const { waitForAck = false, commandId = null, commandSource = null } = options;
   const expectedAck = waitForAck ? _expectedAckForCommand(cmdStr) : null;
   const baseline = expectedAck ? await _readLastLoRa() : null;
-  const result = await _postWithRetry('/command', cmdStr);
+  const headers = {};
+  if (typeof commandId === 'string' && commandId.trim()) {
+    headers['x-command-id'] = commandId.trim();
+  }
+  if (typeof commandSource === 'string' && commandSource.trim()) {
+    headers['x-command-source'] = commandSource.trim();
+  }
+  const result = await _postWithRetry('/command', cmdStr, headers);
 
   _lastCmd      = cmdStr;
   _lastCmdAt    = new Date().toISOString();

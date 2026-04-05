@@ -29,6 +29,31 @@ const ROBOT_STATE = Object.freeze({
 });
 
 // ---------------------------------------------------------------------------
+// 1b. CONNECTION + COMMAND STATUS  (shared operational vocabulary)
+// ---------------------------------------------------------------------------
+/** @readonly */
+const CONNECTION_STATE = Object.freeze({
+  OFFLINE:    'offline',
+  CONNECTING: 'connecting',
+  ONLINE:     'online',
+  DEGRADED:   'degraded',
+  STALE:      'stale',
+  FAULTED:    'faulted',
+  READY:      'ready',
+});
+
+/** @readonly */
+const COMMAND_STATUS = Object.freeze({
+  QUEUED:        'queued',
+  SENT:          'sent',
+  FORWARDED:     'forwarded',
+  ACKNOWLEDGED:  'acknowledged',
+  APPLIED:       'applied',
+  FAILED:        'failed',
+  TIMED_OUT:     'timed_out',
+});
+
+// ---------------------------------------------------------------------------
 // 2. COMMANDS  (app/server → base station → LoRa → gateway → STM32)
 //
 //    Wire format over LoRa:  CMD:<TOKEN>[,SALT:<pct>,BRINE:<pct>]
@@ -382,6 +407,8 @@ const SEQ = Object.freeze({
 // ---------------------------------------------------------------------------
 module.exports = {
   ROBOT_STATE,
+  CONNECTION_STATE,
+  COMMAND_STATUS,
   CMD,
   CMD_ALIASES,
   FAULT_CODE,
