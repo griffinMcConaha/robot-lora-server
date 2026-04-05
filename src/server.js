@@ -2619,6 +2619,17 @@ app.get(API.STATE, requireAppOrBoard, (_req, res) => {
   res.json({ ok: true, state: publicState() });
 });
 
+app.get(API.COMMAND_HISTORY, requireAppOrBoard, (_req, res) => {
+  const connection = buildConnectionState();
+  res.json({
+    ok: true,
+    commands: state.commandHistory,
+    lastCommandId: state.lastCommandId,
+    lastCommandStatus: state.lastCommandStatus,
+    connectivity: connection.commandPath,
+  });
+});
+
 app.get(API.COVERAGE, requireAppOrBoard, (_req, res) => {
   if (!state.coverage) {
     return res.status(400).json({ ok: false, error: 'input area is not initialized' });

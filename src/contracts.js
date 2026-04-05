@@ -280,6 +280,7 @@ const API = Object.freeze({
   INPUT_AREA:       '/api/input-area',        // POST
   TELEMETRY:        '/api/telemetry',         // POST
   STATE:            '/api/state',             // GET
+  COMMAND_HISTORY:  '/api/commands/recent',   // GET
   COVERAGE:         '/api/coverage',          // GET
   PATH_PLAN:        '/api/path/plan',         // POST
   // Mission lifecycle (Phase B)
