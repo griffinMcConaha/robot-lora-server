@@ -77,9 +77,14 @@ let _baseStationSnapshot = {
   statusOk: false,
   statusCode: null,
   statusError: null,
+  statusVersion: null,
   state: null,
   mode: null,
+  wifiLinkState: null,
+  loraLinkState: null,
   queueDepth: null,
+  lastCmdId: null,
+  lastCmdStatus: null,
   ackCount: null,
   lastAck: null,
   lastLoRa: null,
@@ -207,9 +212,14 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
     statusOk: Boolean(meta.ok ?? true),
     statusCode: meta.status ?? null,
     statusError: meta.error ?? null,
+    statusVersion: Number.isFinite(Number(payload.status_version)) ? Number(payload.status_version) : _baseStationSnapshot.statusVersion,
     state: typeof payload.state === 'string' ? payload.state : _baseStationSnapshot.state,
     mode: typeof payload.mode === 'string' ? payload.mode : _baseStationSnapshot.mode,
+    wifiLinkState: typeof payload.wifi_link_state === 'string' ? payload.wifi_link_state : _baseStationSnapshot.wifiLinkState,
+    loraLinkState: typeof payload.lora_link_state === 'string' ? payload.lora_link_state : _baseStationSnapshot.loraLinkState,
     queueDepth: Number.isFinite(Number(payload.queue_depth)) ? Number(payload.queue_depth) : _baseStationSnapshot.queueDepth,
+    lastCmdId: typeof payload.last_cmd_id === 'string' ? payload.last_cmd_id.trim() : _baseStationSnapshot.lastCmdId,
+    lastCmdStatus: typeof payload.last_cmd_status === 'string' ? payload.last_cmd_status.trim() : _baseStationSnapshot.lastCmdStatus,
     ackCount: Number.isFinite(Number(payload.ack_count)) ? Number(payload.ack_count) : _baseStationSnapshot.ackCount,
     lastAck: typeof payload.last_ack === 'string' ? payload.last_ack.trim() : _baseStationSnapshot.lastAck,
     lastLoRa: typeof payload.last_lora === 'string' ? payload.last_lora.trim() : _baseStationSnapshot.lastLoRa,
@@ -319,13 +329,30 @@ async function _readLastLoRa() {
 }
 
 async function _waitForAck(expectedAck, options = {}) {
-  const { baselineRaw = null, wrappedOnly = true, timeoutMs = ACK_WAIT_TIMEOUT_MS } = options;
+  const { baselineRaw = null, wrappedOnly = true, timeoutMs = ACK_WAIT_TIMEOUT_MS, commandId = null } = options;
   const startedAt = Date.now();
   let lastSeenRaw = baselineRaw;
   let lastSeenAck = null;
+  let lastSeenCommandStatus = null;
 
   while ((Date.now() - startedAt) < timeoutMs) {
     const statusSnapshot = await _readBaseStatus();
+    if (statusSnapshot.ok) {
+      const snapshot = statusSnapshot.snapshot ?? {};
+      lastSeenCommandStatus = snapshot.lastCmdStatus ?? lastSeenCommandStatus;
+      if (
+        commandId &&
+        snapshot.lastCmdId === commandId &&
+        snapshot.lastCmdStatus === 'acknowledged'
+      ) {
+        return {
+          ok: true,
+          ack: expectedAck,
+          raw: snapshot.lastAck ?? snapshot.lastLoRa ?? null,
+          source: 'status.command',
+        };
+      }
+    }
     if (statusSnapshot.ok && typeof statusSnapshot.snapshot?.lastAck === 'string' && statusSnapshot.snapshot.lastAck) {
       const frame = _unwrapAckFrame(statusSnapshot.snapshot.lastAck);
       if (frame?.ack) {
@@ -356,6 +383,7 @@ async function _waitForAck(expectedAck, options = {}) {
     error: `Timed out waiting for ${expectedAck}`,
     lastSeenRaw,
     lastSeenAck,
+    lastSeenCommandStatus,
   };
 }
 
@@ -450,6 +478,7 @@ async function sendCommand(cmd, options = {}) {
     const ack = await _waitForAck(expectedAck, {
       baselineRaw: baseline?.ok ? baseline.frame?.raw ?? null : null,
       wrappedOnly: true,
+      commandId: typeof commandId === 'string' && commandId.trim() ? commandId.trim() : null,
     });
     if (!ack.ok) {
       _lastCmdError = ack.error;
@@ -594,9 +623,14 @@ function getStatus() {
       statusOk: _baseStationSnapshot.statusOk,
       statusCode: _baseStationSnapshot.statusCode,
       statusError: _baseStationSnapshot.statusError,
+      statusVersion: _baseStationSnapshot.statusVersion,
       state: _baseStationSnapshot.state,
       mode: _baseStationSnapshot.mode,
+      wifiLinkState: _baseStationSnapshot.wifiLinkState,
+      loraLinkState: _baseStationSnapshot.loraLinkState,
       queueDepth: _baseStationSnapshot.queueDepth,
+      lastCmdId: _baseStationSnapshot.lastCmdId,
+      lastCmdStatus: _baseStationSnapshot.lastCmdStatus,
       ackCount: _baseStationSnapshot.ackCount,
       lastAck: _baseStationSnapshot.lastAck,
       lastLoRa: _baseStationSnapshot.lastLoRa,
