@@ -402,6 +402,40 @@ function trimCommandHistory() {
   }
 }
 
+function buildCommandTransportStatus(commandId, status, bridgeStatus = bridge.getStatus()) {
+  const safeStatus = status ?? null;
+  const bridgeCommandId = bridgeStatus.baseStation?.lastCmdId ?? null;
+  const bridgeCommandStatus = bridgeStatus.baseStation?.lastCmdStatus ?? null;
+  const seenByBaseStation = Boolean(commandId && bridgeCommandId === commandId);
+  const ackedByLoRa = safeStatus === COMMAND_STATUS.ACKNOWLEDGED
+    || safeStatus === COMMAND_STATUS.APPLIED
+    || (seenByBaseStation && bridgeCommandStatus === COMMAND_STATUS.ACKNOWLEDGED);
+  const appliedByRobot = safeStatus === COMMAND_STATUS.APPLIED;
+
+  let stage = 'backend_queued';
+  if (safeStatus === COMMAND_STATUS.FAILED) {
+    stage = 'failed';
+  } else if (safeStatus === COMMAND_STATUS.TIMED_OUT) {
+    stage = 'timed_out';
+  } else if (appliedByRobot) {
+    stage = 'robot_applied';
+  } else if (ackedByLoRa) {
+    stage = 'lora_acknowledged';
+  } else if (safeStatus === COMMAND_STATUS.FORWARDED || safeStatus === COMMAND_STATUS.SENT || seenByBaseStation) {
+    stage = 'base_station_forwarded';
+  }
+
+  return {
+    stage,
+    backendStatus: safeStatus,
+    baseStationSeen: seenByBaseStation,
+    baseStationCommandId: bridgeCommandId,
+    baseStationCommandStatus: bridgeCommandStatus,
+    loRaAcked: ackedByLoRa,
+    robotApplied: appliedByRobot,
+  };
+}
+
 function upsertCommandHistory(entry) {
   if (!entry?.commandId) return;
   if (!Array.isArray(state.commandHistory)) {
@@ -426,6 +460,7 @@ function updateCommandTracking(commandId, patch = {}) {
   if (!commandId) return;
   const timestamp = Date.now();
   const status = patch.status ?? state.lastCommandStatus ?? null;
+  const bridgeStatus = patch.bridgeStatus ?? bridge.getStatus();
   state.lastCommand = patch.cmd ?? state.lastCommand;
   state.lastCommandId = commandId;
   state.lastCommandStatus = status;
@@ -438,6 +473,7 @@ function updateCommandTracking(commandId, patch = {}) {
     status,
     error: patch.error ?? null,
     bridgeAckSource: patch.bridgeAckSource ?? null,
+    transport: buildCommandTransportStatus(commandId, status, bridgeStatus),
     detail: patch.detail ?? null,
     at: patch.at ?? timestamp,
   });
@@ -449,6 +485,7 @@ function updateCommandTracking(commandId, patch = {}) {
     at: state.lastCommandAt,
     error: patch.error ?? null,
     bridgeAckSource: patch.bridgeAckSource ?? null,
+    transport: buildCommandTransportStatus(commandId, status, bridgeStatus),
   });
 }
 
@@ -817,6 +854,9 @@ function buildConnectionState(now = Date.now()) {
     lastCommandStatus: state.lastCommandStatus,
     bridgeLastCommandId: bridgeStatus.baseStation?.lastCmdId ?? null,
     bridgeLastCommandStatus: bridgeStatus.baseStation?.lastCmdStatus ?? null,
+    lastTransport: state.lastCommandId
+      ? buildCommandTransportStatus(state.lastCommandId, state.lastCommandStatus, bridgeStatus)
+      : null,
     lastCmdAt: bridgeStatus.lastCmdAt ?? (state.lastCommandAt || null),
     lastCmdError: bridgeStatus.lastCmdError ?? null,
     missionState,
