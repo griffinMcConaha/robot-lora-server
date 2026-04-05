@@ -899,6 +899,10 @@
       <div id="testMonitor" class="test-monitor"></div>
       <div id="controllerAlerts" class="controller-notes"></div>
       <div class="history-head">
+        <div class="card-title" style="margin-bottom: 0;">Recent Commands</div>
+      </div>
+      <div id="commandHistory" class="history-list">No commands yet.</div>
+      <div class="history-head">
         <div class="card-title" style="margin-bottom: 0;">Recent Test Runs</div>
         <button class="test-run-button" style="padding: 8px 12px;" onclick="repeatLastTest()">Repeat Last Test</button>
       </div>
@@ -993,6 +997,7 @@
         updateRobotDisplay(state.robot || null);
         updateCoverageDisplay(state.coverage?.stats || null);
         updateControllerStatus();
+        renderCommandHistory();
         document.getElementById('trailPoints').textContent = String(state.trail?.length || 0);
         addLogEntry('Snapshot', 'Initial state loaded', 'event');
         return;
@@ -1020,7 +1025,8 @@
       } else if (event === 'command.received') {
         document.getElementById('lastCommand').textContent = payload?.cmd || '—';
         document.getElementById('lastCommandTime').textContent = payload?.at ? new Date(payload.at).toLocaleTimeString() : '—';
-        addLogEntry('Command', `Sent ${payload?.cmd || 'unknown'}`, 'event');
+        renderCommandHistory();
+        addLogEntry('Command', `${payload?.cmd || 'unknown'} ${payload?.transport?.stage || payload?.status || 'updated'}`, 'event');
       } else if (event === 'fault.received') {
         addLogEntry('Fault', `${payload?.fault || 'UNKNOWN'} (${payload?.action || 'LOG_ONLY'})`, 'warning');
       }
@@ -1097,10 +1103,45 @@
         renderTestMenu();
         renderTestMonitor();
         renderMissionActions();
+        renderCommandHistory();
         updateControllerStatus();
       } catch (error) {
         document.getElementById('testMenu').innerHTML = `<div style="color:#ef4444; padding: 12px;">${error.message}</div>`;
       }
+    }
+
+    function renderCommandHistory() {
+      const container = document.getElementById('commandHistory');
+      const entries = Array.isArray(latestTestSnapshot?.commandHistory)
+        ? latestTestSnapshot.commandHistory
+        : (Array.isArray(state?.commandHistory) ? state.commandHistory : []);
+
+      if (!Array.isArray(entries) || entries.length === 0) {
+        container.textContent = 'No commands yet.';
+        return;
+      }
+
+      container.innerHTML = entries.slice(0, 8).map((entry) => {
+        const at = entry?.updatedAt || entry?.at;
+        const time = at ? new Date(at).toLocaleTimeString() : '—';
+        const title = [entry?.cmd || 'Unknown', entry?.commandId || ''].filter(Boolean).join(' · ');
+        const stage = entry?.transport?.stage || entry?.status || 'unknown';
+        const detail = [
+          entry?.status ? `status ${entry.status}` : null,
+          entry?.transport?.baseStationCommandStatus ? `base ${entry.transport.baseStationCommandStatus}` : null,
+          entry?.error ? `error ${entry.error}` : null,
+        ].filter(Boolean).join(' · ');
+        return `
+          <div class="history-item">
+            <span class="history-time">${time}</span>
+            <span>
+              <strong>${title}</strong><br />
+              <span style="color:#94a3b8;">${stage}${detail ? ` · ${detail}` : ''}</span>
+            </span>
+            <span class="shortcut-chip">${stage}</span>
+          </div>
+        `;
+      }).join('');
     }
 
     function renderTestMenu() {
