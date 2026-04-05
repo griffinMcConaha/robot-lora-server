@@ -412,6 +412,7 @@ function buildCommandTransportStatus(commandId, status, bridgeStatus = bridge.ge
     || safeStatus === COMMAND_STATUS.APPLIED
     || (seenByBaseStation && bridgeCommandStatus === COMMAND_STATUS.ACKNOWLEDGED);
   const appliedByRobot = safeStatus === COMMAND_STATUS.APPLIED;
+  const parsedAck = bridgeStatus.baseStation?.lastAckParsed ?? null;
 
   let stage = COMMAND_TRANSPORT_STAGE.BACKEND_QUEUED;
   if (safeStatus === COMMAND_STATUS.FAILED) {
@@ -432,6 +433,11 @@ function buildCommandTransportStatus(commandId, status, bridgeStatus = bridge.ge
     baseStationSeen: seenByBaseStation,
     baseStationCommandId: bridgeCommandId,
     baseStationCommandStatus: bridgeCommandStatus,
+    ackCategory: parsedAck?.category ?? null,
+    ackSource: parsedAck?.source ?? null,
+    robotAckState: parsedAck?.robotState ?? null,
+    waypointIndex: parsedAck?.waypointIndex ?? null,
+    waypointCount: parsedAck?.waypointCount ?? null,
     loRaAcked: ackedByLoRa,
     robotApplied: appliedByRobot,
   };
@@ -814,6 +820,7 @@ function buildConnectionState(now = Date.now()) {
     lastCmdStatus: bridgeStatus.baseStation?.lastCmdStatus ?? null,
     ackCount: bridgeStatus.baseStation?.ackCount ?? null,
     lastAck: bridgeStatus.baseStation?.lastAck ?? null,
+    lastAckParsed: bridgeStatus.baseStation?.lastAckParsed ?? null,
     lastLoRa: bridgeStatus.baseStation?.lastLoRa ?? null,
     lastSuccessAt: bridgeStatus.lastSuccessAt ?? null,
     lastErrorAt: bridgeStatus.lastErrorAt ?? null,

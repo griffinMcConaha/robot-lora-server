@@ -91,6 +91,14 @@ Current safe interpretation across the downstream path is:
 - Robot ACKs like `ACK:STATE:*`, `ACK:WPCLEAR`, `ACK:WP:<idx>`, and `ACK:WPLOAD:<n>` confirm robot-side receipt.
 - Robot telemetry state confirmation is the evidence for `applied`.
 
+Normalized ACK categories exposed by the backend should be:
+
+- `gateway_frame`
+- `robot_state`
+- `waypoint_clear`
+- `waypoint_add`
+- `waypoint_load`
+
 Because STM32 waypoint parsing is strict, inline command metadata should not be added to `WP:` or `WPLOAD:` payloads unless the robot firmware is updated first.
 
 ## Backend Connection Model

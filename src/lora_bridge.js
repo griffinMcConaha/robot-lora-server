@@ -87,6 +87,7 @@ let _baseStationSnapshot = {
   lastCmdStatus: null,
   ackCount: null,
   lastAck: null,
+  lastAckParsed: null,
   lastLoRa: null,
   refreshedAt: null,
 };
@@ -222,6 +223,7 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
     lastCmdStatus: typeof payload.last_cmd_status === 'string' ? payload.last_cmd_status.trim() : _baseStationSnapshot.lastCmdStatus,
     ackCount: Number.isFinite(Number(payload.ack_count)) ? Number(payload.ack_count) : _baseStationSnapshot.ackCount,
     lastAck: typeof payload.last_ack === 'string' ? payload.last_ack.trim() : _baseStationSnapshot.lastAck,
+    lastAckParsed: typeof payload.last_ack === 'string' ? _parseAckDetails(payload.last_ack.trim()) : _baseStationSnapshot.lastAckParsed,
     lastLoRa: typeof payload.last_lora === 'string' ? payload.last_lora.trim() : _baseStationSnapshot.lastLoRa,
     refreshedAt: new Date().toISOString(),
   };
@@ -295,6 +297,65 @@ function _unwrapAckFrame(text) {
     payload: raw,
     ack: raw.startsWith('ACK:') ? raw : null,
   };
+}
+
+function _parseAckDetails(text) {
+  const frame = _unwrapAckFrame(text);
+  if (!frame?.ack) return null;
+
+  const ack = frame.ack;
+  const details = {
+    raw: frame.raw,
+    wrapped: frame.wrapped,
+    ack,
+    category: 'unknown',
+    source: 'unknown',
+    command: null,
+    waypointIndex: null,
+    waypointCount: null,
+    robotState: null,
+  };
+
+  if (ack.startsWith('ACK:S:')) {
+    details.category = 'gateway_frame';
+    details.source = 'gateway';
+    return details;
+  }
+
+  if (ack.startsWith('ACK:STATE:')) {
+    details.category = 'robot_state';
+    details.source = 'robot';
+    details.robotState = ack.slice('ACK:STATE:'.length) || null;
+    details.command = details.robotState;
+    return details;
+  }
+
+  if (ack === LORA_WIRE.WP_ACK_CLEAR) {
+    details.category = 'waypoint_clear';
+    details.source = 'robot';
+    details.command = LORA_WIRE.WP_CLEAR;
+    return details;
+  }
+
+  if (ack.startsWith(`${LORA_WIRE.WP_ACK_ADD}:`)) {
+    details.category = 'waypoint_add';
+    details.source = 'robot';
+    details.command = LORA_WIRE.WP_ADD;
+    const idx = Number(ack.slice(`${LORA_WIRE.WP_ACK_ADD}:`.length));
+    details.waypointIndex = Number.isFinite(idx) ? idx : null;
+    return details;
+  }
+
+  if (ack.startsWith(`${LORA_WIRE.WP_ACK_LOAD}:`)) {
+    details.category = 'waypoint_load';
+    details.source = 'robot';
+    details.command = LORA_WIRE.WP_LOAD;
+    const count = Number(ack.slice(`${LORA_WIRE.WP_ACK_LOAD}:`.length));
+    details.waypointCount = Number.isFinite(count) ? count : null;
+    return details;
+  }
+
+  return details;
 }
 
 function _expectedAckForCommand(cmd) {
@@ -633,6 +694,7 @@ function getStatus() {
       lastCmdStatus: _baseStationSnapshot.lastCmdStatus,
       ackCount: _baseStationSnapshot.ackCount,
       lastAck: _baseStationSnapshot.lastAck,
+      lastAckParsed: _baseStationSnapshot.lastAckParsed,
       lastLoRa: _baseStationSnapshot.lastLoRa,
       refreshedAt: _baseStationSnapshot.refreshedAt,
     },
@@ -722,4 +784,4 @@ function _wpFail(sent, error) {
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
-module.exports = { sendCommand, pushWaypoints, resetWpState, getStatus, refreshStatus, observeCommand, restoreStatus };
+module.exports = { sendCommand, pushWaypoints, resetWpState, getStatus, refreshStatus, observeCommand, restoreStatus, parseAckDetails: _parseAckDetails };
