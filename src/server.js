@@ -27,6 +27,7 @@ const {
   ROBOT_STATE,
   CONNECTION_STATE,
   COMMAND_STATUS,
+  COMMAND_TRANSPORT_STAGE,
   CMD,
   CMD_ALIASES,
   FAULT_CODE,
@@ -412,17 +413,17 @@ function buildCommandTransportStatus(commandId, status, bridgeStatus = bridge.ge
     || (seenByBaseStation && bridgeCommandStatus === COMMAND_STATUS.ACKNOWLEDGED);
   const appliedByRobot = safeStatus === COMMAND_STATUS.APPLIED;
 
-  let stage = 'backend_queued';
+  let stage = COMMAND_TRANSPORT_STAGE.BACKEND_QUEUED;
   if (safeStatus === COMMAND_STATUS.FAILED) {
-    stage = 'failed';
+    stage = COMMAND_TRANSPORT_STAGE.FAILED;
   } else if (safeStatus === COMMAND_STATUS.TIMED_OUT) {
-    stage = 'timed_out';
+    stage = COMMAND_TRANSPORT_STAGE.TIMED_OUT;
   } else if (appliedByRobot) {
-    stage = 'robot_applied';
+    stage = COMMAND_TRANSPORT_STAGE.ROBOT_APPLIED;
   } else if (ackedByLoRa) {
-    stage = 'lora_acknowledged';
+    stage = COMMAND_TRANSPORT_STAGE.LORA_ACKNOWLEDGED;
   } else if (safeStatus === COMMAND_STATUS.FORWARDED || safeStatus === COMMAND_STATUS.SENT || seenByBaseStation) {
-    stage = 'base_station_forwarded';
+    stage = COMMAND_TRANSPORT_STAGE.BASE_STATION_FORWARDED;
   }
 
   return {

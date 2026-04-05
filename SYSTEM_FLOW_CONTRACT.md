@@ -43,6 +43,19 @@ Commands should move through these states as evidence is gained:
 - `failed`
 - `timed_out`
 
+## Command Transport Stages
+
+For the customer-facing transport story, normalize recent commands into these exact stages:
+
+- `backend_queued`
+- `base_station_forwarded`
+- `lora_acknowledged`
+- `robot_applied`
+- `failed`
+- `timed_out`
+
+These are derived from the underlying command lifecycle plus bridge/base-station evidence.
+
 ## Command Metadata
 
 Whenever possible, preserve these fields:
@@ -69,6 +82,16 @@ Structured status should expose:
 - `ack_count`
 - `last_ack`
 - `last_lora`
+
+## Gateway And Robot ACK Notes
+
+Current safe interpretation across the downstream path is:
+
+- Gateway ACKs confirm LoRa frame receipt/forwarding, not robot execution.
+- Robot ACKs like `ACK:STATE:*`, `ACK:WPCLEAR`, `ACK:WP:<idx>`, and `ACK:WPLOAD:<n>` confirm robot-side receipt.
+- Robot telemetry state confirmation is the evidence for `applied`.
+
+Because STM32 waypoint parsing is strict, inline command metadata should not be added to `WP:` or `WPLOAD:` payloads unless the robot firmware is updated first.
 
 ## Backend Connection Model
 

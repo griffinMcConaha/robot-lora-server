@@ -53,6 +53,16 @@ const COMMAND_STATUS = Object.freeze({
   TIMED_OUT:     'timed_out',
 });
 
+/** @readonly */
+const COMMAND_TRANSPORT_STAGE = Object.freeze({
+  BACKEND_QUEUED:          'backend_queued',
+  BASE_STATION_FORWARDED:  'base_station_forwarded',
+  LORA_ACKNOWLEDGED:       'lora_acknowledged',
+  ROBOT_APPLIED:           'robot_applied',
+  FAILED:                  'failed',
+  TIMED_OUT:               'timed_out',
+});
+
 // ---------------------------------------------------------------------------
 // 2. COMMANDS  (app/server → base station → LoRa → gateway → STM32)
 //
@@ -409,6 +419,7 @@ module.exports = {
   ROBOT_STATE,
   CONNECTION_STATE,
   COMMAND_STATUS,
+  COMMAND_TRANSPORT_STAGE,
   CMD,
   CMD_ALIASES,
   FAULT_CODE,
