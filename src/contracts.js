@@ -263,6 +263,8 @@ const API = Object.freeze({
   LORA_PUSH_WP:     '/api/lora/push-waypoints', // POST
   LORA_STATUS:      '/api/lora/status',          // GET
   BRIDGE_SYNC:      '/api/bridge/sync',          // GET
+  TEST_MENU:        '/api/test-menu',            // GET
+  TEST_RUN:         '/api/test-menu/run',        // POST
 });
 
 // ---------------------------------------------------------------------------

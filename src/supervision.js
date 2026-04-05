@@ -17,7 +17,7 @@ function isTelemetryStale(robot, staleThresholdMs, now = Date.now()) {
   return ageMs == null ? true : ageMs > staleThresholdMs;
 }
 
-function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, zeroDispersionPath }) {
+function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, zeroDispersionPath, gpsReady, gpsReason }) {
   return [
     { id: 'input-area', enabled: true, reason: null },
     { id: 'path-plan', enabled: hasCoverage, reason: hasCoverage ? null : 'Area is not configured' },
@@ -32,15 +32,25 @@ function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, 
     },
     {
       id: 'mission-start',
-      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || hasPath) && !zeroDispersionPath,
+      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || hasPath) && !zeroDispersionPath && gpsReady,
       reason: missionState !== MISSION_STATE.CONFIGURING
         ? 'Mission must be CONFIGURING'
+        : !gpsReady
+          ? (gpsReason ?? 'Robot GPS readiness is required before mission start')
         : zeroDispersionPath
           ? 'Zero-dispersion path cannot be started'
           : null,
     },
     { id: 'mission-pause', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
-    { id: 'mission-resume', enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed', reason: missionState === MISSION_STATE.PAUSED ? null : 'Mission is not PAUSED' },
+    {
+      id: 'mission-resume',
+      enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed' && gpsReady,
+      reason: missionState !== MISSION_STATE.PAUSED
+        ? 'Mission is not PAUSED'
+        : !gpsReady
+          ? (gpsReason ?? 'Robot GPS readiness is required before mission resume')
+          : null,
+    },
     { id: 'mission-abort', enabled: [MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(missionState), reason: null },
     { id: 'mission-complete', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
     { id: 'command-manual', enabled: true, reason: null },
@@ -58,6 +68,8 @@ function buildAlerts({
   hasCoverage,
   hasPath,
   zeroDispersionPath,
+  gpsReady,
+  gpsReason,
   telemetryStale,
   telemetryAge,
   lastFault,
@@ -80,6 +92,21 @@ function buildAlerts({
       level: 'warning',
       code: 'ZERO_DISPERSION_PATH',
       message: 'Current path uses 0% salt and 0% brine. Update dispersion before waypoint push or mission start.',
+    });
+  }
+  if (!gpsReady) {
+    alerts.push({
+      level: 'warning',
+      code: 'GPS_FIX_REQUIRED',
+      message: gpsReason ?? 'Robot GPS fix is required before starting or resuming autonomy.',
+    });
+  }
+  if (safety?.gpsFailsafeAt) {
+    alerts.push({
+      level: 'critical',
+      code: 'GPS_FAILSAFE_TRIGGERED',
+      message: `GPS fail-safe triggered ${safety.gpsFailsafeAction ?? 'UNKNOWN'} at ${new Date(safety.gpsFailsafeAt).toISOString()}.`,
+      at: safety.gpsFailsafeAt,
     });
   }
   if (missionState === MISSION_STATE.RUNNING && telemetryStale) {

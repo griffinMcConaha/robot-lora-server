@@ -68,6 +68,13 @@ const COVERAGE_MARK_RADIUS_M = Number(process.env.COVERAGE_MARK_RADIUS_M ?? 0.5)
 const REQUEST_RATE_LIMIT_WINDOW_MS = Number(process.env.REQUEST_RATE_LIMIT_WINDOW_MS ?? 60000);
 const COMMAND_RATE_LIMIT_PER_WINDOW = Number(process.env.COMMAND_RATE_LIMIT_PER_WINDOW ?? 240);
 const TELEMETRY_RATE_LIMIT_PER_WINDOW = Number(process.env.TELEMETRY_RATE_LIMIT_PER_WINDOW ?? 6000);
+const COMMAND_STATE_CONFIRM_TIMEOUT_MS = Number(process.env.COMMAND_STATE_CONFIRM_TIMEOUT_MS ?? 8000);
+const COMMAND_STATE_CONFIRM_POLL_MS = Number(process.env.COMMAND_STATE_CONFIRM_POLL_MS ?? 150);
+const GPS_READY_MIN_SAT = Number(process.env.GPS_READY_MIN_SAT ?? 5);
+const GPS_READY_MAX_HDOP = Number(process.env.GPS_READY_MAX_HDOP ?? 3.0);
+const GPS_FAILSAFE_ENABLED = String(process.env.GPS_FAILSAFE_ENABLED ?? '1') !== '0';
+const GPS_FAILSAFE_ACTION = String(process.env.GPS_FAILSAFE_ACTION ?? CMD.PAUSE).trim().toUpperCase();
+const GPS_FAILSAFE_COOLDOWN_MS = Number(process.env.GPS_FAILSAFE_COOLDOWN_MS ?? 5000);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -116,6 +123,9 @@ const state = {
     telemetryFailsafeAt: 0,
     telemetryFailsafeAction: null,
     telemetryFailsafeReason: null,
+    gpsFailsafeAt: 0,
+    gpsFailsafeAction: null,
+    gpsFailsafeReason: null,
     geofenceFailsafeAt: 0,
     geofenceFailsafeAction: null,
     geofenceFailsafeReason: null,
@@ -185,6 +195,40 @@ function getCoveragePct(stats) {
 
 function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveGpsFailsafeAction() {
+  if (GPS_FAILSAFE_ACTION === CMD.ESTOP) return CMD.ESTOP;
+  return CMD.PAUSE;
+}
+
+function getRobotGpsStatus(robot = state.robot) {
+  if (!robot) {
+    return { ready: false, reason: 'Robot telemetry is unavailable' };
+  }
+  if (!robot.gpsFix) {
+    return { ready: false, reason: 'Robot GPS fix is not available' };
+  }
+  if (Number.isFinite(GPS_READY_MIN_SAT) && GPS_READY_MIN_SAT > 0 && Number(robot.gpsSat ?? 0) < GPS_READY_MIN_SAT) {
+    return {
+      ready: false,
+      reason: `Robot GPS satellites ${Number(robot.gpsSat ?? 0)} below minimum ${GPS_READY_MIN_SAT}`,
+    };
+  }
+  if (Number.isFinite(GPS_READY_MAX_HDOP) && GPS_READY_MAX_HDOP > 0) {
+    const hdop = Number(robot.gpsHdop ?? 0);
+    if (!Number.isFinite(hdop) || hdop <= 0 || hdop > GPS_READY_MAX_HDOP) {
+      return {
+        ready: false,
+        reason: `Robot GPS HDOP ${Number.isFinite(hdop) ? hdop.toFixed(1) : 'unknown'} exceeds maximum ${GPS_READY_MAX_HDOP}`,
+      };
+    }
+  }
+  return { ready: true, reason: null };
 }
 
 function resolveTelemetryFailsafeAction() {
@@ -394,22 +438,28 @@ function addOperatorNote({ text, category = 'general', actor = 'operator' }) {
 }
 
 function buildAllowedActions() {
+  const gpsStatus = getRobotGpsStatus();
   return buildSupervisionAllowedActions({
     missionState: currentMissionState(),
     wpPushState: bridge.getStatus().wpPushState,
     hasCoverage: Boolean(state.coverage),
     hasPath: state.lastPath.length > 0,
     zeroDispersionPath: pathHasZeroDispersion(),
+    gpsReady: gpsStatus.ready,
+    gpsReason: gpsStatus.reason,
   });
 }
 
 function buildAlerts(now = Date.now()) {
+  const gpsStatus = getRobotGpsStatus();
   return buildSupervisionAlerts({
     missionState: currentMissionState(),
     wpPushState: bridge.getStatus().wpPushState,
     hasCoverage: Boolean(state.coverage),
     hasPath: state.lastPath.length > 0,
     zeroDispersionPath: pathHasZeroDispersion(),
+    gpsReady: gpsStatus.ready,
+    gpsReason: gpsStatus.reason,
     telemetryStale: isTelemetryStale(now),
     telemetryAge: telemetryAgeMs(now),
     lastFault: state.lastFault,
@@ -433,6 +483,7 @@ function buildOperatorWorkflows() {
 function buildSupervisionSummary() {
   const now = Date.now();
   const robotAgeMs = telemetryAgeMs(now);
+  const gpsStatus = getRobotGpsStatus();
   return {
     mission: mission.publicMission(),
     lora: bridge.getStatus(),
@@ -442,6 +493,11 @@ function buildSupervisionSummary() {
           lon: state.robot.lon,
           heading: state.robot.heading,
           speed: state.robot.speed,
+          gpsFix: state.robot.gpsFix,
+          gpsHdop: state.robot.gpsHdop,
+          gpsSat: state.robot.gpsSat,
+          gpsReady: gpsStatus.ready,
+          gpsReason: gpsStatus.reason,
           state: state.robot.state,
           source: state.robot.source,
           timestampMs: state.robot.timestampMs,
@@ -456,6 +512,11 @@ function buildSupervisionSummary() {
       telemetryFailsafeAt: state.safety.telemetryFailsafeAt || null,
       telemetryFailsafeReason: state.safety.telemetryFailsafeReason,
       telemetryFailsafeCooldownMs: TELEMETRY_FAILSAFE_COOLDOWN_MS,
+      gpsFailsafeEnabled: GPS_FAILSAFE_ENABLED,
+      gpsFailsafeAction: resolveGpsFailsafeAction(),
+      gpsFailsafeAt: state.safety.gpsFailsafeAt || null,
+      gpsFailsafeReason: state.safety.gpsFailsafeReason,
+      gpsFailsafeCooldownMs: GPS_FAILSAFE_COOLDOWN_MS,
       geofenceFailsafeEnabled: GEOFENCE_FAILSAFE_ENABLED,
       geofenceFailsafeAction: resolveGeofenceFailsafeAction(),
       geofenceFailsafeAt: state.safety.geofenceFailsafeAt || null,
@@ -633,6 +694,97 @@ async function enforceTelemetryFailsafePolicy() {
   }
 }
 
+async function enforceGpsFailsafePolicy() {
+  if (!GPS_FAILSAFE_ENABLED) return;
+  if (safetyMonitorInFlight) return;
+  if (!mission.isRunning()) return;
+  if (isTelemetryStale()) return;
+
+  const gpsStatus = getRobotGpsStatus();
+  if (gpsStatus.ready) return;
+
+  const now = Date.now();
+  if ((now - (state.safety.gpsFailsafeAt || 0)) < GPS_FAILSAFE_COOLDOWN_MS) {
+    return;
+  }
+
+  const action = resolveGpsFailsafeAction();
+  safetyMonitorInFlight = true;
+
+  try {
+    const dispatched = await dispatchCommand(action, {
+      syncMission: false,
+      source: 'failsafe.gps_degraded',
+      waitForAck: true,
+      waitForState: true,
+    });
+
+    if (!dispatched.ok) {
+      db.logEvent(mission.currentId(), EVENT_TYPE.SAFETY_ACTION, {
+        policy: 'gps_degraded',
+        action,
+        ok: false,
+        error: dispatched.error ?? 'dispatch_failed',
+      });
+      return;
+    }
+
+    const actionAt = Date.now();
+    state.safety.gpsFailsafeAt = actionAt;
+    state.safety.gpsFailsafeAction = action;
+    state.safety.gpsFailsafeReason = gpsStatus.reason;
+    state.lastFault = {
+      fault: FAULT_CODE.GPS_LOSS,
+      action: action === CMD.ESTOP ? FAULT_ACTION.ESTOP : FAULT_ACTION.PAUSE,
+      at: actionAt,
+    };
+
+    if (action === CMD.ESTOP) {
+      if ([MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+        try {
+          mission.abort('failsafe:gps_degraded', buildFinalMissionStats());
+        } catch (_) {
+          // ignore invalid transition if mission already terminal
+        }
+      }
+      bridge.resetWpState();
+    } else if (action === CMD.PAUSE && mission.isRunning()) {
+      try {
+        mission.pause('failsafe:gps_degraded');
+      } catch (_) {
+        // ignore invalid transition if mission already changed
+      }
+    }
+
+    publish(WS_EVENT.FAULT_RECEIVED, {
+      fault: FAULT_CODE.GPS_LOSS,
+      action,
+      at: actionAt,
+      source: 'failsafe',
+      reason: gpsStatus.reason,
+    });
+
+    db.logEvent(mission.currentId(), EVENT_TYPE.SAFETY_ACTION, {
+      policy: 'gps_degraded',
+      action,
+      ok: true,
+      reason: gpsStatus.reason,
+      gps: {
+        fix: state.robot?.gpsFix ?? null,
+        hdop: state.robot?.gpsHdop ?? null,
+        sat: state.robot?.gpsSat ?? null,
+      },
+    });
+
+    metrics.safetyActions += 1;
+
+    publishSupervision();
+    publishOperator();
+  } finally {
+    safetyMonitorInFlight = false;
+  }
+}
+
 function publishSupervision() {
   publish(WS_EVENT.SUPERVISION_UPDATED, buildSupervisionSummary());
 }
@@ -743,8 +895,56 @@ function syncMissionToCommand(cmd) {
   }
 }
 
+function expectedRobotStateForCommand(cmd) {
+  switch (cmd) {
+    case CMD.AUTO:
+      return ROBOT_STATE.AUTO;
+    case CMD.PAUSE:
+      return ROBOT_STATE.PAUSE;
+    case CMD.ESTOP:
+      return ROBOT_STATE.ESTOP;
+    case CMD.MANUAL:
+      return ROBOT_STATE.MANUAL;
+    case CMD.RESET:
+      return ROBOT_STATE.PAUSE;
+    default:
+      return null;
+  }
+}
+
+async function waitForRobotState(expectedState, options = {}) {
+  if (!expectedState) {
+    return { ok: true, state: null };
+  }
+
+  const {
+    afterTimestampMs = 0,
+    timeoutMs = COMMAND_STATE_CONFIRM_TIMEOUT_MS,
+    pollMs = COMMAND_STATE_CONFIRM_POLL_MS,
+  } = options;
+
+  const startedAt = Date.now();
+  while ((Date.now() - startedAt) < timeoutMs) {
+    if (state.robot?.timestampMs >= afterTimestampMs && state.robot?.state === expectedState) {
+      return {
+        ok: true,
+        state: state.robot.state,
+        timestampMs: state.robot.timestampMs,
+      };
+    }
+    await sleep(pollMs);
+  }
+
+  return {
+    ok: false,
+    error: `Timed out waiting for robot telemetry state ${expectedState}`,
+    currentState: state.robot?.state ?? null,
+    lastTelemetryAt: state.robot?.timestampMs ?? null,
+  };
+}
+
 async function dispatchCommand(cmd, options = {}) {
-  const { syncMission = true, source = 'api.command', waitForAck = false } = options;
+  const { syncMission = true, source = 'api.command', waitForAck = false, waitForState = false } = options;
 
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
@@ -777,12 +977,428 @@ async function dispatchCommand(cmd, options = {}) {
     syncMissionToCommand(cmd);
   }
 
+  if (waitForState) {
+    const expectedState = expectedRobotStateForCommand(cmd);
+    const confirmation = await waitForRobotState(expectedState, {
+      afterTimestampMs: state.lastCommandAt,
+    });
+    if (!confirmation.ok) {
+      metrics.commandsFailed += 1;
+      return {
+        ok: false,
+        status: 504,
+        error: confirmation.error,
+        detail: confirmation,
+      };
+    }
+  }
+
   publishSupervision();
   publishOperator();
 
   metrics.commandsDispatched += 1;
 
   return { ok: true, status: result.status, body: result.body };
+}
+
+function buildSampleWaypointSet() {
+  if (Array.isArray(state.lastPath) && state.lastPath.length >= 3) {
+    return state.lastPath.slice(0, Math.min(3, state.lastPath.length)).map((point) => ({
+      lat: Number(point.lat),
+      lon: Number(point.lon),
+      salt: clampNumber(Number(point.salt ?? 0), 0, 100),
+      brine: clampNumber(Number(point.brine ?? 0), 0, 100),
+    }));
+  }
+
+  if (state.robot && Number.isFinite(Number(state.robot.lat)) && Number.isFinite(Number(state.robot.lon))) {
+    const lat = Number(state.robot.lat);
+    const lon = Number(state.robot.lon);
+    return [
+      { lat, lon, salt: 25, brine: 75 },
+      { lat: lat + 0.00002, lon, salt: 25, brine: 75 },
+      { lat: lat + 0.00002, lon: lon + 0.00002, salt: 25, brine: 75 },
+    ];
+  }
+
+  return null;
+}
+
+function buildTestMenu() {
+  return [
+    {
+      id: 'bridge-status',
+      title: 'Bridge Status',
+      kind: 'inspect',
+      description: 'Refresh the base station and LoRa bridge snapshot.',
+      caution: 'safe',
+    },
+    {
+      id: 'gps-readiness',
+      title: 'GPS Readiness',
+      kind: 'inspect',
+      description: 'Check GPS fix, satellites, HDOP, and autonomy readiness.',
+      caution: 'safe',
+    },
+    {
+      id: 'telemetry-snapshot',
+      title: 'Telemetry Snapshot',
+      kind: 'inspect',
+      description: 'Inspect the latest robot telemetry and safety state.',
+      caution: 'safe',
+    },
+    {
+      id: 'state-snapshot',
+      title: 'State Snapshot',
+      kind: 'inspect',
+      description: 'Summarize mission, robot, bridge, and last fault state together.',
+      caution: 'safe',
+    },
+    {
+      id: 'gps-snapshot',
+      title: 'GPS Snapshot',
+      kind: 'inspect',
+      description: 'Show GPS fix, position, speed, heading, satellites, and HDOP.',
+      caution: 'safe',
+    },
+    {
+      id: 'mode-manual',
+      title: 'Mode Manual',
+      kind: 'command',
+      description: 'Put the robot into MANUAL so direct drive commands are accepted.',
+      caution: 'safe',
+    },
+    {
+      id: 'mode-auto',
+      title: 'Mode Auto',
+      kind: 'command',
+      description: 'Send AUTO and verify the robot reports AUTO telemetry state.',
+      caution: 'caution',
+    },
+    {
+      id: 'ack-pause',
+      title: 'Pause ACK',
+      kind: 'command',
+      description: 'Send PAUSE and verify command ACK plus telemetry state.',
+      caution: 'safe',
+    },
+    {
+      id: 'ack-reset',
+      title: 'Reset ACK',
+      kind: 'command',
+      description: 'Send RESET and verify recovery back to PAUSE.',
+      caution: 'caution',
+    },
+    {
+      id: 'ack-estop',
+      title: 'E-Stop ACK',
+      kind: 'command',
+      description: 'Send ESTOP and verify robot enters ESTOP.',
+      caution: 'danger',
+    },
+    {
+      id: 'drive-forward',
+      title: 'Drive Forward',
+      kind: 'drive',
+      description: 'Send a single FORWARD command for manual motion testing.',
+      caution: 'danger',
+    },
+    {
+      id: 'drive-left',
+      title: 'Drive Left',
+      kind: 'drive',
+      description: 'Send a single LEFT command for manual steering checks.',
+      caution: 'danger',
+    },
+    {
+      id: 'drive-stop',
+      title: 'Drive Stop',
+      kind: 'drive',
+      description: 'Send STOP to halt manual motion.',
+      caution: 'safe',
+    },
+    {
+      id: 'drive-right',
+      title: 'Drive Right',
+      kind: 'drive',
+      description: 'Send a single RIGHT command for manual steering checks.',
+      caution: 'danger',
+    },
+    {
+      id: 'drive-backward',
+      title: 'Drive Back',
+      kind: 'drive',
+      description: 'Send a single BACKWARD command for manual motion testing.',
+      caution: 'danger',
+    },
+    {
+      id: 'push-sample-waypoints',
+      title: 'Push Sample WPs',
+      kind: 'transport',
+      description: 'Send a tiny sample waypoint set to verify staged waypoint transport.',
+      caution: 'caution',
+    },
+    {
+      id: 'lora-example-set',
+      title: 'LoRa Example Set',
+      kind: 'transport',
+      description: 'Send the STM32 example LoRa control sequence used by the console test menu.',
+      caution: 'danger',
+    },
+    {
+      id: 'mix-preset',
+      title: 'Mix Preset',
+      kind: 'raw',
+      description: 'Send a CMD:AUTO,SALT:x,BRINE:y style mix preset from the server.',
+      caution: 'danger',
+      needsInput: {
+        field: 'mixText',
+        label: 'Mix',
+        placeholder: 'AUTO,SALT:25,BRINE:75',
+      },
+    },
+    {
+      id: 'raw-command',
+      title: 'Raw Command',
+      kind: 'raw',
+      description: 'Send a custom plain-text command for bench testing firmware features.',
+      caution: 'danger',
+      needsInput: {
+        field: 'cmdText',
+        label: 'Command',
+        placeholder: 'CMD:AUTO,SALT:25,BRINE:75',
+      },
+    },
+  ];
+}
+
+async function runTestMenuAction(actionId, input = {}) {
+  switch (actionId) {
+    case 'bridge-status': {
+      return {
+        ok: true,
+        actionId,
+        result: await bridge.refreshStatus(),
+      };
+    }
+    case 'gps-readiness': {
+      const gpsStatus = getRobotGpsStatus();
+      return {
+        ok: gpsStatus.ready,
+        actionId,
+        result: {
+          ...gpsStatus,
+          robot: state.robot
+            ? {
+                state: state.robot.state ?? null,
+                gpsFix: state.robot.gpsFix ?? null,
+                gpsSat: state.robot.gpsSat ?? null,
+                gpsHdop: state.robot.gpsHdop ?? null,
+                timestampMs: state.robot.timestampMs ?? null,
+              }
+            : null,
+        },
+      };
+    }
+    case 'telemetry-snapshot': {
+      return {
+        ok: Boolean(state.robot),
+        actionId,
+        result: {
+          robot: state.robot,
+          safety: state.safety,
+          lastFault: state.lastFault,
+        },
+      };
+    }
+    case 'state-snapshot': {
+      return {
+        ok: true,
+        actionId,
+        result: {
+          mission: mission.publicMission(),
+          robot: state.robot,
+          lora: await bridge.refreshStatus(),
+          safety: state.safety,
+          lastFault: state.lastFault,
+          allowedActions: buildAllowedActions(),
+          alerts: buildAlerts(),
+        },
+      };
+    }
+    case 'gps-snapshot': {
+      const gpsStatus = getRobotGpsStatus();
+      return {
+        ok: true,
+        actionId,
+        result: {
+          ...gpsStatus,
+          robot: state.robot
+            ? {
+                lat: state.robot.lat ?? null,
+                lon: state.robot.lon ?? null,
+                heading: state.robot.heading ?? null,
+                speed: state.robot.speed ?? null,
+                state: state.robot.state ?? null,
+                gpsFix: state.robot.gpsFix ?? null,
+                gpsSat: state.robot.gpsSat ?? null,
+                gpsHdop: state.robot.gpsHdop ?? null,
+                timestampMs: state.robot.timestampMs ?? null,
+              }
+            : null,
+        },
+      };
+    }
+    case 'mode-manual': {
+      const result = await dispatchCommand(CMD.MANUAL, {
+        syncMission: false,
+        source: 'test-menu.mode-manual',
+        waitForAck: true,
+        waitForState: true,
+      });
+      return { ok: result.ok, actionId, result };
+    }
+    case 'mode-auto': {
+      const result = await dispatchCommand(CMD.AUTO, {
+        syncMission: false,
+        source: 'test-menu.mode-auto',
+        waitForAck: true,
+        waitForState: true,
+      });
+      return { ok: result.ok, actionId, result };
+    }
+    case 'ack-pause': {
+      const result = await dispatchCommand(CMD.PAUSE, {
+        syncMission: false,
+        source: 'test-menu.ack-pause',
+        waitForAck: true,
+        waitForState: true,
+      });
+      return { ok: result.ok, actionId, result };
+    }
+    case 'ack-reset': {
+      const result = await dispatchCommand(CMD.RESET, {
+        syncMission: false,
+        source: 'test-menu.ack-reset',
+        waitForAck: true,
+        waitForState: true,
+      });
+      return { ok: result.ok, actionId, result };
+    }
+    case 'ack-estop': {
+      const result = await dispatchCommand(CMD.ESTOP, {
+        syncMission: false,
+        source: 'test-menu.ack-estop',
+        waitForAck: true,
+        waitForState: true,
+      });
+      return { ok: result.ok, actionId, result };
+    }
+    case 'drive-forward':
+    case 'drive-left':
+    case 'drive-stop':
+    case 'drive-right':
+    case 'drive-backward': {
+      const commandMap = {
+        'drive-forward': CMD.FORWARD,
+        'drive-left': CMD.LEFT,
+        'drive-stop': CMD.STOP,
+        'drive-right': CMD.RIGHT,
+        'drive-backward': CMD.BACKWARD,
+      };
+      const command = commandMap[actionId];
+      const result = await dispatchCommand(command, {
+        syncMission: false,
+        source: `test-menu.${actionId}`,
+        waitForAck: false,
+        waitForState: false,
+      });
+      return { ok: result.ok, actionId, result: { ...result, command } };
+    }
+    case 'push-sample-waypoints': {
+      const points = buildSampleWaypointSet();
+      if (!points) {
+        return {
+          ok: false,
+          actionId,
+          result: { error: 'No sample waypoint source available. Plan a path or provide live robot telemetry first.' },
+        };
+      }
+      const pushed = await bridge.pushWaypoints(points);
+      return {
+        ok: pushed.ok,
+        actionId,
+        result: {
+          ...pushed,
+          points,
+          lora: bridge.getStatus(),
+        },
+      };
+    }
+    case 'lora-example-set': {
+      const commands = [
+        'CMD:MANUAL',
+        'CMD:AUTO,SALT:25,BRINE:75',
+        'CMD:PAUSE',
+        'CMD:ESTOP',
+      ];
+      const steps = [];
+      for (const command of commands) {
+        const result = await bridge.sendCommand(command, { waitForAck: false });
+        steps.push({ command, ok: result.ok, status: result.status ?? null, error: result.error ?? null });
+        if (!result.ok) {
+          return { ok: false, actionId, result: { steps, failedCommand: command } };
+        }
+        await sleep(150);
+      }
+      return { ok: true, actionId, result: { steps, lora: await bridge.refreshStatus() } };
+    }
+    case 'mix-preset': {
+      const mixText = String(input.mixText ?? '').trim();
+      if (!mixText) {
+        return {
+          ok: false,
+          actionId,
+          result: { error: 'mixText is required for mix-preset' },
+        };
+      }
+      const command = mixText.toUpperCase().startsWith('CMD:') ? mixText : `CMD:${mixText}`;
+      const result = await bridge.sendCommand(command, { waitForAck: false });
+      return {
+        ok: result.ok,
+        actionId,
+        result: {
+          ...result,
+          command,
+        },
+      };
+    }
+    case 'raw-command': {
+      const cmdText = String(input.cmdText ?? '').trim();
+      if (!cmdText) {
+        return {
+          ok: false,
+          actionId,
+          result: { error: 'cmdText is required for raw-command' },
+        };
+      }
+      const result = await bridge.sendCommand(cmdText, { waitForAck: false });
+      return {
+        ok: result.ok,
+        actionId,
+        result: {
+          ...result,
+          command: cmdText,
+        },
+      };
+    }
+    default:
+      return {
+        ok: false,
+        actionId,
+        result: { error: `Unknown test action: ${actionId}` },
+      };
+  }
 }
 
 function parseIncomingTelemetry(payload) {
@@ -820,6 +1436,9 @@ function parseIncomingTelemetry(payload) {
         lon: body.robot.lon,
         heading: Number(body.robot.heading ?? body.heading?.yaw ?? 0),
         speed: Number(body.robot.speed ?? 0),
+        gpsFix: Boolean(body.robot.fix ?? body.gps?.fix ?? false),
+        gpsHdop: Number(body.robot.hdop ?? body.gps?.hdop ?? 0),
+        gpsSat: Number(body.robot.sat ?? body.gps?.sat ?? 0),
       },
       source: String(body.source ?? 'unknown'),
       stateName: typeof body.state === 'string' ? body.state : null,
@@ -838,6 +1457,9 @@ function parseIncomingTelemetry(payload) {
         lon: body.gps.lon,
         heading: Number(body.heading?.yaw ?? 0),
         speed: Number(body.speed ?? approxSpeed),
+        gpsFix: Boolean(body.gps.fix),
+        gpsHdop: Number(body.gps.hdop ?? 0),
+        gpsSat: Number(body.gps.sat ?? 0),
       },
       source: String(body.source ?? 'lora'),
       stateName: typeof body.state === 'string' ? body.state : null,
@@ -1102,6 +1724,9 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
     lon: parsed.robot.lon,
     heading: parsed.robot.heading,
     speed: parsed.robot.speed,
+    gpsFix: parsed.robot.gpsFix,
+    gpsHdop: parsed.robot.gpsHdop,
+    gpsSat: parsed.robot.gpsSat,
     source: parsed.source,
     state: parsed.stateName ?? state.robot?.state ?? ROBOT_STATE.IDLE,
     timestampMs: Date.now(),
@@ -1258,6 +1883,10 @@ app.post(API.MISSION_START, requireApp, async (_req, res) => {
     if (pathHasZeroDispersion()) {
       return res.status(409).json({ ok: false, error: 'Mission start blocked: path has 0% salt and 0% brine' });
     }
+    const gpsStatus = getRobotGpsStatus();
+    if (!gpsStatus.ready) {
+      return res.status(409).json({ ok: false, error: `Mission start blocked: ${gpsStatus.reason}` });
+    }
 
     const loraStatus = bridge.getStatus();
 
@@ -1279,7 +1908,7 @@ app.post(API.MISSION_START, requireApp, async (_req, res) => {
       return res.status(409).json({ ok: false, error: 'Mission start requires a committed waypoint set' });
     }
 
-    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.start', waitForAck: true });
+    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.start', waitForAck: true, waitForState: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1299,7 +1928,7 @@ app.post(API.MISSION_PAUSE, requireApp, async (req, res) => {
     if (currentMissionState() !== MISSION_STATE.RUNNING) {
       return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before pause' });
     }
-    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.pause', waitForAck: true });
+    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.pause', waitForAck: true, waitForState: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1317,10 +1946,14 @@ app.post(API.MISSION_RESUME, requireApp, async (_req, res) => {
     if (currentMissionState() !== MISSION_STATE.PAUSED) {
       return res.status(409).json({ ok: false, error: 'Mission must be PAUSED before resume' });
     }
+    const gpsStatus = getRobotGpsStatus();
+    if (!gpsStatus.ready) {
+      return res.status(409).json({ ok: false, error: `Mission resume blocked: ${gpsStatus.reason}` });
+    }
     if (bridge.getStatus().wpPushState !== 'committed') {
       return res.status(409).json({ ok: false, error: 'Mission resume requires committed waypoints' });
     }
-    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.resume', waitForAck: true });
+    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.resume', waitForAck: true, waitForState: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1338,7 +1971,7 @@ app.post(API.MISSION_COMPLETE, requireApp, async (_req, res) => {
     if (currentMissionState() !== MISSION_STATE.RUNNING) {
       return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before complete' });
     }
-    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.complete', waitForAck: true });
+    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.complete', waitForAck: true, waitForState: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1363,7 +1996,7 @@ app.post(API.MISSION_ABORT, requireApp, async (req, res) => {
     if (![MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
       return res.status(409).json({ ok: false, error: 'Mission must be RUNNING or PAUSED before abort' });
     }
-    const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source: 'mission.abort', waitForAck: true });
+    const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source: 'mission.abort', waitForAck: true, waitForState: true });
     if (!dispatched.ok) {
       return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
     }
@@ -1415,11 +2048,12 @@ app.get(API.MISSION_EVENTS, requireAppOrBoard, (req, res) => {
 // ---------------------------------------------------------------------------
 
 // GET /api/lora/status  — bridge + WP push state
-app.get(API.LORA_STATUS, requireAppOrBoard, (_req, res) => {
-  res.json({ ok: true, lora: bridge.getStatus() });
+app.get(API.LORA_STATUS, requireAppOrBoard, async (_req, res) => {
+  const lora = await bridge.refreshStatus();
+  res.json({ ok: true, lora });
 });
 
-app.get(API.BRIDGE_SYNC, requireAppOrBoard, (_req, res) => {
+app.get(API.BRIDGE_SYNC, requireAppOrBoard, async (_req, res) => {
   const coverage = state.coverage
     ? {
         width: state.coverage.width,
@@ -1434,7 +2068,7 @@ app.get(API.BRIDGE_SYNC, requireAppOrBoard, (_req, res) => {
     role: _req.clientRole ?? 'unknown',
     now: Date.now(),
     mission: mission.publicMission(),
-    lora: bridge.getStatus(),
+    lora: await bridge.refreshStatus(),
     baseStation: state.baseStation,
     boundary: state.boundary,
     lastPath: state.lastPath,
@@ -1450,6 +2084,25 @@ app.get(API.BRIDGE_SYNC, requireAppOrBoard, (_req, res) => {
 // POST /api/lora/push-waypoints  — manual WP push trigger
 // Body: { points: [{ lat, lon, salt, brine }, ...] }
 // If points is omitted uses state.lastPath.
+app.get(API.TEST_MENU, requireAppOrBoard, async (_req, res) => {
+  res.json({
+    ok: true,
+    tests: buildTestMenu(),
+    lora: await bridge.refreshStatus(),
+    gps: getRobotGpsStatus(),
+  });
+});
+
+app.post(API.TEST_RUN, requireAppOrBoard, async (req, res) => {
+  const actionId = String(req.body?.actionId ?? '').trim();
+  if (!actionId) {
+    return res.status(400).json({ ok: false, error: 'actionId is required' });
+  }
+
+  const output = await runTestMenuAction(actionId, req.body ?? {});
+  return res.status(output.ok ? 200 : 409).json(output);
+});
+
 app.post(API.LORA_PUSH_WP, requireApp, async (req, res) => {
   if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
     return res.status(409).json({ ok: false, error: 'Waypoint push allowed only while mission is CONFIGURING or PAUSED' });
@@ -1559,6 +2212,7 @@ const port = Number(process.env.PORT ?? 8080);
 
 const safetyTimer = setInterval(() => {
   void enforceTelemetryFailsafePolicy();
+  void enforceGpsFailsafePolicy();
   void enforceGeofenceFailsafePolicy('monitor');
 }, Math.max(100, SAFETY_MONITOR_INTERVAL_MS));
 if (typeof safetyTimer.unref === 'function') safetyTimer.unref();

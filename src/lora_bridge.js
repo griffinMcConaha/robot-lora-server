@@ -73,6 +73,18 @@ let _lastSuccessAt  = null;
 let _lastErrorAt    = null;
 let _consecutiveFailures = 0;
 let _degradedSince  = null;
+let _baseStationSnapshot = {
+  statusOk: false,
+  statusCode: null,
+  statusError: null,
+  state: null,
+  mode: null,
+  queueDepth: null,
+  ackCount: null,
+  lastAck: null,
+  lastLoRa: null,
+  refreshedAt: null,
+};
 
 // ---------------------------------------------------------------------------
 // Low-level HTTP helper
@@ -177,6 +189,68 @@ async function _get(path) {
   });
 }
 
+function _applyBaseStatusSnapshot(payload, meta = {}) {
+  if (!payload || typeof payload !== 'object') {
+    _baseStationSnapshot = {
+      ..._baseStationSnapshot,
+      statusOk: false,
+      statusCode: meta.status ?? null,
+      statusError: meta.error ?? 'Invalid base station status payload',
+      refreshedAt: new Date().toISOString(),
+    };
+    return _baseStationSnapshot;
+  }
+
+  _baseStationSnapshot = {
+    ..._baseStationSnapshot,
+    statusOk: Boolean(meta.ok ?? true),
+    statusCode: meta.status ?? null,
+    statusError: meta.error ?? null,
+    state: typeof payload.state === 'string' ? payload.state : _baseStationSnapshot.state,
+    mode: typeof payload.mode === 'string' ? payload.mode : _baseStationSnapshot.mode,
+    queueDepth: Number.isFinite(Number(payload.queue_depth)) ? Number(payload.queue_depth) : _baseStationSnapshot.queueDepth,
+    ackCount: Number.isFinite(Number(payload.ack_count)) ? Number(payload.ack_count) : _baseStationSnapshot.ackCount,
+    lastAck: typeof payload.last_ack === 'string' ? payload.last_ack.trim() : _baseStationSnapshot.lastAck,
+    lastLoRa: typeof payload.last_lora === 'string' ? payload.last_lora.trim() : _baseStationSnapshot.lastLoRa,
+    refreshedAt: new Date().toISOString(),
+  };
+  return _baseStationSnapshot;
+}
+
+async function _readBaseStatus() {
+  const result = await _get('/status');
+  if (!result.ok) {
+    _baseStationSnapshot = {
+      ..._baseStationSnapshot,
+      statusOk: false,
+      statusCode: result.status ?? null,
+      statusError: result.error ?? `HTTP ${result.status}`,
+      refreshedAt: new Date().toISOString(),
+    };
+    return { ok: false, error: _baseStationSnapshot.statusError, status: result.status ?? null, snapshot: _baseStationSnapshot };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(result.body);
+  } catch {
+    _baseStationSnapshot = {
+      ..._baseStationSnapshot,
+      statusOk: false,
+      statusCode: result.status ?? null,
+      statusError: 'Base station /status returned invalid JSON',
+      refreshedAt: new Date().toISOString(),
+    };
+    return { ok: false, error: _baseStationSnapshot.statusError, status: result.status ?? null, snapshot: _baseStationSnapshot };
+  }
+
+  return {
+    ok: true,
+    status: result.status ?? null,
+    snapshot: _applyBaseStatusSnapshot(parsed, { ok: true, status: result.status ?? null }),
+  };
+}
+
 /**
  * Sleep helper for inter-line delay between WP commands.
  * @param {number} ms
@@ -232,22 +306,44 @@ function _expectedAckForCommand(cmd) {
 async function _readLastLoRa() {
   const result = await _get('/last_lora');
   if (!result.ok) return { ok: false, error: result.error ?? `HTTP ${result.status}` };
-  return { ok: true, frame: _unwrapAckFrame(result.body) };
+  const frame = _unwrapAckFrame(result.body);
+  if (frame?.raw) {
+    _baseStationSnapshot = {
+      ..._baseStationSnapshot,
+      lastLoRa: frame.raw,
+      refreshedAt: new Date().toISOString(),
+    };
+  }
+  return { ok: true, frame };
 }
 
 async function _waitForAck(expectedAck, options = {}) {
   const { baselineRaw = null, wrappedOnly = true, timeoutMs = ACK_WAIT_TIMEOUT_MS } = options;
   const startedAt = Date.now();
   let lastSeenRaw = baselineRaw;
+  let lastSeenAck = null;
 
   while ((Date.now() - startedAt) < timeoutMs) {
+    const statusSnapshot = await _readBaseStatus();
+    if (statusSnapshot.ok && typeof statusSnapshot.snapshot?.lastAck === 'string' && statusSnapshot.snapshot.lastAck) {
+      const frame = _unwrapAckFrame(statusSnapshot.snapshot.lastAck);
+      if (frame?.ack) {
+        lastSeenRaw = frame.raw;
+        lastSeenAck = frame.ack;
+        if ((!wrappedOnly || frame.wrapped) && frame.ack === expectedAck && frame.raw !== baselineRaw) {
+          return { ok: true, ack: frame.ack, raw: frame.raw, source: 'status' };
+        }
+      }
+    }
+
     const snapshot = await _readLastLoRa();
     if (snapshot.ok && snapshot.frame?.ack) {
       const { frame } = snapshot;
       lastSeenRaw = frame.raw;
+      lastSeenAck = frame.ack;
 
       if ((!wrappedOnly || frame.wrapped) && frame.ack === expectedAck && frame.raw !== baselineRaw) {
-        return { ok: true, ack: frame.ack, raw: frame.raw };
+        return { ok: true, ack: frame.ack, raw: frame.raw, source: 'last_lora' };
       }
     }
 
@@ -258,6 +354,7 @@ async function _waitForAck(expectedAck, options = {}) {
     ok: false,
     error: `Timed out waiting for ${expectedAck}`,
     lastSeenRaw,
+    lastSeenAck,
   };
 }
 
@@ -483,7 +580,26 @@ function getStatus() {
     degraded: _consecutiveFailures >= BRIDGE_DEGRADED_FAILURE_THRESHOLD,
     degradedSince: _degradedSince,
     requestTimeoutMs: REQUEST_TIMEOUT_MS,
+    ackWaitTimeoutMs: ACK_WAIT_TIMEOUT_MS,
+    ackPollMs: ACK_POLL_MS,
+    baseStation: {
+      statusOk: _baseStationSnapshot.statusOk,
+      statusCode: _baseStationSnapshot.statusCode,
+      statusError: _baseStationSnapshot.statusError,
+      state: _baseStationSnapshot.state,
+      mode: _baseStationSnapshot.mode,
+      queueDepth: _baseStationSnapshot.queueDepth,
+      ackCount: _baseStationSnapshot.ackCount,
+      lastAck: _baseStationSnapshot.lastAck,
+      lastLoRa: _baseStationSnapshot.lastLoRa,
+      refreshedAt: _baseStationSnapshot.refreshedAt,
+    },
   };
+}
+
+async function refreshStatus() {
+  await _readBaseStatus();
+  return getStatus();
 }
 
 /**
@@ -541,4 +657,4 @@ function _wpFail(sent, error) {
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
-module.exports = { sendCommand, pushWaypoints, resetWpState, getStatus, observeCommand };
+module.exports = { sendCommand, pushWaypoints, resetWpState, getStatus, refreshStatus, observeCommand };

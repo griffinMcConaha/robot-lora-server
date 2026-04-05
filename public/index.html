@@ -236,6 +236,110 @@
       color: #64748b;
       padding-left: 8px;
     }
+
+    .test-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+
+    .test-button {
+      width: 100%;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      background: rgba(15, 23, 42, 0.8);
+      color: #e2e8f0;
+      border-radius: 10px;
+      padding: 12px 14px;
+      text-align: left;
+      cursor: pointer;
+      transition: border-color 0.2s ease, transform 0.2s ease, background 0.2s ease;
+    }
+
+    .test-button:hover {
+      border-color: rgba(96, 165, 250, 0.5);
+      background: rgba(30, 41, 59, 0.95);
+      transform: translateY(-1px);
+    }
+
+    .test-button.safe {
+      border-left: 3px solid #10b981;
+    }
+
+    .test-button.caution {
+      border-left: 3px solid #f59e0b;
+    }
+
+    .test-button.danger {
+      border-left: 3px solid #ef4444;
+    }
+
+    .test-button-title {
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: #f8fafc;
+    }
+
+    .test-button-copy {
+      font-size: 12px;
+      line-height: 1.4;
+      color: #94a3b8;
+    }
+
+    .test-result {
+      margin-top: 16px;
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 140px;
+      overflow: auto;
+      font-family: 'Monaco', 'Courier New', monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      color: #cbd5e1;
+    }
+
+    .test-inputs {
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .test-input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .test-input-label {
+      font-size: 12px;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+
+    .test-input {
+      width: 100%;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      background: rgba(15, 23, 42, 0.8);
+      color: #e2e8f0;
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 13px;
+    }
+
+    .test-run-button {
+      border: 1px solid rgba(96, 165, 250, 0.35);
+      background: rgba(37, 99, 235, 0.9);
+      color: #f8fafc;
+      border-radius: 10px;
+      padding: 12px 16px;
+      cursor: pointer;
+      font-weight: 700;
+    }
   </style>
 </head>
 <body>
@@ -349,6 +453,15 @@
       </div>
     </div>
 
+    <div class="card grid-2">
+      <div class="card-title">Test Menu</div>
+      <div id="testMenu" class="test-grid">
+        <div style="color: #64748b; padding: 12px;">Loading test menu...</div>
+      </div>
+      <div id="testInputs"></div>
+      <div id="testResult" class="test-result">Select a test to run it from the server.</div>
+    </div>
+
     <!-- Event Log (spans full width on medium+ screens) -->
     <div class="card grid-2">
       <div class="card-title">Recent Events</div>
@@ -365,6 +478,8 @@
     let state = {};
     const maxLogEntries = 50;
     const logEntries = [];
+    let testMenu = [];
+    let selectedInputTestId = null;
 
     function connect() {
       try {
@@ -511,6 +626,109 @@
       renderLog();
     }
 
+    async function loadTestMenu() {
+      try {
+        const response = await fetch('/api/test-menu');
+        const payload = await response.json();
+        if (!payload.ok || !Array.isArray(payload.tests)) {
+          throw new Error(payload.error || 'Failed to load test menu');
+        }
+        testMenu = payload.tests;
+        renderTestMenu();
+      } catch (error) {
+        document.getElementById('testMenu').innerHTML = `<div style="color:#ef4444; padding: 12px;">${error.message}</div>`;
+      }
+    }
+
+    function renderTestMenu() {
+      const container = document.getElementById('testMenu');
+      if (!Array.isArray(testMenu) || testMenu.length === 0) {
+        container.innerHTML = '<div style="color:#64748b; padding: 12px;">No tests available.</div>';
+        document.getElementById('testInputs').innerHTML = '';
+        return;
+      }
+
+      container.innerHTML = testMenu.map(test => `
+        <button class="test-button ${test.caution || 'safe'}" onclick="${test.needsInput ? `showTestInputs('${test.id}')` : `runTestAction('${test.id}')`}">
+          <div class="test-button-title">${test.title}</div>
+          <div class="test-button-copy">${test.description || ''}</div>
+        </button>
+      `).join('');
+
+      renderTestInputs();
+    }
+
+    function showTestInputs(actionId) {
+      selectedInputTestId = actionId;
+      renderTestInputs();
+    }
+
+    function renderTestInputs() {
+      const test = testMenu.find(item => item.id === selectedInputTestId && item.needsInput);
+      const container = document.getElementById('testInputs');
+      if (!test || !test.needsInput) {
+        container.innerHTML = '';
+        return;
+      }
+
+        const field = test.needsInput.field;
+        container.innerHTML = `
+        <div class="test-inputs">
+          <div class="test-input-group">
+            <label class="test-input-label" for="testInputField">${test.needsInput.label}</label>
+            <input id="testInputField" class="test-input" placeholder="${test.needsInput.placeholder || ''}" />
+          </div>
+          <button class="test-run-button" onclick="runInputBackedTest('${test.id}', '${field}')">Run</button>
+        </div>
+      `;
+    }
+
+    async function runTestAction(actionId) {
+      const resultEl = document.getElementById('testResult');
+      const test = testMenu.find(item => item.id === actionId);
+      resultEl.textContent = `Running ${test?.title || actionId}...`;
+
+      try {
+        const response = await fetch('/api/test-menu/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ actionId }),
+        });
+        const payload = await response.json();
+        resultEl.textContent = JSON.stringify(payload, null, 2);
+        addLogEntry('Test', `${test?.title || actionId} ${payload.ok ? 'passed' : 'failed'}`, payload.ok ? 'event' : 'warning');
+      } catch (error) {
+        resultEl.textContent = JSON.stringify({ ok: false, actionId, error: error.message }, null, 2);
+        addLogEntry('Test', `${test?.title || actionId} failed to run`, 'warning');
+      }
+    }
+
+    async function runInputBackedTest(actionId, fieldName) {
+      const inputEl = document.getElementById('testInputField');
+      const value = inputEl ? inputEl.value : '';
+      await runTestActionWithPayload(actionId, { [fieldName]: value });
+    }
+
+    async function runTestActionWithPayload(actionId, extraPayload) {
+      const resultEl = document.getElementById('testResult');
+      const test = testMenu.find(item => item.id === actionId);
+      resultEl.textContent = `Running ${test?.title || actionId}...`;
+
+      try {
+        const response = await fetch('/api/test-menu/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ actionId, ...(extraPayload || {}) }),
+        });
+        const payload = await response.json();
+        resultEl.textContent = JSON.stringify(payload, null, 2);
+        addLogEntry('Test', `${test?.title || actionId} ${payload.ok ? 'passed' : 'failed'}`, payload.ok ? 'event' : 'warning');
+      } catch (error) {
+        resultEl.textContent = JSON.stringify({ ok: false, actionId, error: error.message }, null, 2);
+        addLogEntry('Test', `${test?.title || actionId} failed to run`, 'warning');
+      }
+    }
+
     function renderLog() {
       const logEl = document.getElementById('eventLog');
       if (logEntries.length === 0) {
@@ -529,6 +747,7 @@
 
     // Initialize
     connect();
+    loadTestMenu();
     addLogEntry('System', 'Dashboard initialized', 'event');
   </script>
 </body>
