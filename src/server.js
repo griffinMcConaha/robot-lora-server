@@ -1024,6 +1024,140 @@ function buildSampleWaypointSet() {
   return null;
 }
 
+async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge') {
+  if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+    return { ok: false, status: 409, error: 'Waypoint push allowed only while mission is CONFIGURING or PAUSED' };
+  }
+
+  let points = rawPoints;
+  if (!points && state.lastPath && state.lastPath.length > 0) {
+    points = state.lastPath.map((p) => ({
+      lat: p.lat,
+      lon: p.lon,
+      salt: p.salt ?? 100,
+      brine: p.brine ?? 100,
+    }));
+  }
+  if (!points || !Array.isArray(points) || points.length === 0) {
+    return { ok: false, status: 400, error: 'No points provided and no cached path plan' };
+  }
+  if (pathHasZeroDispersion(points)) {
+    return { ok: false, status: 409, error: 'Waypoint push blocked: path has 0% salt and 0% brine' };
+  }
+
+  const result = await bridge.pushWaypoints(points);
+  if (!result.ok) {
+    return { ok: false, status: 502, error: result.error, sent: result.sent };
+  }
+  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, { wpPushCount: result.sent, source });
+  publishSupervision();
+  publishOperator();
+  return { ok: true, status: 200, sent: result.sent, points };
+}
+
+async function startMissionAction(source = 'mission.start') {
+  if (currentMissionState() !== MISSION_STATE.CONFIGURING) {
+    return { ok: false, status: 409, error: 'Mission must be CONFIGURING before start' };
+  }
+  if (pathHasZeroDispersion()) {
+    return { ok: false, status: 409, error: 'Mission start blocked: path has 0% salt and 0% brine' };
+  }
+  const gpsStatus = getRobotGpsStatus();
+  if (!gpsStatus.ready) {
+    return { ok: false, status: 409, error: `Mission start blocked: ${gpsStatus.reason}` };
+  }
+
+  const loraStatus = bridge.getStatus();
+  if (loraStatus.wpPushState !== 'committed' && state.lastPath && state.lastPath.length > 0) {
+    const pushed = await pushPathWaypoints(null, source);
+    if (!pushed.ok) return pushed;
+  }
+
+  if (bridge.getStatus().wpPushState !== 'committed') {
+    return { ok: false, status: 409, error: 'Mission start requires a committed waypoint set' };
+  }
+
+  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: true, waitForState: true });
+  if (!dispatched.ok) {
+    return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
+  }
+
+  const current = mission.start();
+  publishSupervision();
+  return { ok: true, status: 200, mission: current };
+}
+
+async function pauseMissionAction(reason = null, source = 'mission.pause') {
+  if (currentMissionState() !== MISSION_STATE.RUNNING) {
+    return { ok: false, status: 409, error: 'Mission must be RUNNING before pause' };
+  }
+  const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source, waitForAck: true, waitForState: true });
+  if (!dispatched.ok) {
+    return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
+  }
+  const current = mission.pause(reason);
+  publishSupervision();
+  return { ok: true, status: 200, mission: current };
+}
+
+async function resumeMissionAction(source = 'mission.resume') {
+  if (currentMissionState() !== MISSION_STATE.PAUSED) {
+    return { ok: false, status: 409, error: 'Mission must be PAUSED before resume' };
+  }
+  const gpsStatus = getRobotGpsStatus();
+  if (!gpsStatus.ready) {
+    return { ok: false, status: 409, error: `Mission resume blocked: ${gpsStatus.reason}` };
+  }
+  if (bridge.getStatus().wpPushState !== 'committed') {
+    return { ok: false, status: 409, error: 'Mission resume requires committed waypoints' };
+  }
+  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: true, waitForState: true });
+  if (!dispatched.ok) {
+    return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
+  }
+  const current = mission.resume();
+  publishSupervision();
+  return { ok: true, status: 200, mission: current };
+}
+
+async function completeMissionAction(source = 'mission.complete') {
+  if (currentMissionState() !== MISSION_STATE.RUNNING) {
+    return { ok: false, status: 409, error: 'Mission must be RUNNING before complete' };
+  }
+  const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source, waitForAck: true, waitForState: true });
+  if (!dispatched.ok) {
+    return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
+  }
+  const stats = state.coverage ? coverageStats(state.coverage) : {};
+  const current = mission.complete({
+    coveragePct: getCoveragePct(stats),
+    faultCount: db.getMissionEventSummary(mission.currentId() ?? 0)?.faultCount ?? 0,
+    cmdCount: db.getMissionEventSummary(mission.currentId() ?? 0)?.cmdCount ?? 0,
+  });
+  bridge.resetWpState();
+  publishSupervision();
+  return { ok: true, status: 200, mission: current };
+}
+
+async function abortMissionAction(reason = 'operator', source = 'mission.abort') {
+  if (![MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+    return { ok: false, status: 409, error: 'Mission must be RUNNING or PAUSED before abort' };
+  }
+  const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source, waitForAck: true, waitForState: true });
+  if (!dispatched.ok) {
+    return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
+  }
+  const stats = state.coverage ? coverageStats(state.coverage) : {};
+  const current = mission.abort(reason, {
+    coveragePct: getCoveragePct(stats),
+    faultCount: db.getMissionEventSummary(mission.currentId() ?? 0)?.faultCount ?? 0,
+    cmdCount: db.getMissionEventSummary(mission.currentId() ?? 0)?.cmdCount ?? 0,
+  });
+  bridge.resetWpState();
+  publishSupervision();
+  return { ok: true, status: 200, mission: current };
+}
+
 function buildTestMenu() {
   return [
     {
@@ -1032,6 +1166,8 @@ function buildTestMenu() {
       kind: 'inspect',
       description: 'Refresh the base station and LoRa bridge snapshot.',
       caution: 'safe',
+      shortcut: 'S',
+      group: 'System',
     },
     {
       id: 'gps-readiness',
@@ -1046,6 +1182,8 @@ function buildTestMenu() {
       kind: 'inspect',
       description: 'Inspect the latest robot telemetry and safety state.',
       caution: 'safe',
+      shortcut: '1',
+      group: 'System',
     },
     {
       id: 'state-snapshot',
@@ -1053,6 +1191,8 @@ function buildTestMenu() {
       kind: 'inspect',
       description: 'Summarize mission, robot, bridge, and last fault state together.',
       caution: 'safe',
+      shortcut: '9',
+      group: 'Sensors',
     },
     {
       id: 'gps-snapshot',
@@ -1060,6 +1200,8 @@ function buildTestMenu() {
       kind: 'inspect',
       description: 'Show GPS fix, position, speed, heading, satellites, and HDOP.',
       caution: 'safe',
+      shortcut: '4',
+      group: 'Sensors',
     },
     {
       id: 'mode-manual',
@@ -1067,6 +1209,8 @@ function buildTestMenu() {
       kind: 'command',
       description: 'Put the robot into MANUAL so direct drive commands are accepted.',
       caution: 'safe',
+      shortcut: 'M',
+      group: 'Modes',
     },
     {
       id: 'mode-auto',
@@ -1074,6 +1218,8 @@ function buildTestMenu() {
       kind: 'command',
       description: 'Send AUTO and verify the robot reports AUTO telemetry state.',
       caution: 'caution',
+      shortcut: 'U',
+      group: 'Modes',
     },
     {
       id: 'ack-pause',
@@ -1081,6 +1227,8 @@ function buildTestMenu() {
       kind: 'command',
       description: 'Send PAUSE and verify command ACK plus telemetry state.',
       caution: 'safe',
+      shortcut: 'P',
+      group: 'Modes',
     },
     {
       id: 'ack-reset',
@@ -1088,6 +1236,8 @@ function buildTestMenu() {
       kind: 'command',
       description: 'Send RESET and verify recovery back to PAUSE.',
       caution: 'caution',
+      shortcut: 'J',
+      group: 'Modes',
     },
     {
       id: 'ack-estop',
@@ -1095,6 +1245,8 @@ function buildTestMenu() {
       kind: 'command',
       description: 'Send ESTOP and verify robot enters ESTOP.',
       caution: 'danger',
+      shortcut: 'E',
+      group: 'Modes',
     },
     {
       id: 'drive-forward',
@@ -1102,6 +1254,8 @@ function buildTestMenu() {
       kind: 'drive',
       description: 'Send a single FORWARD command for manual motion testing.',
       caution: 'danger',
+      shortcut: 'F',
+      group: 'Drive',
     },
     {
       id: 'drive-left',
@@ -1109,6 +1263,8 @@ function buildTestMenu() {
       kind: 'drive',
       description: 'Send a single LEFT command for manual steering checks.',
       caution: 'danger',
+      shortcut: 'V',
+      group: 'Drive',
     },
     {
       id: 'drive-stop',
@@ -1116,6 +1272,8 @@ function buildTestMenu() {
       kind: 'drive',
       description: 'Send STOP to halt manual motion.',
       caution: 'safe',
+      shortcut: 'T',
+      group: 'Drive',
     },
     {
       id: 'drive-right',
@@ -1123,6 +1281,8 @@ function buildTestMenu() {
       kind: 'drive',
       description: 'Send a single RIGHT command for manual steering checks.',
       caution: 'danger',
+      shortcut: 'N',
+      group: 'Drive',
     },
     {
       id: 'drive-backward',
@@ -1130,6 +1290,8 @@ function buildTestMenu() {
       kind: 'drive',
       description: 'Send a single BACKWARD command for manual motion testing.',
       caution: 'danger',
+      shortcut: 'B',
+      group: 'Drive',
     },
     {
       id: 'push-sample-waypoints',
@@ -1137,6 +1299,62 @@ function buildTestMenu() {
       kind: 'transport',
       description: 'Send a tiny sample waypoint set to verify staged waypoint transport.',
       caution: 'caution',
+      shortcut: 'C',
+      group: 'Transport',
+    },
+    {
+      id: 'commit-current-path',
+      title: 'Commit Current Path',
+      kind: 'mission',
+      description: 'Push the current planned path to the robot as committed waypoints.',
+      caution: 'caution',
+      shortcut: 'K',
+      group: 'Mission',
+    },
+    {
+      id: 'mission-start-test',
+      title: 'Mission Start',
+      kind: 'mission',
+      description: 'Run the normal mission start sequence with all server-side checks.',
+      caution: 'danger',
+      shortcut: 'I',
+      group: 'Mission',
+    },
+    {
+      id: 'mission-pause-test',
+      title: 'Mission Pause',
+      kind: 'mission',
+      description: 'Pause the active mission through the full lifecycle path.',
+      caution: 'safe',
+      shortcut: 'H',
+      group: 'Mission',
+    },
+    {
+      id: 'mission-resume-test',
+      title: 'Mission Resume',
+      kind: 'mission',
+      description: 'Resume a paused mission through the full lifecycle path.',
+      caution: 'caution',
+      shortcut: 'R',
+      group: 'Mission',
+    },
+    {
+      id: 'mission-complete-test',
+      title: 'Mission Complete',
+      kind: 'mission',
+      description: 'Complete the active mission and close out the lifecycle cleanly.',
+      caution: 'caution',
+      shortcut: 'G',
+      group: 'Mission',
+    },
+    {
+      id: 'mission-abort-test',
+      title: 'Mission Abort',
+      kind: 'mission',
+      description: 'Abort the active mission and force the ESTOP lifecycle path.',
+      caution: 'danger',
+      shortcut: 'Z',
+      group: 'Mission',
     },
     {
       id: 'lora-example-set',
@@ -1144,6 +1362,62 @@ function buildTestMenu() {
       kind: 'transport',
       description: 'Send the STM32 example LoRa control sequence used by the console test menu.',
       caution: 'danger',
+      shortcut: 'X',
+      group: 'Transport',
+    },
+    {
+      id: 'salt-50',
+      title: 'Salt 50%',
+      kind: 'dispersion',
+      description: 'Send a 50% salt-only bench command.',
+      caution: 'caution',
+      shortcut: '7',
+      group: 'Dispersion',
+    },
+    {
+      id: 'brine-50',
+      title: 'Brine 50%',
+      kind: 'dispersion',
+      description: 'Send a 50% brine-only bench command.',
+      caution: 'caution',
+      shortcut: '8',
+      group: 'Dispersion',
+    },
+    {
+      id: 'agitator-on',
+      title: 'Agitator ON',
+      kind: 'dispersion',
+      description: 'Toggle the brine agitator on for individual bench testing.',
+      caution: 'caution',
+      shortcut: 'A',
+      group: 'Dispersion',
+    },
+    {
+      id: 'thrower-on',
+      title: 'Thrower ON',
+      kind: 'dispersion',
+      description: 'Toggle the salt thrower on for individual bench testing.',
+      caution: 'caution',
+      shortcut: 'W',
+      group: 'Dispersion',
+    },
+    {
+      id: 'relay-on',
+      title: 'Relay ON',
+      kind: 'dispersion',
+      description: 'Toggle the Sabertooth relay on for individual bench testing.',
+      caution: 'caution',
+      shortcut: 'O',
+      group: 'Dispersion',
+    },
+    {
+      id: 'safe-off',
+      title: 'Safe Outputs Off',
+      kind: 'dispersion',
+      description: 'Send the safe-off sequence to stop outputs and relays.',
+      caution: 'safe',
+      shortcut: 'Q',
+      group: 'Dispersion',
     },
     {
       id: 'mix-preset',
@@ -1151,6 +1425,8 @@ function buildTestMenu() {
       kind: 'raw',
       description: 'Send a CMD:AUTO,SALT:x,BRINE:y style mix preset from the server.',
       caution: 'danger',
+      shortcut: 'L',
+      group: 'Transport',
       needsInput: {
         field: 'mixText',
         label: 'Mix',
@@ -1163,6 +1439,8 @@ function buildTestMenu() {
       kind: 'raw',
       description: 'Send a custom plain-text command for bench testing firmware features.',
       caution: 'danger',
+      shortcut: '?',
+      group: 'Advanced',
       needsInput: {
         field: 'cmdText',
         label: 'Command',
@@ -1172,12 +1450,28 @@ function buildTestMenu() {
   ];
 }
 
+function resolveTestMenuAction(actionIdOrShortcut) {
+  const token = String(actionIdOrShortcut ?? '').trim();
+  if (!token) return null;
+  const upper = token.toUpperCase();
+  return buildTestMenu().find((item) => item.id === token || String(item.shortcut ?? '').toUpperCase() === upper) ?? null;
+}
+
 async function runTestMenuAction(actionId, input = {}) {
-  switch (actionId) {
+  const resolved = resolveTestMenuAction(actionId);
+  if (!resolved) {
+    return {
+      ok: false,
+      actionId,
+      result: { error: `Unknown test action: ${actionId}` },
+    };
+  }
+
+  switch (resolved.id) {
     case 'bridge-status': {
       return {
         ok: true,
-        actionId,
+        actionId: resolved.id,
         result: await bridge.refreshStatus(),
       };
     }
@@ -1185,7 +1479,7 @@ async function runTestMenuAction(actionId, input = {}) {
       const gpsStatus = getRobotGpsStatus();
       return {
         ok: gpsStatus.ready,
-        actionId,
+        actionId: resolved.id,
         result: {
           ...gpsStatus,
           robot: state.robot
@@ -1203,7 +1497,7 @@ async function runTestMenuAction(actionId, input = {}) {
     case 'telemetry-snapshot': {
       return {
         ok: Boolean(state.robot),
-        actionId,
+        actionId: resolved.id,
         result: {
           robot: state.robot,
           safety: state.safety,
@@ -1214,7 +1508,7 @@ async function runTestMenuAction(actionId, input = {}) {
     case 'state-snapshot': {
       return {
         ok: true,
-        actionId,
+        actionId: resolved.id,
         result: {
           mission: mission.publicMission(),
           robot: state.robot,
@@ -1230,7 +1524,7 @@ async function runTestMenuAction(actionId, input = {}) {
       const gpsStatus = getRobotGpsStatus();
       return {
         ok: true,
-        actionId,
+        actionId: resolved.id,
         result: {
           ...gpsStatus,
           robot: state.robot
@@ -1256,7 +1550,7 @@ async function runTestMenuAction(actionId, input = {}) {
         waitForAck: true,
         waitForState: true,
       });
-      return { ok: result.ok, actionId, result };
+      return { ok: result.ok, actionId: resolved.id, result };
     }
     case 'mode-auto': {
       const result = await dispatchCommand(CMD.AUTO, {
@@ -1265,7 +1559,7 @@ async function runTestMenuAction(actionId, input = {}) {
         waitForAck: true,
         waitForState: true,
       });
-      return { ok: result.ok, actionId, result };
+      return { ok: result.ok, actionId: resolved.id, result };
     }
     case 'ack-pause': {
       const result = await dispatchCommand(CMD.PAUSE, {
@@ -1274,7 +1568,7 @@ async function runTestMenuAction(actionId, input = {}) {
         waitForAck: true,
         waitForState: true,
       });
-      return { ok: result.ok, actionId, result };
+      return { ok: result.ok, actionId: resolved.id, result };
     }
     case 'ack-reset': {
       const result = await dispatchCommand(CMD.RESET, {
@@ -1283,7 +1577,7 @@ async function runTestMenuAction(actionId, input = {}) {
         waitForAck: true,
         waitForState: true,
       });
-      return { ok: result.ok, actionId, result };
+      return { ok: result.ok, actionId: resolved.id, result };
     }
     case 'ack-estop': {
       const result = await dispatchCommand(CMD.ESTOP, {
@@ -1292,7 +1586,7 @@ async function runTestMenuAction(actionId, input = {}) {
         waitForAck: true,
         waitForState: true,
       });
-      return { ok: result.ok, actionId, result };
+      return { ok: result.ok, actionId: resolved.id, result };
     }
     case 'drive-forward':
     case 'drive-left':
@@ -1306,34 +1600,91 @@ async function runTestMenuAction(actionId, input = {}) {
         'drive-right': CMD.RIGHT,
         'drive-backward': CMD.BACKWARD,
       };
-      const command = commandMap[actionId];
+      const command = commandMap[resolved.id];
       const result = await dispatchCommand(command, {
         syncMission: false,
-        source: `test-menu.${actionId}`,
+        source: `test-menu.${resolved.id}`,
         waitForAck: false,
         waitForState: false,
       });
-      return { ok: result.ok, actionId, result: { ...result, command } };
+      return { ok: result.ok, actionId: resolved.id, result: { ...result, command } };
     }
     case 'push-sample-waypoints': {
       const points = buildSampleWaypointSet();
       if (!points) {
         return {
           ok: false,
-          actionId,
+          actionId: resolved.id,
           result: { error: 'No sample waypoint source available. Plan a path or provide live robot telemetry first.' },
         };
       }
       const pushed = await bridge.pushWaypoints(points);
       return {
         ok: pushed.ok,
-        actionId,
+        actionId: resolved.id,
         result: {
           ...pushed,
           points,
           lora: bridge.getStatus(),
         },
       };
+    }
+    case 'commit-current-path': {
+      const result = await pushPathWaypoints(null, 'test-menu.commit-current-path');
+      return { ok: result.ok, actionId: resolved.id, result };
+    }
+    case 'mission-start-test': {
+      const result = await startMissionAction('test-menu.mission-start');
+      return { ok: result.ok, actionId: resolved.id, result };
+    }
+    case 'mission-pause-test': {
+      const result = await pauseMissionAction('test-menu.mission-pause');
+      return { ok: result.ok, actionId: resolved.id, result };
+    }
+    case 'mission-resume-test': {
+      const result = await resumeMissionAction('test-menu.mission-resume');
+      return { ok: result.ok, actionId: resolved.id, result };
+    }
+    case 'mission-complete-test': {
+      const result = await completeMissionAction('test-menu.mission-complete');
+      return { ok: result.ok, actionId: resolved.id, result };
+    }
+    case 'mission-abort-test': {
+      const result = await abortMissionAction('test-menu.mission-abort', 'test-menu.mission-abort');
+      return { ok: result.ok, actionId: resolved.id, result };
+    }
+    case 'salt-50': {
+      const result = await bridge.sendCommand('TEST SALT 50', { waitForAck: false });
+      return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'TEST SALT 50' } };
+    }
+    case 'brine-50': {
+      const result = await bridge.sendCommand('TEST BRINE 50', { waitForAck: false });
+      return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'TEST BRINE 50' } };
+    }
+    case 'agitator-on': {
+      const result = await bridge.sendCommand('AGITATOR ON', { waitForAck: false });
+      return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'AGITATOR ON' } };
+    }
+    case 'thrower-on': {
+      const result = await bridge.sendCommand('THROWER ON', { waitForAck: false });
+      return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'THROWER ON' } };
+    }
+    case 'relay-on': {
+      const result = await bridge.sendCommand('RELAY ON', { waitForAck: false });
+      return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'RELAY ON' } };
+    }
+    case 'safe-off': {
+      const commands = ['PCT:0', 'AGITATOR OFF', 'THROWER OFF', 'RELAY OFF'];
+      const steps = [];
+      for (const command of commands) {
+        const result = await bridge.sendCommand(command, { waitForAck: false });
+        steps.push({ command, ok: result.ok, status: result.status ?? null, error: result.error ?? null });
+        if (!result.ok) {
+          return { ok: false, actionId: resolved.id, result: { steps, failedCommand: command } };
+        }
+        await sleep(100);
+      }
+      return { ok: true, actionId: resolved.id, result: { steps } };
     }
     case 'lora-example-set': {
       const commands = [
@@ -1347,18 +1698,18 @@ async function runTestMenuAction(actionId, input = {}) {
         const result = await bridge.sendCommand(command, { waitForAck: false });
         steps.push({ command, ok: result.ok, status: result.status ?? null, error: result.error ?? null });
         if (!result.ok) {
-          return { ok: false, actionId, result: { steps, failedCommand: command } };
+          return { ok: false, actionId: resolved.id, result: { steps, failedCommand: command } };
         }
         await sleep(150);
       }
-      return { ok: true, actionId, result: { steps, lora: await bridge.refreshStatus() } };
+      return { ok: true, actionId: resolved.id, result: { steps, lora: await bridge.refreshStatus() } };
     }
     case 'mix-preset': {
       const mixText = String(input.mixText ?? '').trim();
       if (!mixText) {
         return {
           ok: false,
-          actionId,
+          actionId: resolved.id,
           result: { error: 'mixText is required for mix-preset' },
         };
       }
@@ -1366,7 +1717,7 @@ async function runTestMenuAction(actionId, input = {}) {
       const result = await bridge.sendCommand(command, { waitForAck: false });
       return {
         ok: result.ok,
-        actionId,
+        actionId: resolved.id,
         result: {
           ...result,
           command,
@@ -1378,14 +1729,14 @@ async function runTestMenuAction(actionId, input = {}) {
       if (!cmdText) {
         return {
           ok: false,
-          actionId,
+          actionId: resolved.id,
           result: { error: 'cmdText is required for raw-command' },
         };
       }
       const result = await bridge.sendCommand(cmdText, { waitForAck: false });
       return {
         ok: result.ok,
-        actionId,
+        actionId: resolved.id,
         result: {
           ...result,
           command: cmdText,
@@ -1395,8 +1746,8 @@ async function runTestMenuAction(actionId, input = {}) {
     default:
       return {
         ok: false,
-        actionId,
-        result: { error: `Unknown test action: ${actionId}` },
+        actionId: resolved.id,
+        result: { error: `Unknown test action: ${resolved.id}` },
       };
   }
 }
@@ -1877,45 +2228,11 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
 // Also pushes staged waypoints (from lastPath) to STM32, then sends AUTO.
 app.post(API.MISSION_START, requireApp, async (_req, res) => {
   try {
-    if (currentMissionState() !== MISSION_STATE.CONFIGURING) {
-      return res.status(409).json({ ok: false, error: 'Mission must be CONFIGURING before start' });
+    const result = await startMissionAction('mission.start');
+    if (!result.ok) {
+      return res.status(result.status ?? 500).json({ ok: false, error: result.error });
     }
-    if (pathHasZeroDispersion()) {
-      return res.status(409).json({ ok: false, error: 'Mission start blocked: path has 0% salt and 0% brine' });
-    }
-    const gpsStatus = getRobotGpsStatus();
-    if (!gpsStatus.ready) {
-      return res.status(409).json({ ok: false, error: `Mission start blocked: ${gpsStatus.reason}` });
-    }
-
-    const loraStatus = bridge.getStatus();
-
-    // Push waypoints if we have a path plan and no committed set yet.
-    if (loraStatus.wpPushState !== 'committed' && state.lastPath && state.lastPath.length > 0) {
-      const points = state.lastPath.map((p) => ({
-        lat:   p.lat,
-        lon:   p.lon,
-        salt:  p.salt  ?? 100,
-        brine: p.brine ?? 100,
-      }));
-      const pushResult = await bridge.pushWaypoints(points);
-      if (!pushResult.ok) {
-        return res.status(502).json({ ok: false, error: pushResult.error, sent: pushResult.sent });
-      }
-    }
-
-    if (bridge.getStatus().wpPushState !== 'committed') {
-      return res.status(409).json({ ok: false, error: 'Mission start requires a committed waypoint set' });
-    }
-
-    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.start', waitForAck: true, waitForState: true });
-    if (!dispatched.ok) {
-      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
-    }
-
-    const m = mission.start();
-    publishSupervision();
-    return res.json({ ok: true, mission: m });
+    return res.json({ ok: true, mission: result.mission });
   } catch (err) {
     return res.status(400).json({ ok: false, error: err.message });
   }
@@ -1925,16 +2242,11 @@ app.post(API.MISSION_START, requireApp, async (_req, res) => {
 app.post(API.MISSION_PAUSE, requireApp, async (req, res) => {
   const reason = req.body?.reason ?? null;
   try {
-    if (currentMissionState() !== MISSION_STATE.RUNNING) {
-      return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before pause' });
+    const result = await pauseMissionAction(reason, 'mission.pause');
+    if (!result.ok) {
+      return res.status(result.status ?? 500).json({ ok: false, error: result.error });
     }
-    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.pause', waitForAck: true, waitForState: true });
-    if (!dispatched.ok) {
-      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
-    }
-    const m = mission.pause(reason);
-    publishSupervision();
-    return res.json({ ok: true, mission: m });
+    return res.json({ ok: true, mission: result.mission });
   } catch (err) {
     return res.status(400).json({ ok: false, error: err.message });
   }
@@ -1943,23 +2255,11 @@ app.post(API.MISSION_PAUSE, requireApp, async (req, res) => {
 // POST /api/mission/resume  — transitions PAUSED → RUNNING
 app.post(API.MISSION_RESUME, requireApp, async (_req, res) => {
   try {
-    if (currentMissionState() !== MISSION_STATE.PAUSED) {
-      return res.status(409).json({ ok: false, error: 'Mission must be PAUSED before resume' });
+    const result = await resumeMissionAction('mission.resume');
+    if (!result.ok) {
+      return res.status(result.status ?? 500).json({ ok: false, error: result.error });
     }
-    const gpsStatus = getRobotGpsStatus();
-    if (!gpsStatus.ready) {
-      return res.status(409).json({ ok: false, error: `Mission resume blocked: ${gpsStatus.reason}` });
-    }
-    if (bridge.getStatus().wpPushState !== 'committed') {
-      return res.status(409).json({ ok: false, error: 'Mission resume requires committed waypoints' });
-    }
-    const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source: 'mission.resume', waitForAck: true, waitForState: true });
-    if (!dispatched.ok) {
-      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
-    }
-    const m = mission.resume();
-    publishSupervision();
-    return res.json({ ok: true, mission: m });
+    return res.json({ ok: true, mission: result.mission });
   } catch (err) {
     return res.status(400).json({ ok: false, error: err.message });
   }
@@ -1968,22 +2268,11 @@ app.post(API.MISSION_RESUME, requireApp, async (_req, res) => {
 // POST /api/mission/complete  — transitions RUNNING → COMPLETED  (operator-declared)
 app.post(API.MISSION_COMPLETE, requireApp, async (_req, res) => {
   try {
-    if (currentMissionState() !== MISSION_STATE.RUNNING) {
-      return res.status(409).json({ ok: false, error: 'Mission must be RUNNING before complete' });
+    const result = await completeMissionAction('mission.complete');
+    if (!result.ok) {
+      return res.status(result.status ?? 500).json({ ok: false, error: result.error });
     }
-    const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source: 'mission.complete', waitForAck: true, waitForState: true });
-    if (!dispatched.ok) {
-      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
-    }
-    const stats = state.coverage ? coverageStats(state.coverage) : {};
-    const m = mission.complete({
-      coveragePct: getCoveragePct(stats),
-      faultCount:  mission.publicMission()?.faultCount ?? 0,
-      cmdCount:    mission.publicMission()?.cmdCount   ?? 0,
-    });
-    bridge.resetWpState();
-    publishSupervision();
-    return res.json({ ok: true, mission: m });
+    return res.json({ ok: true, mission: result.mission });
   } catch (err) {
     return res.status(400).json({ ok: false, error: err.message });
   }
@@ -1993,22 +2282,11 @@ app.post(API.MISSION_COMPLETE, requireApp, async (_req, res) => {
 app.post(API.MISSION_ABORT, requireApp, async (req, res) => {
   const reason = req.body?.reason ?? 'operator';
   try {
-    if (![MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
-      return res.status(409).json({ ok: false, error: 'Mission must be RUNNING or PAUSED before abort' });
+    const result = await abortMissionAction(reason, 'mission.abort');
+    if (!result.ok) {
+      return res.status(result.status ?? 500).json({ ok: false, error: result.error });
     }
-    const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source: 'mission.abort', waitForAck: true, waitForState: true });
-    if (!dispatched.ok) {
-      return res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error });
-    }
-    const stats = state.coverage ? coverageStats(state.coverage) : {};
-    const m = mission.abort(reason, {
-      coveragePct: getCoveragePct(stats),
-      faultCount:  mission.publicMission()?.faultCount ?? 0,
-      cmdCount:    mission.publicMission()?.cmdCount   ?? 0,
-    });
-    bridge.resetWpState();
-    publishSupervision();
-    return res.json({ ok: true, mission: m });
+    return res.json({ ok: true, mission: result.mission });
   } catch (err) {
     return res.status(400).json({ ok: false, error: err.message });
   }
@@ -2090,6 +2368,11 @@ app.get(API.TEST_MENU, requireAppOrBoard, async (_req, res) => {
     tests: buildTestMenu(),
     lora: await bridge.refreshStatus(),
     gps: getRobotGpsStatus(),
+    mission: mission.publicMission(),
+    robot: state.robot,
+    safety: state.safety,
+    allowedActions: buildAllowedActions(),
+    alerts: buildAlerts(),
   });
 });
 
@@ -2104,32 +2387,10 @@ app.post(API.TEST_RUN, requireAppOrBoard, async (req, res) => {
 });
 
 app.post(API.LORA_PUSH_WP, requireApp, async (req, res) => {
-  if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
-    return res.status(409).json({ ok: false, error: 'Waypoint push allowed only while mission is CONFIGURING or PAUSED' });
-  }
-
-  let rawPoints = req.body?.points;
-  if (!rawPoints && state.lastPath && state.lastPath.length > 0) {
-    rawPoints = state.lastPath.map((p) => ({
-      lat:   p.lat,
-      lon:   p.lon,
-      salt:  p.salt  ?? 100,
-      brine: p.brine ?? 100,
-    }));
-  }
-  if (!rawPoints || !Array.isArray(rawPoints) || rawPoints.length === 0) {
-    return res.status(400).json({ ok: false, error: 'No points provided and no cached path plan' });
-  }
-  if (pathHasZeroDispersion(rawPoints)) {
-    return res.status(409).json({ ok: false, error: 'Waypoint push blocked: path has 0% salt and 0% brine' });
-  }
-  const result = await bridge.pushWaypoints(rawPoints);
+  const result = await pushPathWaypoints(req.body?.points, 'lora_bridge');
   if (!result.ok) {
-    return res.status(502).json({ ok: false, error: result.error, sent: result.sent });
+    return res.status(result.status ?? 500).json({ ok: false, error: result.error, sent: result.sent });
   }
-  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, { wpPushCount: result.sent, source: 'lora_bridge' });
-  publishSupervision();
-  publishOperator();
   return res.json({ ok: true, sent: result.sent });
 });
 
