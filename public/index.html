@@ -237,9 +237,97 @@
       padding-left: 8px;
     }
 
+    .test-workbench {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.95fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .test-workbench-main,
+    .test-workbench-side {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .section-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .section-card {
+      background: rgba(15, 23, 42, 0.48);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 12px;
+      padding: 14px;
+    }
+
+    .section-card.compact {
+      padding: 12px;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .section-title {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #94a3b8;
+    }
+
+    .section-copy {
+      color: #94a3b8;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .test-groups {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .test-group-card {
+      background: rgba(15, 23, 42, 0.44);
+      border: 1px solid rgba(148, 163, 184, 0.15);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .test-group-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .test-group-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #e2e8f0;
+    }
+
+    .test-group-count {
+      font-size: 11px;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+
     .test-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
       gap: 12px;
     }
 
@@ -307,9 +395,8 @@
     }
 
     .shortcut-help {
-      margin-top: 14px;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 10px;
     }
 
@@ -346,12 +433,12 @@
     }
 
     .test-result {
-      margin-top: 16px;
       background: rgba(15, 23, 42, 0.8);
       border: 1px solid rgba(148, 163, 184, 0.2);
       border-radius: 8px;
       padding: 14px;
-      min-height: 140px;
+      min-height: 96px;
+      max-height: 220px;
       overflow: auto;
       font-family: 'Monaco', 'Courier New', monospace;
       font-size: 12px;
@@ -360,7 +447,6 @@
     }
 
     .test-inputs {
-      margin-top: 14px;
       display: grid;
       grid-template-columns: minmax(180px, 1fr) auto;
       gap: 10px;
@@ -401,7 +487,6 @@
     }
 
     .mission-actions {
-      margin-top: 14px;
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
       gap: 10px;
@@ -423,9 +508,8 @@
     }
 
     .test-monitor {
-      margin-top: 16px;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
     }
 
@@ -472,7 +556,6 @@
     }
 
     .history-head {
-      margin-top: 16px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -487,6 +570,22 @@
       padding: 10px 12px;
       max-height: 220px;
       overflow: auto;
+    }
+
+    .stacked-history {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    @media (max-width: 1120px) {
+      .test-workbench {
+        grid-template-columns: 1fr;
+      }
+
+      .test-monitor {
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }
     }
 
     .history-item {
@@ -890,24 +989,75 @@
 
     <div class="card grid-2">
       <div class="card-title">Test Menu</div>
-      <div id="testMenu" class="test-grid">
-        <div style="color: #64748b; padding: 12px;">Loading test menu...</div>
+      <div class="test-workbench">
+        <div class="test-workbench-main">
+          <div class="section-card">
+            <div class="section-header">
+              <div>
+                <div class="section-title">Mission Actions</div>
+                <div class="section-copy">Run the main lifecycle checks first, then move into targeted subsystem tests.</div>
+              </div>
+            </div>
+            <div class="mission-actions" id="missionActions"></div>
+          </div>
+          <div id="testInputs" class="section-card compact"></div>
+          <div class="section-card">
+            <div class="section-header">
+              <div>
+                <div class="section-title">Subsystem Tests</div>
+                <div class="section-copy">Grouped by system so it is easier to scan and run individual checks.</div>
+              </div>
+            </div>
+            <div id="testMenu" class="test-groups">
+              <div style="color: #64748b; padding: 12px;">Loading test menu...</div>
+            </div>
+          </div>
+        </div>
+        <div class="test-workbench-side">
+          <div class="section-card">
+            <div class="section-header">
+              <div>
+                <div class="section-title">Live Monitor</div>
+                <div class="section-copy">Connection, mission, and GPS readiness in one place.</div>
+              </div>
+            </div>
+            <div id="testMonitor" class="test-monitor"></div>
+          </div>
+          <div class="section-card compact">
+            <div class="section-header">
+              <div class="section-title">Active Alerts</div>
+            </div>
+            <div id="controllerAlerts" class="controller-notes"></div>
+          </div>
+          <div class="section-card compact">
+            <div class="section-header">
+              <div class="section-title">Shortcut Help</div>
+            </div>
+            <div id="shortcutHelp" class="shortcut-help"></div>
+          </div>
+          <div class="section-card compact">
+            <div class="section-header">
+              <div class="section-title">Test Result</div>
+            </div>
+            <div id="testResult" class="test-result">Select a test to run it from the server.</div>
+          </div>
+          <div class="section-card compact stacked-history">
+            <div>
+              <div class="history-head">
+                <div class="section-title">Recent Commands</div>
+              </div>
+              <div id="commandHistory" class="history-list">No commands yet.</div>
+            </div>
+            <div>
+              <div class="history-head">
+                <div class="section-title">Recent Test Runs</div>
+                <button class="test-run-button" style="padding: 8px 12px;" onclick="repeatLastTest()">Repeat Last Test</button>
+              </div>
+              <div id="testHistory" class="history-list">No test runs yet.</div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div id="shortcutHelp" class="shortcut-help"></div>
-      <div class="mission-actions" id="missionActions"></div>
-      <div id="testInputs"></div>
-      <div id="testMonitor" class="test-monitor"></div>
-      <div id="controllerAlerts" class="controller-notes"></div>
-      <div class="history-head">
-        <div class="card-title" style="margin-bottom: 0;">Recent Commands</div>
-      </div>
-      <div id="commandHistory" class="history-list">No commands yet.</div>
-      <div class="history-head">
-        <div class="card-title" style="margin-bottom: 0;">Recent Test Runs</div>
-        <button class="test-run-button" style="padding: 8px 12px;" onclick="repeatLastTest()">Repeat Last Test</button>
-      </div>
-      <div id="testHistory" class="history-list">No test runs yet.</div>
-      <div id="testResult" class="test-result">Select a test to run it from the server.</div>
     </div>
 
     <!-- Event Log (spans full width on medium+ screens) -->
@@ -1152,11 +1302,28 @@
         return;
       }
 
-      container.innerHTML = testMenu.map(test => `
-        <button class="test-button ${test.caution || 'safe'}" onclick="${test.needsInput ? `showTestInputs('${test.id}')` : `runTestAction('${test.id}')`}">
-          <div class="test-button-title">${test.title}${test.shortcut ? `<span class="shortcut-chip">${test.shortcut}</span>` : ''}</div>
-          <div class="test-button-copy">${test.description || ''}</div>
-        </button>
+      const groups = {};
+      for (const test of testMenu) {
+        const groupName = test.group || 'Other';
+        if (!groups[groupName]) groups[groupName] = [];
+        groups[groupName].push(test);
+      }
+
+      container.innerHTML = Object.entries(groups).map(([groupName, items]) => `
+        <div class="test-group-card">
+          <div class="test-group-head">
+            <div class="test-group-title">${groupName}</div>
+            <div class="test-group-count">${items.length} item${items.length === 1 ? '' : 's'}</div>
+          </div>
+          <div class="test-grid">
+            ${items.map(test => `
+              <button class="test-button ${test.caution || 'safe'}" onclick="${test.needsInput ? `showTestInputs('${test.id}')` : `runTestAction('${test.id}')`}">
+                <div class="test-button-title">${test.title}${test.shortcut ? `<span class="shortcut-chip">${test.shortcut}</span>` : ''}</div>
+                <div class="test-button-copy">${test.description || ''}</div>
+              </button>
+            `).join('')}
+          </div>
+        </div>
       `).join('');
 
       renderShortcutHelp();
