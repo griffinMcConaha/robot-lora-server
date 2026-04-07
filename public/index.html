@@ -313,7 +313,7 @@
 
     .test-workbench-side {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 14px;
       align-items: start;
     }
@@ -669,11 +669,17 @@
 
     @media (max-width: 1120px) {
       .test-workbench-side {
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
 
       .test-monitor {
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }
+    }
+
+    @media (max-width: 780px) {
+      .test-workbench-side {
+        grid-template-columns: 1fr;
       }
     }
 
@@ -1071,9 +1077,32 @@
       </div>
     </div>
 
-    <div class="card grid-2">
+    <div class="card grid-3">
       <div class="card-title">Test Menu</div>
       <div class="test-workbench">
+        <div class="test-workbench-main">
+          <div class="section-card">
+            <div class="section-header">
+              <div>
+                <div class="section-title">Mission Actions</div>
+                <div class="section-copy">Run the main lifecycle checks first, then move into targeted subsystem tests.</div>
+              </div>
+            </div>
+            <div class="mission-actions" id="missionActions"></div>
+          </div>
+          <div id="testInputs" class="section-card compact"></div>
+          <div class="section-card">
+            <div class="section-header">
+              <div>
+                <div class="section-title">Subsystem Tests</div>
+                <div class="section-copy">Grouped by system so it is easier to scan and run individual checks.</div>
+              </div>
+            </div>
+            <div id="testMenu" class="test-groups">
+              <div style="color: #64748b; padding: 12px;">Loading test menu...</div>
+            </div>
+          </div>
+        </div>
         <div class="test-workbench-side">
           <div class="section-card">
             <div class="section-header">
@@ -1115,29 +1144,6 @@
                 <button class="test-run-button" style="padding: 8px 12px;" onclick="repeatLastTest()">Repeat Last Test</button>
               </div>
               <div id="testHistory" class="history-list">No test runs yet.</div>
-            </div>
-          </div>
-        </div>
-        <div class="test-workbench-main">
-          <div class="section-card">
-            <div class="section-header">
-              <div>
-                <div class="section-title">Mission Actions</div>
-                <div class="section-copy">Run the main lifecycle checks first, then move into targeted subsystem tests.</div>
-              </div>
-            </div>
-            <div class="mission-actions" id="missionActions"></div>
-          </div>
-          <div id="testInputs" class="section-card compact"></div>
-          <div class="section-card">
-            <div class="section-header">
-              <div>
-                <div class="section-title">Subsystem Tests</div>
-                <div class="section-copy">Grouped by system so it is easier to scan and run individual checks.</div>
-              </div>
-            </div>
-            <div id="testMenu" class="test-groups">
-              <div style="color: #64748b; padding: 12px;">Loading test menu...</div>
             </div>
           </div>
         </div>
