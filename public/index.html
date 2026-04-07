@@ -298,10 +298,9 @@
     }
 
     .test-workbench {
-      display: grid;
-      grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.95fr);
-      gap: 18px;
-      align-items: start;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
     }
 
     .test-workbench-main,
@@ -313,12 +312,14 @@
     }
 
     .test-workbench-side {
-      position: sticky;
-      top: 12px;
-      align-self: start;
-      max-height: calc(100vh - 28px);
-      overflow-y: auto;
-      padding-right: 4px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+
+    .test-workbench-side .section-card:last-child {
+      grid-column: 1 / -1;
     }
 
     .section-stack {
@@ -365,15 +366,30 @@
       display: flex;
       flex-direction: column;
       gap: 12px;
-      max-height: calc(100vh - 330px);
-      overflow-y: auto;
-      padding-right: 4px;
     }
 
     .test-group-card {
       background: rgba(15, 23, 42, 0.44);
       border: 1px solid rgba(148, 163, 184, 0.15);
       border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .test-group-toggle {
+      list-style: none;
+      cursor: pointer;
+      padding: 12px;
+    }
+
+    .test-group-toggle::-webkit-details-marker {
+      display: none;
+    }
+
+    .test-group-card[open] .test-group-toggle {
+      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+    }
+
+    .test-group-body {
       padding: 12px;
     }
 
@@ -652,21 +668,8 @@
     }
 
     @media (max-width: 1120px) {
-      .test-workbench {
-        grid-template-columns: 1fr;
-      }
-
       .test-workbench-side {
-        position: static;
-        max-height: none;
-        overflow: visible;
-        padding-right: 0;
-      }
-
-      .test-groups {
-        max-height: none;
-        overflow: visible;
-        padding-right: 0;
+        grid-template-columns: 1fr;
       }
 
       .test-monitor {
@@ -1071,6 +1074,50 @@
     <div class="card grid-2">
       <div class="card-title">Test Menu</div>
       <div class="test-workbench">
+        <div class="test-workbench-side">
+          <div class="section-card">
+            <div class="section-header">
+              <div>
+                <div class="section-title">Live Monitor</div>
+                <div class="section-copy">Connection, mission, and GPS readiness in one place.</div>
+              </div>
+            </div>
+            <div id="testMonitor" class="test-monitor"></div>
+          </div>
+          <div class="section-card compact">
+            <div class="section-header">
+              <div class="section-title">Active Alerts</div>
+            </div>
+            <div id="controllerAlerts" class="controller-notes"></div>
+          </div>
+          <div class="section-card compact">
+            <div class="section-header">
+              <div class="section-title">Test Result</div>
+            </div>
+            <div id="testResult" class="test-result">Select a test to run it from the server.</div>
+          </div>
+          <div class="section-card compact">
+            <div class="section-header">
+              <div class="section-title">Shortcut Help</div>
+            </div>
+            <div id="shortcutHelp" class="shortcut-help"></div>
+          </div>
+          <div class="section-card compact stacked-history">
+            <div>
+              <div class="history-head">
+                <div class="section-title">Recent Commands</div>
+              </div>
+              <div id="commandHistory" class="history-list">No commands yet.</div>
+            </div>
+            <div>
+              <div class="history-head">
+                <div class="section-title">Recent Test Runs</div>
+                <button class="test-run-button" style="padding: 8px 12px;" onclick="repeatLastTest()">Repeat Last Test</button>
+              </div>
+              <div id="testHistory" class="history-list">No test runs yet.</div>
+            </div>
+          </div>
+        </div>
         <div class="test-workbench-main">
           <div class="section-card">
             <div class="section-header">
@@ -1091,50 +1138,6 @@
             </div>
             <div id="testMenu" class="test-groups">
               <div style="color: #64748b; padding: 12px;">Loading test menu...</div>
-            </div>
-          </div>
-        </div>
-        <div class="test-workbench-side">
-          <div class="section-card">
-            <div class="section-header">
-              <div>
-                <div class="section-title">Live Monitor</div>
-                <div class="section-copy">Connection, mission, and GPS readiness in one place.</div>
-              </div>
-            </div>
-            <div id="testMonitor" class="test-monitor"></div>
-          </div>
-          <div class="section-card compact">
-            <div class="section-header">
-              <div class="section-title">Active Alerts</div>
-            </div>
-            <div id="controllerAlerts" class="controller-notes"></div>
-          </div>
-          <div class="section-card compact">
-            <div class="section-header">
-              <div class="section-title">Shortcut Help</div>
-            </div>
-            <div id="shortcutHelp" class="shortcut-help"></div>
-          </div>
-          <div class="section-card compact">
-            <div class="section-header">
-              <div class="section-title">Test Result</div>
-            </div>
-            <div id="testResult" class="test-result">Select a test to run it from the server.</div>
-          </div>
-          <div class="section-card compact stacked-history">
-            <div>
-              <div class="history-head">
-                <div class="section-title">Recent Commands</div>
-              </div>
-              <div id="commandHistory" class="history-list">No commands yet.</div>
-            </div>
-            <div>
-              <div class="history-head">
-                <div class="section-title">Recent Test Runs</div>
-                <button class="test-run-button" style="padding: 8px 12px;" onclick="repeatLastTest()">Repeat Last Test</button>
-              </div>
-              <div id="testHistory" class="history-list">No test runs yet.</div>
             </div>
           </div>
         </div>
@@ -1390,21 +1393,26 @@
         groups[groupName].push(test);
       }
 
-      container.innerHTML = Object.entries(groups).map(([groupName, items]) => `
-        <div class="test-group-card">
-          <div class="test-group-head">
-            <div class="test-group-title">${groupName}</div>
-            <div class="test-group-count">${items.length} item${items.length === 1 ? '' : 's'}</div>
+      const preferredOpenGroups = new Set(['Mission', 'System', 'Modes', 'Drive']);
+      container.innerHTML = Object.entries(groups).map(([groupName, items], index) => `
+        <details class="test-group-card" ${preferredOpenGroups.has(groupName) || index < 2 ? 'open' : ''}>
+          <summary class="test-group-toggle">
+            <div class="test-group-head">
+              <div class="test-group-title">${groupName}</div>
+              <div class="test-group-count">${items.length} item${items.length === 1 ? '' : 's'}</div>
+            </div>
+          </summary>
+          <div class="test-group-body">
+            <div class="test-grid">
+              ${items.map(test => `
+                <button class="test-button ${test.caution || 'safe'}" onclick="${test.needsInput ? `showTestInputs('${test.id}')` : `runTestAction('${test.id}')`}">
+                  <div class="test-button-title">${test.title}${test.shortcut ? `<span class="shortcut-chip">${test.shortcut}</span>` : ''}</div>
+                  <div class="test-button-copy">${test.description || ''}</div>
+                </button>
+              `).join('')}
+            </div>
           </div>
-          <div class="test-grid">
-            ${items.map(test => `
-              <button class="test-button ${test.caution || 'safe'}" onclick="${test.needsInput ? `showTestInputs('${test.id}')` : `runTestAction('${test.id}')`}">
-                <div class="test-button-title">${test.title}${test.shortcut ? `<span class="shortcut-chip">${test.shortcut}</span>` : ''}</div>
-                <div class="test-button-copy">${test.description || ''}</div>
-              </button>
-            `).join('')}
-          </div>
-        </div>
+        </details>
       `).join('');
 
       renderShortcutHelp();
