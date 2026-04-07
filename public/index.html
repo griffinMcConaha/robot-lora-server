@@ -16,12 +16,12 @@
       background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
       color: #e2e8f0;
       min-height: 100vh;
-      padding: 20px;
+      padding: 16px;
     }
 
     header {
-      max-width: 1400px;
-      margin: 0 auto 30px;
+      max-width: 1600px;
+      margin: 0 auto 20px;
       text-align: center;
     }
 
@@ -40,11 +40,11 @@
     }
 
     .container {
-      max-width: 1400px;
+      max-width: 1600px;
       margin: 0 auto;
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 20px;
+      gap: 16px;
     }
 
     .card {
@@ -52,7 +52,7 @@
       backdrop-filter: blur(10px);
       border: 1px solid rgba(148, 163, 184, 0.2);
       border-radius: 12px;
-      padding: 20px;
+      padding: 16px;
       transition: all 0.3s ease;
     }
 
@@ -67,7 +67,7 @@
       text-transform: uppercase;
       letter-spacing: 0.5px;
       color: #94a3b8;
-      margin-bottom: 16px;
+      margin-bottom: 12px;
       display: flex;
       align-items: center;
       gap: 8px;
@@ -100,7 +100,7 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 12px 0;
+      padding: 8px 0;
       border-bottom: 1px solid rgba(148, 163, 184, 0.1);
     }
 
@@ -114,7 +114,7 @@
     }
 
     .stat-value {
-      font-size: 18px;
+      font-size: 16px;
       font-weight: 600;
       color: #60a5fa;
       font-family: 'Monaco', 'Courier New', monospace;
@@ -159,7 +159,7 @@
       border: 1px solid rgba(148, 163, 184, 0.2);
       border-radius: 8px;
       padding: 16px;
-      max-height: 300px;
+      max-height: 220px;
       overflow-y: auto;
       font-family: 'Monaco', 'Courier New', monospace;
       font-size: 12px;
@@ -221,8 +221,16 @@
       grid-column: span 2;
     }
 
+    .grid-3 {
+      grid-column: span 3;
+    }
+
     @media (max-width: 768px) {
       .grid-2 {
+        grid-column: span 1;
+      }
+
+      .grid-3 {
         grid-column: span 1;
       }
 
@@ -235,6 +243,58 @@
       font-size: 12px;
       color: #64748b;
       padding-left: 8px;
+    }
+
+    .overview-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .overview-tile {
+      background: rgba(15, 23, 42, 0.55);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 10px;
+      padding: 10px 12px;
+      min-width: 0;
+    }
+
+    .overview-title {
+      font-size: 11px;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.45px;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+
+    .overview-main {
+      font-size: 16px;
+      font-weight: 700;
+      color: #f8fafc;
+      margin-bottom: 8px;
+    }
+
+    .overview-subgrid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 12px;
+    }
+
+    .overview-metric-label {
+      font-size: 11px;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin-bottom: 2px;
+    }
+
+    .overview-metric-value {
+      font-size: 13px;
+      color: #cbd5e1;
+      font-weight: 600;
+      line-height: 1.35;
+      word-break: break-word;
     }
 
     .test-workbench {
@@ -252,6 +312,15 @@
       min-width: 0;
     }
 
+    .test-workbench-side {
+      position: sticky;
+      top: 12px;
+      align-self: start;
+      max-height: calc(100vh - 28px);
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+
     .section-stack {
       display: flex;
       flex-direction: column;
@@ -263,6 +332,7 @@
       border: 1px solid rgba(148, 163, 184, 0.16);
       border-radius: 12px;
       padding: 14px;
+      min-width: 0;
     }
 
     .section-card.compact {
@@ -295,6 +365,9 @@
       display: flex;
       flex-direction: column;
       gap: 12px;
+      max-height: calc(100vh - 330px);
+      overflow-y: auto;
+      padding-right: 4px;
     }
 
     .test-group-card {
@@ -489,7 +562,7 @@
     .mission-actions {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 10px;
+      gap: 8px;
     }
 
     .mission-button {
@@ -497,7 +570,7 @@
       background: rgba(15, 23, 42, 0.75);
       color: #e2e8f0;
       border-radius: 10px;
-      padding: 12px;
+      padding: 10px;
       cursor: pointer;
       font-weight: 700;
       text-align: center;
@@ -510,14 +583,14 @@
     .test-monitor {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
+      gap: 10px;
     }
 
     .monitor-card {
       background: rgba(15, 23, 42, 0.55);
       border: 1px solid rgba(148, 163, 184, 0.16);
       border-radius: 10px;
-      padding: 12px;
+      padding: 10px;
     }
 
     .monitor-card.ok {
@@ -583,8 +656,31 @@
         grid-template-columns: 1fr;
       }
 
+      .test-workbench-side {
+        position: static;
+        max-height: none;
+        overflow: visible;
+        padding-right: 0;
+      }
+
+      .test-groups {
+        max-height: none;
+        overflow: visible;
+        padding-right: 0;
+      }
+
       .test-monitor {
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }
+    }
+
+    @media (max-width: 900px) {
+      .overview-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .overview-subgrid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
 
@@ -622,21 +718,21 @@
     .controller-panel {
       display: grid;
       grid-template-columns: minmax(240px, 320px) 1fr;
-      gap: 16px;
+      gap: 12px;
       align-items: start;
     }
 
     .controller-status {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
+      gap: 8px;
     }
 
     .controller-status-card {
       background: rgba(15, 23, 42, 0.55);
       border: 1px solid rgba(148, 163, 184, 0.16);
       border-radius: 10px;
-      padding: 10px 12px;
+      padding: 9px 10px;
     }
 
     .controller-status-card.ok {
@@ -664,15 +760,15 @@
 
     .controller-status-value {
       color: #f8fafc;
-      font-size: 15px;
+      font-size: 14px;
       font-weight: 700;
     }
 
     .controller-action-row {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
-      margin-top: 14px;
+      gap: 8px;
+      margin-top: 10px;
     }
 
     .controller-button {
@@ -680,7 +776,7 @@
       background: rgba(15, 23, 42, 0.78);
       color: #e2e8f0;
       border-radius: 12px;
-      padding: 12px 14px;
+      padding: 10px 8px;
       cursor: pointer;
       font-weight: 700;
       text-align: center;
@@ -730,10 +826,10 @@
     .drive-pad {
       display: grid;
       grid-template-columns: repeat(3, minmax(72px, 1fr));
-      gap: 10px;
+      gap: 8px;
       justify-items: stretch;
       max-width: 320px;
-      margin-top: 14px;
+      margin-top: 10px;
     }
 
     .drive-pad .spacer {
@@ -750,14 +846,14 @@
     }
 
     .controller-notes {
-      margin-top: 14px;
+      margin-top: 10px;
       color: #94a3b8;
       font-size: 12px;
       line-height: 1.5;
     }
 
     .controller-banner {
-      margin-top: 14px;
+      margin-top: 10px;
       border-radius: 12px;
       padding: 12px 14px;
       border: 1px solid rgba(148, 163, 184, 0.18);
@@ -823,101 +919,86 @@
   </header>
 
   <div class="container">
-    <!-- Mission Status -->
-    <div class="card">
+    <div class="card grid-3">
       <div class="card-title">
         <span class="status-indicator active"></span>
-        Mission State
+        Operations Overview
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Current Mode</span>
-        <span class="stat-value" id="missionState">—</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Status</span>
-        <div id="missionStatus"></div>
-      </div>
-    </div>
-
-    <!-- Robot Position -->
-    <div class="card">
-      <div class="card-title">
-        <span class="status-indicator"></span>
-        Robot Position
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Latitude</span>
-        <span class="stat-value" id="robotLat">—</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Longitude</span>
-        <span class="stat-value" id="robotLon">—</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Last Seen</span>
-        <span class="stat-value" id="robotLastSeen">—</span>
-      </div>
-    </div>
-
-    <!-- Coverage Stats -->
-    <div class="card">
-      <div class="card-title">
-        <span class="status-indicator active"></span>
-        Coverage Progress
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Covered Cells</span>
-        <span class="stat-value" id="coveredCells">—</span>
-      </div>
-      <div class="progress-bar">
-        <div class="progress-fill" id="coverageProgress" style="width: 0%"></div>
-      </div>
-      <div class="stat-row" style="margin-top: 8px;">
-        <span class="stat-label">Coverage %</span>
-        <span class="stat-value" id="coveragePercent">0%</span>
-      </div>
-    </div>
-
-    <!-- Telemetry -->
-    <div class="card">
-      <div class="card-title">Telemetry</div>
-      <div class="stat-row">
-        <span class="stat-label">Battery Voltage</span>
-        <span class="stat-value" id="batteryVoltage">—</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Motor Current</span>
-        <span class="stat-value" id="motorCurrent">—</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Temperature</span>
-        <span class="stat-value" id="temperature">—</span>
-      </div>
-    </div>
-
-    <!-- Trail Statistics -->
-    <div class="card">
-      <div class="card-title">Trail Statistics</div>
-      <div class="stat-row">
-        <span class="stat-label">Trail Points</span>
-        <span class="stat-value" id="trailPoints">0</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Distance Traveled</span>
-        <span class="stat-value" id="distanceTraveled">—</span>
-      </div>
-    </div>
-
-    <!-- Latest Commands -->
-    <div class="card">
-      <div class="card-title">Last Command</div>
-      <div class="stat-row">
-        <span class="stat-label">Command</span>
-        <span class="stat-value" id="lastCommand">—</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Sent At</span>
-        <span class="stat-value" id="lastCommandTime">—</span>
+      <div class="overview-grid">
+        <div class="overview-tile">
+          <div class="overview-title">Mission</div>
+          <div class="overview-main" id="missionState">—</div>
+          <div id="missionStatus"></div>
+        </div>
+        <div class="overview-tile">
+          <div class="overview-title">Robot Position</div>
+          <div class="overview-subgrid">
+            <div>
+              <div class="overview-metric-label">Latitude</div>
+              <div class="overview-metric-value" id="robotLat">—</div>
+            </div>
+            <div>
+              <div class="overview-metric-label">Longitude</div>
+              <div class="overview-metric-value" id="robotLon">—</div>
+            </div>
+            <div>
+              <div class="overview-metric-label">Last Seen</div>
+              <div class="overview-metric-value" id="robotLastSeen">—</div>
+            </div>
+          </div>
+        </div>
+        <div class="overview-tile">
+          <div class="overview-title">Coverage</div>
+          <div class="overview-main" id="coveragePercent">0%</div>
+          <div class="overview-metric-label">Covered Cells</div>
+          <div class="overview-metric-value" id="coveredCells">—</div>
+          <div class="progress-bar">
+            <div class="progress-fill" id="coverageProgress" style="width: 0%"></div>
+          </div>
+        </div>
+        <div class="overview-tile">
+          <div class="overview-title">Telemetry</div>
+          <div class="overview-subgrid">
+            <div>
+              <div class="overview-metric-label">Battery</div>
+              <div class="overview-metric-value" id="batteryVoltage">—</div>
+            </div>
+            <div>
+              <div class="overview-metric-label">Motor Current</div>
+              <div class="overview-metric-value" id="motorCurrent">—</div>
+            </div>
+            <div>
+              <div class="overview-metric-label">Temperature</div>
+              <div class="overview-metric-value" id="temperature">—</div>
+            </div>
+          </div>
+        </div>
+        <div class="overview-tile">
+          <div class="overview-title">Trail</div>
+          <div class="overview-subgrid">
+            <div>
+              <div class="overview-metric-label">Trail Points</div>
+              <div class="overview-metric-value" id="trailPoints">0</div>
+            </div>
+            <div>
+              <div class="overview-metric-label">Distance</div>
+              <div class="overview-metric-value" id="distanceTraveled">—</div>
+            </div>
+          </div>
+        </div>
+        <div class="overview-tile">
+          <div class="overview-title">Last Command</div>
+          <div class="overview-subgrid">
+            <div>
+              <div class="overview-metric-label">Command</div>
+              <div class="overview-metric-value" id="lastCommand">—</div>
+            </div>
+            <div>
+              <div class="overview-metric-label">Sent At</div>
+              <div class="overview-metric-value" id="lastCommandTime">—</div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 

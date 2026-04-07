@@ -13,7 +13,7 @@ const {
   withinGrid,
   gridCellPolygon,
 } = require('./coverage');
-const { latLonToLocal } = require('./geo');
+const { latLonToLocal, localToLatLon } = require('./geo');
 const { findPath, findCoveragePath } = require('./pathing');
 const {
   createOperatorState,
@@ -146,6 +146,15 @@ const state = {
     geofenceFailsafeAt: 0,
     geofenceFailsafeAction: null,
     geofenceFailsafeReason: null,
+  },
+  demo: {
+    enabled: false,
+    updatedAt: 0,
+    source: 'default',
+    spots: {
+      start: null,
+      end: null,
+    },
   },
   operator: createOperatorState(),
   persistence: {
@@ -290,6 +299,7 @@ function buildRuntimeSnapshot(reason = 'unspecified') {
         : [],
       lastFault: cloneJsonSafe(state.lastFault, null),
       safety: cloneJsonSafe(state.safety, {}),
+      demo: cloneJsonSafe(state.demo, { enabled: false, updatedAt: 0, source: 'default', spots: { start: null, end: null } }),
       operator: cloneJsonSafe({
         workflowAcks: state.operator.workflowAcks,
         notes: state.operator.notes,
@@ -360,6 +370,14 @@ function restoreRuntimeState() {
   state.safety = {
     ...state.safety,
     ...(cloneJsonSafe(saved?.safety, {}) ?? {}),
+  };
+  state.demo = {
+    ...state.demo,
+    ...(cloneJsonSafe(saved?.demo, {}) ?? {}),
+    spots: {
+      ...(state.demo?.spots ?? { start: null, end: null }),
+      ...((cloneJsonSafe(saved?.demo?.spots, {}) ?? {})),
+    },
   };
   state.operator = createOperatorState();
   state.operator.workflowAcks = cloneJsonSafe(saved?.operator?.workflowAcks, {});
@@ -524,6 +542,28 @@ function getRobotGpsStatus(robot = state.robot) {
     }
   }
   return { ready: true, reason: null };
+}
+
+function getDemoSpotGpsStatus(spot, label) {
+  const robot = spot?.robot ?? null;
+  if (!robot) {
+    return { ready: false, reason: `${label} has no saved robot telemetry` };
+  }
+  const gpsStatus = getRobotGpsStatus(robot);
+  if (gpsStatus.ready) {
+    return gpsStatus;
+  }
+  return {
+    ready: false,
+    reason: `${label}: ${gpsStatus.reason}`,
+  };
+}
+
+function getDemoSpotStatuses() {
+  return {
+    start: getDemoSpotGpsStatus(state.demo?.spots?.start, 'Spot A'),
+    end: getDemoSpotGpsStatus(state.demo?.spots?.end, 'Spot B'),
+  };
 }
 
 function resolveTelemetryFailsafeAction() {
@@ -746,11 +786,13 @@ function buildAllowedActions() {
     zeroDispersionPath: pathHasZeroDispersion(),
     gpsReady: gpsStatus.ready,
     gpsReason: gpsStatus.reason,
+    demoModeEnabled: Boolean(state.demo?.enabled),
   });
 }
 
 function buildAlerts(now = Date.now()) {
   const gpsStatus = getRobotGpsStatus();
+  const connectivity = buildConnectionState(now);
   return buildSupervisionAlerts({
     missionState: currentMissionState(),
     wpPushState: bridge.getStatus().wpPushState,
@@ -759,10 +801,12 @@ function buildAlerts(now = Date.now()) {
     zeroDispersionPath: pathHasZeroDispersion(),
     gpsReady: gpsStatus.ready,
     gpsReason: gpsStatus.reason,
+    demoModeEnabled: Boolean(state.demo?.enabled),
     telemetryStale: isTelemetryStale(now),
     telemetryAge: telemetryAgeMs(now),
     lastFault: state.lastFault,
     safety: state.safety,
+    recovery: connectivity.recovery,
     now,
   });
 }
@@ -787,6 +831,16 @@ function buildConnectionState(now = Date.now()) {
   const missionState = currentMissionState();
   const baseStationReachable = bridgeStatus.baseStation?.statusOk === true;
   const robotReachable = Boolean(state.robot);
+  const selectedBaseUrl = String(bridgeStatus.baseStation?.selectedUrl ?? bridgeStatus.baseStationUrl ?? '').toLowerCase();
+  const discoverySource = String(bridgeStatus.baseStation?.discoverySource ?? '').toLowerCase();
+  const baseStationPath = discoverySource === 'mdns'
+    ? 'field_network'
+    : (selectedBaseUrl.includes('192.168.4.1') || selectedBaseUrl.includes('base-station.local')
+      ? 'direct_backup'
+      : 'field_network');
+  const baseStationPathLabel = discoverySource === 'mdns'
+    ? 'Field network (auto)'
+    : (baseStationPath === 'direct_backup' ? 'Direct backup' : 'Field network');
 
   const backend = {
     state: dbOk ? CONNECTION_STATE.ONLINE : CONNECTION_STATE.DEGRADED,
@@ -810,6 +864,12 @@ function buildConnectionState(now = Date.now()) {
   const baseStation = {
     state: baseStationState,
     reachable: baseStationReachable,
+    connectionPath: baseStationPath,
+    connectionPathLabel: baseStationPathLabel,
+    discoverySource: bridgeStatus.baseStation?.discoverySource ?? null,
+    mdnsEnabled: bridgeStatus.baseStation?.mdnsEnabled ?? false,
+    mdnsNames: bridgeStatus.baseStation?.mdnsNames ?? [],
+    mdnsServices: bridgeStatus.baseStation?.mdnsServices ?? [],
     mode: bridgeStatus.baseStation?.mode ?? null,
     stationState: bridgeStatus.baseStation?.state ?? null,
     statusVersion: bridgeStatus.baseStation?.statusVersion ?? null,
@@ -870,6 +930,29 @@ function buildConnectionState(now = Date.now()) {
     missionState,
   };
 
+  const hasRecoverablePath = Array.isArray(state.lastPath) && state.lastPath.length > 1;
+  const robotMode = String(state.robot?.state ?? '').toUpperCase();
+  const missionRecoveryNeeded =
+    hasRecoverablePath &&
+    [MISSION_STATE.CONFIGURING, MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(missionState) &&
+    (
+      !robotReachable ||
+      bridgeStatus.wpPushState !== 'committed' ||
+      (missionState === MISSION_STATE.RUNNING && robotMode !== 'AUTO') ||
+      (missionState === MISSION_STATE.PAUSED && !['PAUSE', 'ERROR', 'ESTOP'].includes(robotMode))
+    );
+  const missionRecoveryReason = missionRecoveryNeeded
+    ? (
+      !robotReachable
+        ? 'Robot telemetry must reconnect before the mission can continue'
+        : bridgeStatus.wpPushState !== 'committed'
+          ? 'The mission path should be re-committed to the robot'
+          : missionState === MISSION_STATE.RUNNING
+            ? `The backend expected AUTO but the robot reports ${robotMode || 'UNKNOWN'}`
+            : `The backend expected a paused mission but the robot reports ${robotMode || 'UNKNOWN'}`
+    )
+    : null;
+
   let overallState = CONNECTION_STATE.ONLINE;
   let reason = null;
   if (!dbOk) {
@@ -898,11 +981,20 @@ function buildConnectionState(now = Date.now()) {
       ready: overallState === CONNECTION_STATE.ONLINE,
       reason,
       missionState,
+      connectionPath: baseStationPath,
+      connectionPathLabel: baseStationPathLabel,
     },
     backend,
     baseStation,
     robot,
     commandPath,
+    recovery: {
+      needed: missionRecoveryNeeded,
+      reason: missionRecoveryReason,
+      lastPathPoints: hasRecoverablePath ? state.lastPath.length : 0,
+      wpPushState: bridgeStatus.wpPushState ?? null,
+      robotState: state.robot?.state ?? null,
+    },
   };
 }
 
@@ -910,6 +1002,7 @@ function buildSupervisionSummary() {
   const now = Date.now();
   const robotAgeMs = telemetryAgeMs(now);
   const gpsStatus = getRobotGpsStatus();
+  const connectivity = buildConnectionState(now);
   return {
     mission: mission.publicMission(),
     lora: bridge.getStatus(),
@@ -949,7 +1042,14 @@ function buildSupervisionSummary() {
       geofenceFailsafeReason: state.safety.geofenceFailsafeReason,
       geofenceFailsafeCooldownMs: GEOFENCE_FAILSAFE_COOLDOWN_MS,
     },
-    connectivity: buildConnectionState(now),
+    demo: {
+      enabled: Boolean(state.demo?.enabled),
+      updatedAt: state.demo?.updatedAt || null,
+      source: state.demo?.source ?? 'default',
+      spots: state.demo?.spots ?? { start: null, end: null },
+      spotGpsStatus: getDemoSpotStatuses(),
+    },
+    connectivity,
     alerts: buildAlerts(now),
     allowedActions: buildAllowedActions(),
     workflows: buildOperatorWorkflows(),
@@ -1220,6 +1320,7 @@ function publishOperator() {
   publish(WS_EVENT.OPERATOR_UPDATED, {
     workflows: buildOperatorWorkflows(),
     notes: state.operator.notes,
+    demo: state.demo,
   });
 }
 
@@ -1378,6 +1479,224 @@ async function waitForRobotState(expectedState, options = {}) {
   };
 }
 
+function setDemoMode(enabled, source = 'operator') {
+  state.demo = {
+    ...state.demo,
+    enabled: Boolean(enabled),
+    updatedAt: Date.now(),
+    source,
+  };
+  publishOperator();
+  publishSupervision();
+  scheduleRuntimeStateSave('demo-mode.update', { immediate: true });
+  return state.demo;
+}
+
+function markDemoSpot(kind, note = null, source = 'operator') {
+  const normalizedKind = kind === 'end' ? 'end' : 'start';
+  const robot = state.robot
+    ? {
+        lat: state.robot.lat ?? null,
+        lon: state.robot.lon ?? null,
+        heading: state.robot.heading ?? null,
+        speed: state.robot.speed ?? null,
+        state: state.robot.state ?? null,
+        gpsFix: state.robot.gpsFix ?? null,
+        gpsHdop: state.robot.gpsHdop ?? null,
+        gpsSat: state.robot.gpsSat ?? null,
+        timestampMs: state.robot.timestampMs ?? null,
+      }
+    : null;
+
+  const spot = {
+    kind: normalizedKind,
+    label: normalizedKind === 'start' ? 'Spot A' : 'Spot B',
+    note: typeof note === 'string' && note.trim() ? note.trim() : null,
+    source,
+    markedAt: Date.now(),
+    robot,
+  };
+
+  state.demo = {
+    ...state.demo,
+    spots: {
+      ...(state.demo?.spots ?? { start: null, end: null }),
+      [normalizedKind]: spot,
+    },
+    updatedAt: Date.now(),
+    source,
+  };
+
+  db.logEvent(mission.currentId(), EVENT_TYPE.OPERATOR_NOTE_ADDED, {
+    category: 'demo.spot',
+    spot: normalizedKind,
+    note: spot.note,
+    source,
+  });
+
+  publishOperator();
+  publishSupervision();
+  scheduleRuntimeStateSave('demo-mode.spot', { immediate: true });
+  return spot;
+}
+
+function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0) {
+  const start = startSpot?.robot;
+  const end = endSpot?.robot;
+  if (
+    !start ||
+    !end ||
+    !Number.isFinite(start.lat) ||
+    !Number.isFinite(start.lon) ||
+    !Number.isFinite(end.lat) ||
+    !Number.isFinite(end.lon)
+  ) {
+    return { ok: false, error: 'Both demo spots need saved robot positions before building a demo path' };
+  }
+
+  const origin = { lat: start.lat, lon: start.lon };
+  const startLocal = latLonToLocal({ lat: start.lat, lon: start.lon }, origin);
+  const endLocal = latLonToLocal({ lat: end.lat, lon: end.lon }, origin);
+  const dx = endLocal.x - startLocal.x;
+  const dy = endLocal.y - startLocal.y;
+  const length = Math.hypot(dx, dy);
+  if (!Number.isFinite(length) || length < 1.0) {
+    return { ok: false, error: 'Demo spots are too close together to build a demo lane' };
+  }
+
+  const dirX = dx / length;
+  const dirY = dy / length;
+  const perpX = -dirY;
+  const perpY = dirX;
+  const halfWidth = Math.max(0.75, laneWidthM / 2);
+  const leadIn = Math.min(1.0, length * 0.1);
+  const tailX = dirX * leadIn;
+  const tailY = dirY * leadIn;
+
+  const cornersLocal = [
+    { x: startLocal.x - tailX + perpX * halfWidth, y: startLocal.y - tailY + perpY * halfWidth },
+    { x: endLocal.x + tailX + perpX * halfWidth, y: endLocal.y + tailY + perpY * halfWidth },
+    { x: endLocal.x + tailX - perpX * halfWidth, y: endLocal.y + tailY - perpY * halfWidth },
+    { x: startLocal.x - tailX - perpX * halfWidth, y: startLocal.y - tailY - perpY * halfWidth },
+  ];
+
+  return {
+    ok: true,
+    baseStation: { lat: start.lat, lon: start.lon },
+    start: { lat: start.lat, lon: start.lon },
+    goal: { lat: end.lat, lon: end.lon },
+    boundary: cornersLocal.map((point) => localToLatLon(point, origin)),
+    laneWidthM: halfWidth * 2,
+    laneLengthM: length,
+  };
+}
+
+function configureActiveArea(baseStation, boundary, cellSizeM) {
+  const cellPlan = resolveInputAreaCellSize(boundary, Number(cellSizeM));
+
+  state.baseStation = baseStation;
+  state.boundary = boundary;
+  state.coverage = buildCoverageMap(boundary, cellPlan.effectiveCellSizeM);
+  state.robot = null;
+  state.trail = [];
+  state.lastPath = [];
+  bridge.resetWpState();
+  resetOperatorState();
+
+  const stats = coverageStats(state.coverage);
+  publish(WS_EVENT.AREA_UPDATED, { baseStation, boundary, stats });
+
+  if (mission.isActive()) {
+    const missionState = mission.publicMission()?.state;
+    if (missionState === MISSION_STATE.CONFIGURING) {
+      try {
+        mission.reset();
+      } catch (_) { /* ignore */ }
+    } else {
+      try {
+        mission.abort('area_reset', {
+          coveragePct: getCoveragePct(stats),
+          faultCount: mission.publicMission()?.faultCount ?? 0,
+          cmdCount: mission.publicMission()?.cmdCount ?? 0,
+        });
+      } catch (_) { /* ignore */ }
+      try {
+        mission.reset();
+      } catch (_) { /* ignore */ }
+    }
+  }
+
+  mission.configure({ baseStation, boundary, cellSizeM: cellPlan.effectiveCellSizeM });
+  return { stats, cellPlan };
+}
+
+function planCoveragePathForCurrentArea({ startPoint, goalPoint, coverageWidthM, saltPct, brinePct }) {
+  const path = findCoveragePath(state.coverage, {
+    swathWidthM: coverageWidthM,
+    startLatLon: startPoint,
+    goalLatLon: goalPoint,
+  });
+
+  if (!path.ok) {
+    state.lastPath = [];
+    return path;
+  }
+
+  state.lastPath = path.points.map((point) => ({
+    ...point,
+    salt: saltPct,
+    brine: brinePct,
+  }));
+
+  publish(WS_EVENT.PATH_UPDATED, {
+    mode: 'coverage',
+    coverageWidthM,
+    points: state.lastPath,
+    meta: path.meta ?? null,
+  });
+  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
+    mode: 'coverage',
+    pointCount: state.lastPath.length,
+    saltPct,
+    brinePct,
+    coverageWidthM,
+  });
+  scheduleRuntimeStateSave('path.planned', { immediate: true });
+  publishSupervision();
+  publishOperator();
+  return path;
+}
+
+function isHardwareLockedForDemo() {
+  return Boolean(state.demo?.enabled);
+}
+
+function assertHardwareAllowed(actionLabel, options = {}) {
+  const { allowWhenDemo = false } = options;
+  if (!isHardwareLockedForDemo() || allowWhenDemo) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    status: 409,
+    error: `${actionLabel} blocked: demo mode is active`,
+  };
+}
+
+function isDemoSafeCommand(cmd) {
+  return [
+    CMD.ESTOP,
+    CMD.PAUSE,
+    CMD.STOP,
+    CMD.MANUAL,
+    CMD.RESET,
+    CMD.FORWARD,
+    CMD.BACK,
+    CMD.LEFT,
+    CMD.RIGHT,
+  ].includes(cmd);
+}
+
 async function dispatchCommand(cmd, options = {}) {
   const { syncMission = true, source = 'api.command', waitForAck = false, waitForState = false } = options;
   const commandId = createCommandId();
@@ -1501,6 +1820,8 @@ function buildSampleWaypointSet() {
 }
 
 async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge') {
+  const demoCheck = assertHardwareAllowed('Waypoint push');
+  if (!demoCheck.ok) return demoCheck;
   if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
     return { ok: false, status: 409, error: 'Waypoint push allowed only while mission is CONFIGURING or PAUSED' };
   }
@@ -1533,6 +1854,8 @@ async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge') {
 }
 
 async function startMissionAction(source = 'mission.start') {
+  const demoCheck = assertHardwareAllowed('Mission start');
+  if (!demoCheck.ok) return demoCheck;
   if (currentMissionState() !== MISSION_STATE.CONFIGURING) {
     return { ok: false, status: 409, error: 'Mission must be CONFIGURING before start' };
   }
@@ -1580,6 +1903,8 @@ async function pauseMissionAction(reason = null, source = 'mission.pause') {
 }
 
 async function resumeMissionAction(source = 'mission.resume') {
+  const demoCheck = assertHardwareAllowed('Mission resume');
+  if (!demoCheck.ok) return demoCheck;
   if (currentMissionState() !== MISSION_STATE.PAUSED) {
     return { ok: false, status: 409, error: 'Mission must be PAUSED before resume' };
   }
@@ -1951,6 +2276,23 @@ async function runTestMenuAction(actionId, input = {}) {
     };
   }
 
+  const safeInDemoMode = new Set([
+    'bridge-status',
+    'gps-readiness',
+    'telemetry-snapshot',
+    'state-snapshot',
+    'gps-snapshot',
+    'ack-pause',
+    'ack-estop',
+  ]);
+  if (isHardwareLockedForDemo() && !safeInDemoMode.has(resolved.id)) {
+    return {
+      ok: false,
+      actionId: resolved.id,
+      result: { error: 'Demo mode is active. This service action is locked.' },
+    };
+  }
+
   switch (resolved.id) {
     case 'bridge-status': {
       return {
@@ -2318,6 +2660,7 @@ function publicState() {
   return {
     baseStation: state.baseStation,
     boundary: state.boundary,
+    demo: state.demo,
     robot: state.robot,
     trail: state.trail,
     coverage: state.coverage
@@ -2422,6 +2765,114 @@ app.get(API.SUPERVISION_SUMMARY, requireAppOrBoard, (_req, res) => {
   res.json({ ok: true, summary: buildSupervisionSummary() });
 });
 
+app.get(API.DEMO_MODE, requireAppOrBoard, (_req, res) => {
+  res.json({ ok: true, demo: state.demo });
+});
+
+app.post(API.DEMO_MODE, requireApp, (req, res) => {
+  const enabled = Boolean(req.body?.enabled);
+  const source = typeof req.body?.source === 'string' && req.body.source.trim()
+    ? req.body.source.trim()
+    : 'app';
+  const demo = setDemoMode(enabled, source);
+  res.json({ ok: true, demo });
+});
+
+app.post(API.DEMO_SPOT, requireApp, (req, res) => {
+  if (!state.demo?.enabled) {
+    return res.status(409).json({ ok: false, error: 'Demo mode is not active' });
+  }
+  const kind = String(req.body?.kind ?? '').trim().toLowerCase();
+  if (!['start', 'end'].includes(kind)) {
+    return res.status(400).json({ ok: false, error: 'kind must be start or end' });
+  }
+  const note = typeof req.body?.note === 'string' ? req.body.note : null;
+  const source = typeof req.body?.source === 'string' && req.body.source.trim()
+    ? req.body.source.trim()
+    : 'app';
+  const spot = markDemoSpot(kind, note, source);
+  res.json({ ok: true, demo: state.demo, spot });
+});
+
+app.post(API.DEMO_PATH, requireApp, (req, res) => {
+  if (!state.demo?.enabled) {
+    return res.status(409).json({ ok: false, error: 'Demo mode is not active' });
+  }
+
+  const allowWeakGps = req.body?.allowWeakGps === true;
+  const startSpotStatus = getDemoSpotGpsStatus(state.demo?.spots?.start, 'Spot A');
+  if (!startSpotStatus.ready && !allowWeakGps) {
+    return res.status(409).json({ ok: false, error: `Demo path blocked: ${startSpotStatus.reason}` });
+  }
+  const endSpotStatus = getDemoSpotGpsStatus(state.demo?.spots?.end, 'Spot B');
+  if (!endSpotStatus.ready && !allowWeakGps) {
+    return res.status(409).json({ ok: false, error: `Demo path blocked: ${endSpotStatus.reason}` });
+  }
+
+  const laneWidthM = Number.isFinite(Number(req.body?.laneWidthM)) && Number(req.body.laneWidthM) > 0
+    ? Number(req.body.laneWidthM)
+    : 3.0;
+  const cellSizeM = Number.isFinite(Number(req.body?.cellSizeM)) && Number(req.body.cellSizeM) > 0
+    ? Number(req.body.cellSizeM)
+    : 0.75;
+  const coverageWidthM = Number.isFinite(Number(req.body?.coverageWidthM)) && Number(req.body.coverageWidthM) > 0
+    ? Number(req.body.coverageWidthM)
+    : 0.75;
+  const saltPct = Number.isFinite(Number(req.body?.saltPct))
+    ? Math.max(0, Math.min(100, Math.round(Number(req.body.saltPct))))
+    : 100;
+  const brinePct = Number.isFinite(Number(req.body?.brinePct))
+    ? Math.max(0, Math.min(100, Math.round(Number(req.body.brinePct))))
+    : 100;
+
+  const geometry = buildDemoBoundaryFromSpots(state.demo?.spots?.start, state.demo?.spots?.end, laneWidthM);
+  if (!geometry.ok) {
+    return res.status(400).json({ ok: false, error: geometry.error });
+  }
+
+  const configured = configureActiveArea(geometry.baseStation, geometry.boundary, cellSizeM);
+  const path = planCoveragePathForCurrentArea({
+    startPoint: geometry.start,
+    goalPoint: geometry.goal,
+    coverageWidthM,
+    saltPct,
+    brinePct,
+  });
+
+  if (!path.ok) {
+    return res.status(400).json({ ok: false, error: path.reason });
+  }
+
+  scheduleRuntimeStateSave('demo-mode.path', { immediate: true });
+  res.json({
+    ok: true,
+    demo: state.demo,
+    warnings: allowWeakGps && (!startSpotStatus.ready || !endSpotStatus.ready)
+      ? [
+          'Service override used: demo path was built with weak or unavailable GPS quality.',
+          ...[startSpotStatus, endSpotStatus].filter((status) => !status.ready).map((status) => status.reason),
+        ]
+      : [],
+    geometry: {
+      laneWidthM: geometry.laneWidthM,
+      laneLengthM: geometry.laneLengthM,
+      boundary: geometry.boundary,
+      baseStation: geometry.baseStation,
+      start: geometry.start,
+      goal: geometry.goal,
+      cellSizeM: configured.cellPlan.effectiveCellSizeM,
+      stats: configured.stats,
+    },
+    path: {
+      mode: 'coverage',
+      coverageWidthM,
+      pointCount: state.lastPath.length,
+      points: state.lastPath,
+      meta: path.meta ?? null,
+    },
+  });
+});
+
 app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
   const connection = buildConnectionState();
   res.json({
@@ -2433,6 +2884,7 @@ app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
     last_cmd_status: state.lastCommandStatus,
     command_history: state.commandHistory,
     last_fault: state.lastFault ?? null,
+    demo: state.demo,
     connectivity: connection.overall,
     robot: state.robot
       ? {
@@ -2458,6 +2910,9 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
   const cmd = normalizeCommand(rawCmd);
   if (!cmd) {
     return res.status(400).send('Missing cmd');
+  }
+  if (isHardwareLockedForDemo() && !isDemoSafeCommand(cmd)) {
+    return res.status(409).type('text/plain').send('Command blocked: demo mode is active');
   }
 
   const dispatched = await dispatchCommand(cmd);
@@ -2487,42 +2942,7 @@ app.post(API.INPUT_AREA, requireApp, (req, res) => {
     return res.status(400).json({ ok: false, error: 'boundary requires at least 3 points' });
   }
 
-  const cellPlan = resolveInputAreaCellSize(boundary, Number(cellSizeM));
-
-  state.baseStation = baseStation;
-  state.boundary = boundary;
-  state.coverage = buildCoverageMap(boundary, cellPlan.effectiveCellSizeM);
-  state.robot = null;
-  state.trail = [];
-  state.lastPath = [];
-  bridge.resetWpState();
-  resetOperatorState();
-
-  const stats = coverageStats(state.coverage);
-  publish(WS_EVENT.AREA_UPDATED, { baseStation, boundary, stats });
-
-  // Create / replace mission record in CONFIGURING state
-  // (Resetting area resets the mission lifecycle to CONFIGURING)
-  if (mission.isActive()) {
-    const missionState = mission.publicMission()?.state;
-    if (missionState === MISSION_STATE.CONFIGURING) {
-      try {
-        mission.reset();
-      } catch (_) { /* ignore */ }
-    } else {
-      try {
-        mission.abort('area_reset', {
-          coveragePct: getCoveragePct(stats),
-          faultCount:  mission.publicMission()?.faultCount ?? 0,
-          cmdCount:    mission.publicMission()?.cmdCount   ?? 0,
-        });
-      } catch (_) { /* ignore */ }
-      try {
-        mission.reset();
-      } catch (_) { /* ignore */ }
-    }
-  }
-  mission.configure({ baseStation, boundary, cellSizeM: cellPlan.effectiveCellSizeM });
+  const { stats, cellPlan } = configureActiveArea(baseStation, boundary, Number(cellSizeM));
   scheduleRuntimeStateSave('area.set', { immediate: true });
   publishOperator();
   publishSupervision();

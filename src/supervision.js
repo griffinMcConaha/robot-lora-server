@@ -17,14 +17,17 @@ function isTelemetryStale(robot, staleThresholdMs, now = Date.now()) {
   return ageMs == null ? true : ageMs > staleThresholdMs;
 }
 
-function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, zeroDispersionPath, gpsReady, gpsReason }) {
+function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, zeroDispersionPath, gpsReady, gpsReason, demoModeEnabled }) {
   return [
     { id: 'input-area', enabled: true, reason: null },
     { id: 'path-plan', enabled: hasCoverage, reason: hasCoverage ? null : 'Area is not configured' },
+    { id: 'demo-mode-toggle', enabled: true, reason: null },
     {
       id: 'push-waypoints',
-      enabled: [MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && hasPath && !zeroDispersionPath,
-      reason: !hasPath
+      enabled: [MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState) && hasPath && !zeroDispersionPath && !demoModeEnabled,
+      reason: demoModeEnabled
+        ? 'Demo mode is on. Hardware waypoint push is locked.'
+        : !hasPath
         ? 'Path plan is required before waypoint push'
         : zeroDispersionPath
           ? 'Zero-dispersion path cannot be committed'
@@ -32,8 +35,10 @@ function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, 
     },
     {
       id: 'mission-start',
-      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || hasPath) && !zeroDispersionPath && gpsReady,
-      reason: missionState !== MISSION_STATE.CONFIGURING
+      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || hasPath) && !zeroDispersionPath && gpsReady && !demoModeEnabled,
+      reason: demoModeEnabled
+        ? 'Demo mode is on. Live mission start is locked.'
+        : missionState !== MISSION_STATE.CONFIGURING
         ? 'Mission must be CONFIGURING'
         : !gpsReady
           ? (gpsReason ?? 'Robot GPS readiness is required before mission start')
@@ -44,8 +49,10 @@ function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, 
     { id: 'mission-pause', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
     {
       id: 'mission-resume',
-      enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed' && gpsReady,
-      reason: missionState !== MISSION_STATE.PAUSED
+      enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed' && gpsReady && !demoModeEnabled,
+      reason: demoModeEnabled
+        ? 'Demo mode is on. Live mission resume is locked.'
+        : missionState !== MISSION_STATE.PAUSED
         ? 'Mission is not PAUSED'
         : !gpsReady
           ? (gpsReason ?? 'Robot GPS readiness is required before mission resume')
@@ -53,7 +60,11 @@ function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, 
     },
     { id: 'mission-abort', enabled: [MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(missionState), reason: null },
     { id: 'mission-complete', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
-    { id: 'command-manual', enabled: true, reason: null },
+    {
+      id: 'command-manual',
+      enabled: true,
+      reason: null,
+    },
     {
       id: 'command-reset',
       enabled: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
@@ -70,10 +81,12 @@ function buildAlerts({
   zeroDispersionPath,
   gpsReady,
   gpsReason,
+  demoModeEnabled,
   telemetryStale,
   telemetryAge,
   lastFault,
   safety,
+  recovery,
   now = Date.now(),
 }) {
   const alerts = [];
@@ -92,6 +105,20 @@ function buildAlerts({
       level: 'warning',
       code: 'ZERO_DISPERSION_PATH',
       message: 'Current path uses 0% salt and 0% brine. Update dispersion before waypoint push or mission start.',
+    });
+  }
+  if (demoModeEnabled) {
+    alerts.push({
+      level: 'warning',
+      code: 'DEMO_MODE_ACTIVE',
+      message: 'Demo mode is active. Autonomy is locked, but manual driving and spot marking stay available.',
+    });
+  }
+  if (recovery?.needed) {
+    alerts.push({
+      level: 'warning',
+      code: 'MISSION_RECOVERY_NEEDED',
+      message: recovery.reason ?? 'The active mission needs to be re-synced with the robot before it can continue.',
     });
   }
   if (!gpsReady) {

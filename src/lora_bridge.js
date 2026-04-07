@@ -46,18 +46,29 @@
 
 const http  = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { Bonjour } = require('bonjour-service');
 const { LORA_WIRE, ARBITRATION } = require('./contracts');
+const { DATA_DIR } = require('./runtime_state');
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const BASE_STATION_URL = (process.env.BASE_STATION_URL ?? 'http://192.168.4.1').replace(/\/$/, '');
+const BASE_STATION_PERSIST_PATH = path.join(DATA_DIR, 'base_station.json');
+const DEFAULT_BASE_STATION_URL = _normalizeBaseStationUrl(process.env.BASE_STATION_URL ?? 'http://192.168.4.1');
+const BASE_STATION_CANDIDATES = _buildBaseStationCandidates();
+const BASE_STATION_MDNS_ENABLED = String(process.env.BASE_STATION_MDNS_ENABLED ?? '1') !== '0';
+const BASE_STATION_MDNS_TYPE = String(process.env.BASE_STATION_MDNS_TYPE ?? 'http').trim() || 'http';
+const BASE_STATION_MDNS_PROTOCOL = String(process.env.BASE_STATION_MDNS_PROTOCOL ?? 'tcp').trim() || 'tcp';
+const BASE_STATION_MDNS_NAMES = _buildMdnsNameList();
 const REQUEST_TIMEOUT_MS = Number(process.env.LORA_REQUEST_TIMEOUT_MS ?? 3000);
 const TRANSIENT_RETRY_MAX = Number(process.env.LORA_TRANSIENT_RETRY_MAX ?? 2);
 const TRANSIENT_RETRY_MS = Number(process.env.LORA_TRANSIENT_RETRY_MS ?? 200);
 const BRIDGE_DEGRADED_FAILURE_THRESHOLD = Number(process.env.BRIDGE_DEGRADED_FAILURE_THRESHOLD ?? 3);
 const ACK_WAIT_TIMEOUT_MS = Number(process.env.LORA_ACK_WAIT_TIMEOUT_MS ?? 3000);
 const ACK_POLL_MS = Number(process.env.LORA_ACK_POLL_MS ?? 120);
+const BASE_STATUS_REFRESH_INTERVAL_MS = Number(process.env.BASE_STATUS_REFRESH_INTERVAL_MS ?? 5000);
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -73,6 +84,11 @@ let _lastSuccessAt  = null;
 let _lastErrorAt    = null;
 let _consecutiveFailures = 0;
 let _degradedSince  = null;
+let _selectedBaseStationUrl = _loadPreferredBaseStationUrl();
+let _statusRefreshInFlight = false;
+let _bonjour = null;
+let _mdnsBrowser = null;
+let _mdnsServices = new Map();
 let _baseStationSnapshot = {
   statusOk: false,
   statusCode: null,
@@ -89,8 +105,214 @@ let _baseStationSnapshot = {
   lastAck: null,
   lastAckParsed: null,
   lastLoRa: null,
+  discoverySource: 'configured',
+  mdnsEnabled: BASE_STATION_MDNS_ENABLED,
+  mdnsNames: BASE_STATION_MDNS_NAMES,
+  mdnsServices: [],
   refreshedAt: null,
+  selectedUrl: _selectedBaseStationUrl,
+  attemptedUrls: [],
 };
+
+function _normalizeBaseStationUrl(value) {
+  return String(value ?? '').trim().replace(/\/$/, '');
+}
+
+function _buildBaseStationCandidates() {
+  const raw = [
+    process.env.BASE_STATION_URL,
+    ...(typeof process.env.BASE_STATION_CANDIDATES === 'string'
+      ? process.env.BASE_STATION_CANDIDATES.split(',')
+      : []),
+    'http://192.168.4.1',
+    'http://base-station.local',
+  ];
+
+  const normalized = raw
+    .map(_normalizeBaseStationUrl)
+    .filter(Boolean);
+
+  return Array.from(new Set(normalized));
+}
+
+function _buildMdnsNameList() {
+  const raw = [
+    ...(typeof process.env.BASE_STATION_MDNS_NAMES === 'string'
+      ? process.env.BASE_STATION_MDNS_NAMES.split(',')
+      : []),
+    'base-station',
+    'base-station.local',
+    'saltrobot-base',
+    'saltrobot-base.local',
+    'salt-robot-base',
+    'salt-robot-base.local',
+  ];
+
+  return Array.from(new Set(
+    raw
+      .map((value) => String(value ?? '').trim().toLowerCase())
+      .filter(Boolean),
+  ));
+}
+
+function _loadPreferredBaseStationUrl() {
+  try {
+    if (!fs.existsSync(BASE_STATION_PERSIST_PATH)) {
+      return DEFAULT_BASE_STATION_URL;
+    }
+    const raw = JSON.parse(fs.readFileSync(BASE_STATION_PERSIST_PATH, 'utf8'));
+    const preferred = _normalizeBaseStationUrl(raw?.selectedUrl);
+    return preferred || DEFAULT_BASE_STATION_URL;
+  } catch {
+    return DEFAULT_BASE_STATION_URL;
+  }
+}
+
+function _savePreferredBaseStationUrl(url) {
+  try {
+    fs.writeFileSync(
+      BASE_STATION_PERSIST_PATH,
+      `${JSON.stringify({ selectedUrl: url, savedAt: new Date().toISOString() }, null, 2)}\n`,
+      'utf8',
+    );
+  } catch {
+    // Best-effort persistence only.
+  }
+}
+
+function _setSelectedBaseStationUrl(url) {
+  const normalized = _normalizeBaseStationUrl(url);
+  if (!normalized || normalized === _selectedBaseStationUrl) {
+    return;
+  }
+  _selectedBaseStationUrl = normalized;
+  _baseStationSnapshot = {
+    ..._baseStationSnapshot,
+    selectedUrl: normalized,
+  };
+  _savePreferredBaseStationUrl(normalized);
+}
+
+function _normalizeHostToken(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, '');
+}
+
+function _hostMatchesMdnsNames(host) {
+  const normalizedHost = _normalizeHostToken(host);
+  if (!normalizedHost) return false;
+  return BASE_STATION_MDNS_NAMES.some((candidate) => {
+    const normalizedCandidate = _normalizeHostToken(candidate);
+    if (!normalizedCandidate) return false;
+    return normalizedHost === normalizedCandidate
+      || normalizedHost === `${normalizedCandidate}.local`
+      || normalizedHost.startsWith(`${normalizedCandidate}.`);
+  });
+}
+
+function _serviceMatchesMdns(service) {
+  if (!service || typeof service !== 'object') return false;
+  if (_hostMatchesMdnsNames(service.host)) return true;
+  if (_hostMatchesMdnsNames(service.name)) return true;
+  if (Array.isArray(service.addresses) && service.addresses.some(_hostMatchesMdnsNames)) return true;
+  return false;
+}
+
+function _serviceToBaseUrls(service) {
+  if (!service || typeof service !== 'object') return [];
+
+  const protocol = String(service.protocol || 'http').toLowerCase() === 'https' ? 'https' : 'http';
+  const port = Number(service.port);
+  const hosts = [
+    service.host,
+    ...(Array.isArray(service.addresses) ? service.addresses : []),
+  ]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean);
+
+  return Array.from(new Set(hosts.map((host) => {
+    const normalizedHost = host.replace(/\.$/, '');
+    if (Number.isFinite(port) && port > 0 && port !== 80 && port !== 443) {
+      return _normalizeBaseStationUrl(`${protocol}://${normalizedHost}:${port}`);
+    }
+    return _normalizeBaseStationUrl(`${protocol}://${normalizedHost}`);
+  })));
+}
+
+function _recordMdnsService(service) {
+  if (!_serviceMatchesMdns(service)) return;
+  const urls = _serviceToBaseUrls(service);
+  if (!urls.length) return;
+
+  _mdnsServices.set(urls[0], {
+    name: service.name ?? null,
+    host: service.host ?? null,
+    port: Number.isFinite(Number(service.port)) ? Number(service.port) : null,
+    type: service.type ?? null,
+    protocol: service.protocol ?? null,
+    addresses: Array.isArray(service.addresses) ? service.addresses.slice(0, 4) : [],
+    urls,
+    updatedAt: new Date().toISOString(),
+  });
+
+  _baseStationSnapshot = {
+    ..._baseStationSnapshot,
+    mdnsServices: Array.from(_mdnsServices.values()),
+  };
+}
+
+function _removeMdnsService(service) {
+  const urls = _serviceToBaseUrls(service);
+  for (const url of urls) {
+    _mdnsServices.delete(url);
+  }
+  _baseStationSnapshot = {
+    ..._baseStationSnapshot,
+    mdnsServices: Array.from(_mdnsServices.values()),
+  };
+}
+
+function _startMdnsDiscovery() {
+  if (!BASE_STATION_MDNS_ENABLED || _bonjour || typeof Bonjour !== 'function') {
+    return;
+  }
+
+  try {
+    _bonjour = new Bonjour();
+    _mdnsBrowser = _bonjour.find(
+      { type: BASE_STATION_MDNS_TYPE, protocol: BASE_STATION_MDNS_PROTOCOL },
+      (service) => _recordMdnsService(service),
+    );
+    if (_mdnsBrowser?.on) {
+      _mdnsBrowser.on('up', _recordMdnsService);
+      _mdnsBrowser.on('down', _removeMdnsService);
+    }
+    if (_mdnsBrowser?.start) {
+      _mdnsBrowser.start();
+    }
+  } catch (error) {
+    _baseStationSnapshot = {
+      ..._baseStationSnapshot,
+      mdnsEnabled: false,
+      statusError: _baseStationSnapshot.statusError ?? `mDNS unavailable: ${error.message}`,
+    };
+  }
+}
+
+function _candidateUrls() {
+  const urls = [
+    _selectedBaseStationUrl,
+    ...Array.from(_mdnsServices.values()).flatMap((service) => service.urls ?? []),
+    ...BASE_STATION_CANDIDATES,
+    DEFAULT_BASE_STATION_URL,
+  ]
+    .map(_normalizeBaseStationUrl)
+    .filter(Boolean);
+
+  return Array.from(new Set(urls));
+}
 
 // ---------------------------------------------------------------------------
 // Low-level HTTP helper
@@ -101,10 +323,10 @@ let _baseStationSnapshot = {
  * Returns { ok: boolean, status: number|null, body: string, error: string|null }.
  * Never throws.
  */
-async function _post(path, body, extraHeaders = {}) {
+async function _post(path, body, extraHeaders = {}, baseUrl = _selectedBaseStationUrl) {
   return new Promise((resolve) => {
     const bodyBuf = Buffer.from(body, 'utf8');
-    const urlStr  = `${BASE_STATION_URL}${path}`;
+    const urlStr  = `${baseUrl}${path}`;
 
     let parsedUrl;
     try {
@@ -123,6 +345,7 @@ async function _post(path, body, extraHeaders = {}) {
       headers:  {
         'Content-Type':   'text/plain',
         'Content-Length': bodyBuf.length,
+        'x-discovery-source': _baseStationSnapshot.discoverySource ?? 'configured',
         ...extraHeaders,
       },
     };
@@ -154,9 +377,9 @@ async function _post(path, body, extraHeaders = {}) {
  * GET helper for base-station endpoints.
  * Returns { ok, status, body, error } and never throws.
  */
-async function _get(path) {
+async function _get(path, baseUrl = _selectedBaseStationUrl) {
   return new Promise((resolve) => {
-    const urlStr = `${BASE_STATION_URL}${path}`;
+    const urlStr = `${baseUrl}${path}`;
 
     let parsedUrl;
     try {
@@ -203,7 +426,12 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
       statusOk: false,
       statusCode: meta.status ?? null,
       statusError: meta.error ?? 'Invalid base station status payload',
+      discoverySource: meta.discoverySource ?? _baseStationSnapshot.discoverySource,
+      mdnsEnabled: BASE_STATION_MDNS_ENABLED,
+      mdnsNames: BASE_STATION_MDNS_NAMES,
+      mdnsServices: Array.from(_mdnsServices.values()),
       refreshedAt: new Date().toISOString(),
+      attemptedUrls: Array.isArray(meta.attemptedUrls) ? meta.attemptedUrls : _baseStationSnapshot.attemptedUrls,
     };
     return _baseStationSnapshot;
   }
@@ -225,43 +453,64 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
     lastAck: typeof payload.last_ack === 'string' ? payload.last_ack.trim() : _baseStationSnapshot.lastAck,
     lastAckParsed: typeof payload.last_ack === 'string' ? _parseAckDetails(payload.last_ack.trim()) : _baseStationSnapshot.lastAckParsed,
     lastLoRa: typeof payload.last_lora === 'string' ? payload.last_lora.trim() : _baseStationSnapshot.lastLoRa,
+    discoverySource: meta.discoverySource ?? _baseStationSnapshot.discoverySource,
+    mdnsEnabled: BASE_STATION_MDNS_ENABLED,
+    mdnsNames: BASE_STATION_MDNS_NAMES,
+    mdnsServices: Array.from(_mdnsServices.values()),
     refreshedAt: new Date().toISOString(),
+    selectedUrl: meta.selectedUrl ?? _selectedBaseStationUrl,
+    attemptedUrls: Array.isArray(meta.attemptedUrls) ? meta.attemptedUrls : _baseStationSnapshot.attemptedUrls,
   };
   return _baseStationSnapshot;
 }
 
 async function _readBaseStatus() {
-  const result = await _get('/status');
-  if (!result.ok) {
-    _baseStationSnapshot = {
-      ..._baseStationSnapshot,
-      statusOk: false,
-      statusCode: result.status ?? null,
-      statusError: result.error ?? `HTTP ${result.status}`,
-      refreshedAt: new Date().toISOString(),
+  const attemptedUrls = [];
+
+  for (const candidateUrl of _candidateUrls()) {
+    attemptedUrls.push(candidateUrl);
+    const result = await _get('/status', candidateUrl);
+    if (!result.ok) {
+      continue;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(result.body);
+    } catch {
+      continue;
+    }
+
+    _setSelectedBaseStationUrl(candidateUrl);
+    const discoverySource = _mdnsServices.has(candidateUrl)
+      ? 'mdns'
+      : (candidateUrl === DEFAULT_BASE_STATION_URL ? 'default' : 'configured');
+    return {
+      ok: true,
+      status: result.status ?? null,
+      snapshot: _applyBaseStatusSnapshot(parsed, {
+        ok: true,
+        status: result.status ?? null,
+        selectedUrl: candidateUrl,
+        attemptedUrls,
+        discoverySource,
+      }),
     };
-    return { ok: false, error: _baseStationSnapshot.statusError, status: result.status ?? null, snapshot: _baseStationSnapshot };
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(result.body);
-  } catch {
-    _baseStationSnapshot = {
-      ..._baseStationSnapshot,
-      statusOk: false,
-      statusCode: result.status ?? null,
-      statusError: 'Base station /status returned invalid JSON',
-      refreshedAt: new Date().toISOString(),
-    };
-    return { ok: false, error: _baseStationSnapshot.statusError, status: result.status ?? null, snapshot: _baseStationSnapshot };
-  }
-
-  return {
-    ok: true,
-    status: result.status ?? null,
-    snapshot: _applyBaseStatusSnapshot(parsed, { ok: true, status: result.status ?? null }),
+  _baseStationSnapshot = {
+    ..._baseStationSnapshot,
+    statusOk: false,
+    statusCode: null,
+    statusError: 'Unable to reach any configured base station endpoint',
+    mdnsEnabled: BASE_STATION_MDNS_ENABLED,
+    mdnsNames: BASE_STATION_MDNS_NAMES,
+    mdnsServices: Array.from(_mdnsServices.values()),
+    refreshedAt: new Date().toISOString(),
+    attemptedUrls,
+    selectedUrl: _selectedBaseStationUrl,
   };
+  return { ok: false, error: _baseStationSnapshot.statusError, status: null, snapshot: _baseStationSnapshot };
 }
 
 /**
@@ -376,7 +625,7 @@ function _expectedAckForCommand(cmd) {
 }
 
 async function _readLastLoRa() {
-  const result = await _get('/last_lora');
+  const result = await _get('/last_lora', _selectedBaseStationUrl);
   if (!result.ok) return { ok: false, error: result.error ?? `HTTP ${result.status}` };
   const frame = _unwrapAckFrame(result.body);
   if (frame?.raw) {
@@ -465,7 +714,7 @@ const QUEUE_FULL_RETRY_MS  = 250;
  */
 async function _postWithRetry(path, body, extraHeaders = {}) {
   for (let attempt = 0; attempt <= QUEUE_FULL_RETRY_MAX; attempt++) {
-    const r = await _post(path, body, extraHeaders);
+    const r = await _post(path, body, extraHeaders, _selectedBaseStationUrl);
     if (r.ok) return r;
     const isQueueFull = r.status === 503 && r.body === 'queue_full';
     const isTransient =
@@ -476,6 +725,10 @@ async function _postWithRetry(path, body, extraHeaders = {}) {
 
     const maxRetries = isQueueFull ? QUEUE_FULL_RETRY_MAX : TRANSIENT_RETRY_MAX;
     const retryDelayMs = isQueueFull ? QUEUE_FULL_RETRY_MS : TRANSIENT_RETRY_MS;
+
+    if (isTransient && r.status == null) {
+      await _readBaseStatus();
+    }
 
     if (!isTransient || attempt === maxRetries) return r;
     await _sleep(retryDelayMs);
@@ -664,7 +917,8 @@ function resetWpState() {
  */
 function getStatus() {
   return {
-    baseStationUrl: BASE_STATION_URL,
+    baseStationUrl: _selectedBaseStationUrl,
+    baseStationCandidates: _candidateUrls(),
     wpPushState:    _wpPushState,
     wpPushCount:    _wpPushCount,
     wpPushAt:       _wpPushAt,
@@ -696,7 +950,13 @@ function getStatus() {
       lastAck: _baseStationSnapshot.lastAck,
       lastAckParsed: _baseStationSnapshot.lastAckParsed,
       lastLoRa: _baseStationSnapshot.lastLoRa,
+      discoverySource: _baseStationSnapshot.discoverySource,
+      mdnsEnabled: _baseStationSnapshot.mdnsEnabled,
+      mdnsNames: _baseStationSnapshot.mdnsNames,
+      mdnsServices: _baseStationSnapshot.mdnsServices,
       refreshedAt: _baseStationSnapshot.refreshedAt,
+      selectedUrl: _baseStationSnapshot.selectedUrl,
+      attemptedUrls: _baseStationSnapshot.attemptedUrls,
     },
   };
 }
@@ -704,6 +964,16 @@ function getStatus() {
 async function refreshStatus() {
   await _readBaseStatus();
   return getStatus();
+}
+
+async function _refreshLoop() {
+  if (_statusRefreshInFlight) return;
+  _statusRefreshInFlight = true;
+  try {
+    await _readBaseStatus();
+  } finally {
+    _statusRefreshInFlight = false;
+  }
 }
 
 /**
@@ -785,3 +1055,19 @@ function _wpFail(sent, error) {
 // Exports
 // ---------------------------------------------------------------------------
 module.exports = { sendCommand, pushWaypoints, resetWpState, getStatus, refreshStatus, observeCommand, restoreStatus, parseAckDetails: _parseAckDetails };
+
+_startMdnsDiscovery();
+
+if (BASE_STATUS_REFRESH_INTERVAL_MS > 0) {
+  const timer = setInterval(() => {
+    _refreshLoop().catch(() => {
+      // Keep background reconnect best-effort.
+    });
+  }, BASE_STATUS_REFRESH_INTERVAL_MS);
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  _refreshLoop().catch(() => {
+    // Startup probe is best-effort.
+  });
+}
