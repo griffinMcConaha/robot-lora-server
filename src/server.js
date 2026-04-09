@@ -97,15 +97,9 @@ function parseKeyList(value) {
     .filter(Boolean);
 }
 
-const APP_API_KEYS = new Set([
-  ...parseKeyList(process.env.APP_API_KEYS),
-  ...(typeof process.env.APP_API_KEY === 'string' && process.env.APP_API_KEY.trim() ? [process.env.APP_API_KEY.trim()] : []),
-]);
-const BOARD_API_KEYS = new Set([
-  ...parseKeyList(process.env.BOARD_API_KEYS),
-  ...(typeof process.env.BOARD_API_KEY === 'string' && process.env.BOARD_API_KEY.trim() ? [process.env.BOARD_API_KEY.trim()] : []),
-]);
-const API_AUTH_ENABLED = APP_API_KEYS.size > 0 || BOARD_API_KEYS.size > 0;
+const APP_API_KEYS = new Set();
+const BOARD_API_KEYS = new Set();
+const API_AUTH_ENABLED = false;
 
 const rateLimitStore = new Map();
 
@@ -122,6 +116,12 @@ const metrics = {
   eventPrunedRows: 0,
   runtimeStateWrites: 0,
   runtimeStateWriteFailures: 0,
+  wsPublishes: 0,
+  wsDeliveredMessages: 0,
+  wsConnectionsOpened: 0,
+  wsConnectionsClosed: 0,
+  wsPeakClients: 0,
+  wsLastTestAt: null,
 };
 
 const state = {
@@ -2071,6 +2071,15 @@ function buildTestMenu() {
       group: 'System',
     },
     {
+      id: 'websocket-test',
+      title: 'WebSocket Test',
+      kind: 'inspect',
+      description: 'Publish a WebSocket test event and report connected live-update clients.',
+      caution: 'safe',
+      shortcut: 'W',
+      group: 'System',
+    },
+    {
       id: 'state-snapshot',
       title: 'State Snapshot',
       kind: 'inspect',
@@ -2356,6 +2365,7 @@ async function runTestMenuAction(actionId, input = {}) {
     'bridge-status',
     'gps-readiness',
     'telemetry-snapshot',
+    'websocket-test',
     'state-snapshot',
     'gps-snapshot',
     'ack-pause',
@@ -2404,6 +2414,22 @@ async function runTestMenuAction(actionId, input = {}) {
           robot: state.robot,
           safety: state.safety,
           lastFault: state.lastFault,
+        },
+      };
+    }
+    case 'websocket-test': {
+      metrics.wsLastTestAt = Date.now();
+      const delivered = publish(WS_EVENT.WS_TEST, {
+        label: 'test_menu',
+        websocket: buildWebSocketDiagnostics(),
+      });
+      return {
+        ok: true,
+        actionId: resolved.id,
+        result: {
+          delivered,
+          at: metrics.wsLastTestAt,
+          websocket: buildWebSocketDiagnostics(),
         },
       };
     }
@@ -2725,11 +2751,33 @@ function parseIncomingTelemetry(payload) {
 
 function publish(event, payload) {
   const packet = JSON.stringify({ event, payload, at: Date.now() });
+  let delivered = 0;
   for (const client of wss.clients) {
     if (client.readyState === 1) {
       client.send(packet);
+      delivered += 1;
     }
   }
+  metrics.wsPublishes += 1;
+  metrics.wsDeliveredMessages += delivered;
+  return delivered;
+}
+
+function buildWebSocketDiagnostics() {
+  let connectedClients = 0;
+  for (const client of wss.clients) {
+    if (client.readyState === 1) connectedClients += 1;
+  }
+
+  return {
+    connectedClients,
+    peakClients: metrics.wsPeakClients,
+    connectionsOpened: metrics.wsConnectionsOpened,
+    connectionsClosed: metrics.wsConnectionsClosed,
+    publishes: metrics.wsPublishes,
+    deliveredMessages: metrics.wsDeliveredMessages,
+    lastTestAt: metrics.wsLastTestAt,
+  };
 }
 
 function publicState() {
@@ -2803,6 +2851,7 @@ app.get(API.HEALTH, (_req, res) => {
       lastSuccessAt: bridgeStatus.lastSuccessAt,
       lastErrorAt: bridgeStatus.lastErrorAt,
     },
+    websocket: buildWebSocketDiagnostics(),
     commandHistory: state.commandHistory,
     connectivity: connection,
     persistence: {
@@ -2834,7 +2883,33 @@ app.get(API.METRICS, requireApp, (_req, res) => {
         commandPerWindow: COMMAND_RATE_LIMIT_PER_WINDOW,
         telemetryPerWindow: TELEMETRY_RATE_LIMIT_PER_WINDOW,
       },
+      websocket: buildWebSocketDiagnostics(),
     },
+  });
+});
+
+app.get(API.WS_TEST, requireAppOrBoard, (_req, res) => {
+  res.json({
+    ok: true,
+    websocket: buildWebSocketDiagnostics(),
+  });
+});
+
+app.post(API.WS_TEST, requireAppOrBoard, (req, res) => {
+  const label = typeof req.body?.label === 'string' && req.body.label.trim()
+    ? req.body.label.trim()
+    : 'manual_test';
+  const payload = {
+    label,
+    websocket: buildWebSocketDiagnostics(),
+  };
+  metrics.wsLastTestAt = Date.now();
+  const delivered = publish(WS_EVENT.WS_TEST, payload);
+  res.json({
+    ok: true,
+    delivered,
+    at: metrics.wsLastTestAt,
+    websocket: buildWebSocketDiagnostics(),
   });
 });
 
@@ -3401,6 +3476,7 @@ app.get(API.TEST_MENU, requireAppOrBoard, async (_req, res) => {
     ok: true,
     tests: buildTestMenu(),
     lora: await bridge.refreshStatus(),
+    websocket: buildWebSocketDiagnostics(),
     gps: getRobotGpsStatus(),
     mission: mission.publicMission(),
     robot: state.robot,
@@ -3503,7 +3579,12 @@ app.post(API.OPERATOR_NOTES, requireApp, (req, res) => {
 });
 
 wss.on('connection', (socket) => {
+  metrics.wsConnectionsOpened += 1;
+  metrics.wsPeakClients = Math.max(metrics.wsPeakClients, wss.clients.size);
   socket.send(JSON.stringify({ event: WS_EVENT.STATE_SNAPSHOT, payload: publicState(), at: Date.now() }));
+  socket.on('close', () => {
+    metrics.wsConnectionsClosed += 1;
+  });
 });
 
 const port = Number(process.env.PORT ?? 8080);

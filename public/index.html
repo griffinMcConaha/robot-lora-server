@@ -632,6 +632,7 @@
 
     .monitor-row {
       display: flex;
+      align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
       padding: 5px 0;
@@ -639,9 +640,18 @@
       color: #cbd5e1;
     }
 
+    .monitor-row span {
+      flex: 0 0 auto;
+    }
+
     .monitor-row strong {
+      flex: 1 1 auto;
+      min-width: 0;
       color: #bfdbfe;
       font-weight: 700;
+      text-align: right;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
 
     .history-head {
@@ -1283,6 +1293,9 @@
         document.getElementById('lastCommandTime').textContent = payload?.at ? new Date(payload.at).toLocaleTimeString() : '—';
         renderCommandHistory();
         addLogEntry('Command', `${payload?.cmd || 'unknown'} ${payload?.transport?.stage || payload?.status || 'updated'}`, 'event');
+      } else if (event === 'ws.test') {
+        const delivered = payload?.websocket?.connectedClients ?? payload?.delivered ?? 0;
+        addLogEntry('WebSocket', `Live update test reached ${delivered} client${delivered === 1 ? '' : 's'}`, 'event');
       } else if (event === 'fault.received') {
         addLogEntry('Fault', `${payload?.fault || 'UNKNOWN'} (${payload?.action || 'LOG_ONLY'})`, 'warning');
       }
@@ -2023,3 +2036,4 @@
   </script>
 </body>
 </html>
+

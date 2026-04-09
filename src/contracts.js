@@ -264,6 +264,7 @@ const WS_EVENT = Object.freeze({
   MISSION_UPDATED:   'mission.updated',   // mission state transition
   SUPERVISION_UPDATED: 'supervision.updated',
   OPERATOR_UPDATED:    'operator.updated',
+  WS_TEST:             'ws.test',
 });
 
 // ---------------------------------------------------------------------------
@@ -276,6 +277,7 @@ const API = Object.freeze({
   COMMAND:          '/command',               // app-compat: POST
   HEALTH:           '/api/health',            // GET
   METRICS:          '/api/metrics',           // GET
+  WS_TEST:          '/api/ws-test',           // GET/POST
   SUPERVISION_SUMMARY: '/api/supervision/summary',
   INPUT_AREA:       '/api/input-area',        // POST
   TELEMETRY:        '/api/telemetry',         // POST
