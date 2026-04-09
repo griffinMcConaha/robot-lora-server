@@ -1496,7 +1496,8 @@
       const commandPath = connectivity.commandPath || {};
       const robotLink = connectivity.robot || {};
       const backendClass = backend.state === 'online' ? 'ok' : 'critical';
-      const baseClass = baseStation.state === 'online' ? 'ok' : (baseStation.state === 'degraded' ? 'warn' : 'critical');
+      const baseReachable = baseStation.reachable === true || baseStation.state === 'online';
+      const baseClass = baseReachable ? 'ok' : (baseStation.state === 'degraded' ? 'warn' : 'critical');
       const robotClass = robotLink.state === 'online' ? 'ok' : (robotLink.state === 'degraded' || robotLink.state === 'stale' ? 'warn' : 'critical');
       const commandClass = commandPath.state === 'ready' ? 'ok' : (commandPath.state === 'degraded' ? 'warn' : 'critical');
 

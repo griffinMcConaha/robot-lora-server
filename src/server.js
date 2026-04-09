@@ -2772,7 +2772,7 @@ app.get(API.HEALTH, (_req, res) => {
 
   const checks = {
     db: dbOk,
-    bridge: !bridgeStatus.degraded,
+    bridge: connection.baseStation.reachable,
     telemetry: !telemetryStaleWhileRunning,
   };
 
