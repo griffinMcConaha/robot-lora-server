@@ -133,6 +133,7 @@ const metrics = {
 
 const state = {
   baseStation: null,
+  homePoint: null,
   boundary: null,
   coverage: null,
   robot: null,
@@ -249,6 +250,54 @@ function cloneJsonSafe(value, fallback) {
   }
 }
 
+function normalizeLatLonPoint(point, fallback = null) {
+  if (!point || typeof point !== 'object') return fallback;
+
+  const lat = Number(point.lat ?? point.latitude);
+  const lon = Number(point.lon ?? point.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return fallback;
+
+  const heading = Number(point.heading ?? point.headingDeg);
+  const capturedAt = Number(point.capturedAt ?? point.timestampMs);
+  return {
+    lat,
+    lon,
+    heading: Number.isFinite(heading) ? heading : null,
+    source: typeof point.source === 'string' && point.source.trim() ? point.source.trim() : null,
+    capturedAt: Number.isFinite(capturedAt) ? capturedAt : Date.now(),
+  };
+}
+
+function pointsRoughlyEqual(a, b, tolerance = 1e-6) {
+  const pointA = normalizeLatLonPoint(a, null);
+  const pointB = normalizeLatLonPoint(b, null);
+  if (!pointA || !pointB) return false;
+
+  return Math.abs(pointA.lat - pointB.lat) <= tolerance
+    && Math.abs(pointA.lon - pointB.lon) <= tolerance;
+}
+
+function resolveHomePoint(preferred = null) {
+  return normalizeLatLonPoint(preferred, null)
+    ?? normalizeLatLonPoint(state.homePoint, null)
+    ?? normalizeLatLonPoint(state.robot, null)
+    ?? normalizeLatLonPoint(state.baseStation, null);
+}
+
+function mergePlannedSegments(...segments) {
+  const merged = [];
+  for (const segment of segments) {
+    if (!Array.isArray(segment)) continue;
+    for (const point of segment) {
+      if (merged.length > 0 && pointsRoughlyEqual(merged[merged.length - 1], point)) {
+        continue;
+      }
+      merged.push(point);
+    }
+  }
+  return merged;
+}
+
 function serializeCoverageRuntime(map) {
   if (!map) return null;
 
@@ -296,6 +345,7 @@ function buildRuntimeSnapshot(reason = 'unspecified') {
     reason,
     state: {
       baseStation: cloneJsonSafe(state.baseStation, null),
+      homePoint: cloneJsonSafe(state.homePoint, null),
       remoteBaseStation: cloneJsonSafe(state.remoteBaseStation, null),
       boundary: cloneJsonSafe(state.boundary, null),
       coverage: serializeCoverageRuntime(state.coverage),
@@ -369,9 +419,11 @@ function restoreRuntimeState() {
     : (Array.isArray(missionSnapshot?.boundary) && missionSnapshot.boundary.length >= 3 ? missionSnapshot.boundary : null);
   const baseStation = saved?.baseStation ?? missionSnapshot?.baseStation ?? null;
   const remoteBaseStation = cloneJsonSafe(saved?.remoteBaseStation, null);
+  const homePoint = cloneJsonSafe(saved?.homePoint, null) ?? cloneJsonSafe(saved?.baseStation, null) ?? baseStation;
   const cellSizeM = Number(saved?.coverage?.cellSizeM ?? missionSnapshot?.cellSizeM ?? 2.0);
 
   state.baseStation = baseStation;
+  state.homePoint = homePoint;
   state.remoteBaseStation = remoteBaseStation;
   state.boundary = boundary;
   state.robot = cloneJsonSafe(saved?.robot, null);
@@ -1318,6 +1370,7 @@ function buildSupervisionSummary() {
           stale: isTelemetryStale(now),
         }
       : null,
+    homePoint: cloneJsonSafe(state.homePoint, null),
     coverage: state.coverage ? coverageStats(state.coverage) : null,
     safety: {
       telemetryFailsafeEnabled: TELEMETRY_FAILSAFE_ENABLED,
@@ -1885,10 +1938,15 @@ function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0) {
   };
 }
 
-function configureActiveArea(baseStation, boundary, cellSizeM) {
+function configureActiveArea(baseStation, boundary, cellSizeM, homePoint = null) {
   const cellPlan = resolveInputAreaCellSize(boundary, Number(cellSizeM));
+  const capturedHomePoint = normalizeLatLonPoint(homePoint, null)
+    ?? normalizeLatLonPoint(state.robot, null)
+    ?? normalizeLatLonPoint(baseStation, null)
+    ?? normalizeLatLonPoint(state.baseStation, null);
 
   state.baseStation = baseStation;
+  state.homePoint = capturedHomePoint;
   state.boundary = boundary;
   state.coverage = buildCoverageMap(boundary, cellPlan.effectiveCellSizeM);
   state.robot = null;
@@ -1898,7 +1956,7 @@ function configureActiveArea(baseStation, boundary, cellSizeM) {
   resetOperatorState();
 
   const stats = coverageStats(state.coverage);
-  publish(WS_EVENT.AREA_UPDATED, { baseStation, boundary, stats });
+  publish(WS_EVENT.AREA_UPDATED, { baseStation, boundary, homePoint: capturedHomePoint, stats });
 
   if (mission.isActive()) {
     const missionState = mission.publicMission()?.state;
@@ -1921,44 +1979,103 @@ function configureActiveArea(baseStation, boundary, cellSizeM) {
   }
 
   mission.configure({ baseStation, boundary, cellSizeM: cellPlan.effectiveCellSizeM });
-  return { stats, cellPlan };
+  return { stats, cellPlan, homePoint: capturedHomePoint };
 }
 
-function planCoveragePathForCurrentArea({ startPoint, goalPoint, coverageWidthM, saltPct, brinePct }) {
-  const path = findCoveragePath(state.coverage, {
-    swathWidthM: coverageWidthM,
-    startLatLon: startPoint,
-    goalLatLon: goalPoint,
-  });
+function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWidthM, saltPct, brinePct, homePoint = null, returnToBase = false }) {
+  const normalizedStart = normalizeLatLonPoint(startPoint, null);
+  state.homePoint = normalizeLatLonPoint(homePoint, null)
+    ?? normalizeLatLonPoint(state.homePoint, null)
+    ?? normalizeLatLonPoint(state.robot, null)
+    ?? normalizedStart
+    ?? normalizeLatLonPoint(state.baseStation, null);
 
-  if (!path.ok) {
+  const basePath = mode === 'coverage'
+    ? findCoveragePath(state.coverage, {
+        swathWidthM: coverageWidthM,
+        startLatLon: normalizedStart ?? startPoint,
+        goalLatLon: goalPoint ?? null,
+      })
+    : findPath(state.coverage, normalizedStart ?? startPoint, goalPoint);
+
+  if (!basePath.ok) {
     state.lastPath = [];
-    return path;
+    return basePath;
   }
 
-  state.lastPath = path.points.map((point) => ({
+  let plannedPoints = Array.isArray(basePath.points) ? basePath.points.slice() : [];
+  const meta = {
+    ...(basePath.meta ?? {}),
+    homePoint: cloneJsonSafe(state.homePoint, null),
+    returnToBase: Boolean(returnToBase && state.homePoint),
+  };
+
+  if (normalizedStart && plannedPoints.length > 0 && !pointsRoughlyEqual(normalizedStart, plannedPoints[0])) {
+    const ingressPath = findPath(state.coverage, normalizedStart, plannedPoints[0]);
+    if (ingressPath.ok && Array.isArray(ingressPath.points) && ingressPath.points.length > 0) {
+      plannedPoints = mergePlannedSegments(ingressPath.points, plannedPoints);
+      meta.ingressPlanned = true;
+      meta.ingressPointCount = ingressPath.points.length;
+    } else if (ingressPath.reason) {
+      meta.ingressPlanned = false;
+      meta.ingressReason = ingressPath.reason;
+    }
+  }
+
+  const resolvedHomePoint = returnToBase ? resolveHomePoint(homePoint) : null;
+  if (resolvedHomePoint && plannedPoints.length > 0 && !pointsRoughlyEqual(plannedPoints[plannedPoints.length - 1], resolvedHomePoint)) {
+    const returnPath = findPath(state.coverage, plannedPoints[plannedPoints.length - 1], resolvedHomePoint);
+    if (returnPath.ok && Array.isArray(returnPath.points) && returnPath.points.length > 0) {
+      plannedPoints = mergePlannedSegments(plannedPoints, returnPath.points);
+      meta.returnPlanned = true;
+      meta.returnPointCount = returnPath.points.length;
+    } else if (returnPath.reason) {
+      meta.returnPlanned = false;
+      meta.returnReason = returnPath.reason;
+    }
+  }
+
+  state.lastPath = plannedPoints.map((point) => ({
     ...point,
     salt: saltPct,
     brine: brinePct,
   }));
 
   publish(WS_EVENT.PATH_UPDATED, {
-    mode: 'coverage',
-    coverageWidthM,
+    mode,
+    coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
     points: state.lastPath,
-    meta: path.meta ?? null,
+    meta,
   });
   db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
-    mode: 'coverage',
+    mode,
     pointCount: state.lastPath.length,
     saltPct,
     brinePct,
-    coverageWidthM,
+    coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
+    returnToBase: Boolean(meta.returnToBase),
   });
   scheduleRuntimeStateSave('path.planned', { immediate: true });
   publishSupervision();
   publishOperator();
-  return path;
+  return {
+    ...basePath,
+    points: state.lastPath,
+    meta,
+  };
+}
+
+function planCoveragePathForCurrentArea({ startPoint, goalPoint, coverageWidthM, saltPct, brinePct, homePoint = null, returnToBase = true }) {
+  return buildMissionPath({
+    mode: 'coverage',
+    startPoint,
+    goalPoint,
+    coverageWidthM,
+    saltPct,
+    brinePct,
+    homePoint,
+    returnToBase,
+  });
 }
 
 function isHardwareLockedForDemo() {
@@ -3137,6 +3254,7 @@ function buildWebSocketDiagnostics() {
 function publicState() {
   return {
     baseStation: state.baseStation ?? state.remoteBaseStation,
+    homePoint: state.homePoint,
     remoteBaseStation: state.remoteBaseStation,
     boundary: state.boundary,
     demo: state.demo,
@@ -3439,7 +3557,7 @@ app.get(API.ROOT, (_req, res) => {
   });
 });
 app.post(API.INPUT_AREA, requireApp, (req, res) => {
-  const { baseStation, boundary, cellSizeM = 2.0 } = req.body ?? {};
+  const { baseStation, boundary, cellSizeM = 2.0, homePoint = null } = req.body ?? {};
   const startedAt = Date.now();
 
   if (!baseStation || typeof baseStation.lat !== 'number' || typeof baseStation.lon !== 'number') {
@@ -3450,7 +3568,7 @@ app.post(API.INPUT_AREA, requireApp, (req, res) => {
     return res.status(400).json({ ok: false, error: 'boundary requires at least 3 points' });
   }
 
-  const { stats, cellPlan } = configureActiveArea(baseStation, boundary, Number(cellSizeM));
+  const { stats, cellPlan, homePoint: capturedHomePoint } = configureActiveArea(baseStation, boundary, Number(cellSizeM), homePoint);
   scheduleRuntimeStateSave('area.set', { immediate: true });
   publishOperator();
   publishSupervision();
@@ -3462,6 +3580,7 @@ app.post(API.INPUT_AREA, requireApp, (req, res) => {
     cellSizeM: cellPlan.effectiveCellSizeM,
     cellSizeAdjusted: cellPlan.adjusted,
     estimatedCells: cellPlan.estimatedCells,
+    homePoint: capturedHomePoint,
     buildMs: Date.now() - startedAt,
   });
 });
@@ -3695,7 +3814,7 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     return res.status(400).json({ ok: false, error: 'input area is not initialized' });
   }
 
-  const { goal, start, saltPct, brinePct } = req.body ?? {};
+  const { goal, start, saltPct, brinePct, homePoint = null } = req.body ?? {};
   const requestedMode = typeof req.body?.mode === 'string' ? req.body.mode.trim().toLowerCase() : null;
   const coverageWidthM = Number.isFinite(Number(req.body?.coverageWidthM)) && Number(req.body?.coverageWidthM) > 0
     ? Number(req.body.coverageWidthM)
@@ -3708,7 +3827,11 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     ? Math.max(0, Math.min(100, Math.round(Number(brinePct))))
     : 100;
 
-  const startPoint = start ?? state.robot ?? state.baseStation;
+  const requestedStartPoint = normalizeLatLonPoint(start, null);
+  const startPoint = normalizeLatLonPoint(state.robot, null)
+    ?? normalizeLatLonPoint(state.homePoint, null)
+    ?? requestedStartPoint
+    ?? normalizeLatLonPoint(state.baseStation, null);
   if (!startPoint) {
     return res.status(400).json({ ok: false, error: 'no start point available' });
   }
@@ -3726,37 +3849,35 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     return res.status(400).json({ ok: false, error: 'goal.lat/lon required for goal mode' });
   }
 
-  const path = mode === 'coverage'
-    ? findCoveragePath(state.coverage, { swathWidthM: coverageWidthM, startLatLon: startPoint, goalLatLon: goal ?? null })
-    : findPath(state.coverage, startPoint, goal);
+  const returnToBase = mode === 'coverage'
+    ? req.body?.returnToBase !== false
+    : req.body?.returnToBase === true;
+
+  const path = buildMissionPath({
+    mode,
+    startPoint,
+    goalPoint: goal ?? null,
+    coverageWidthM,
+    saltPct: normalizedSalt,
+    brinePct: normalizedBrine,
+    homePoint,
+    returnToBase,
+  });
 
   if (!path.ok) {
     state.lastPath = [];
     return res.status(400).json({ ok: false, error: path.reason });
   }
 
-  state.lastPath = path.points.map((point) => ({
-    ...point,
-    salt: normalizedSalt,
-    brine: normalizedBrine,
-  }));
-  publish(WS_EVENT.PATH_UPDATED, {
+  res.json({
+    ok: true,
     mode,
     coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
+    returnToBase,
+    homePoint: cloneJsonSafe(state.homePoint, null),
     points: state.lastPath,
     meta: path.meta ?? null,
   });
-  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
-    mode,
-    pointCount: state.lastPath.length,
-    saltPct: normalizedSalt,
-    brinePct: normalizedBrine,
-    coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
-  });
-  scheduleRuntimeStateSave('path.planned', { immediate: true });
-  publishSupervision();
-  publishOperator();
-  res.json({ ok: true, mode, coverageWidthM: mode === 'coverage' ? coverageWidthM : null, points: state.lastPath, meta: path.meta ?? null });
 });
 
 // ---------------------------------------------------------------------------
