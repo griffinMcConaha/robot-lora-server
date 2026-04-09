@@ -122,6 +122,9 @@ const metrics = {
   wsConnectionsClosed: 0,
   wsPeakClients: 0,
   wsLastTestAt: null,
+  remoteBaseStationAccepted: 0,
+  remoteBaseStationRejected: 0,
+  remoteBaseStationLastAt: null,
 };
 
 const state = {
@@ -780,6 +783,25 @@ function normalizeRemoteBaseStationStatus(payload) {
     configured,
     apSsid: payload.ap_ssid ?? payload.apSsid ?? null,
     raw: cloneJsonSafe(payload, null),
+  };
+}
+
+function buildRemoteBaseStationDiagnostics(now = Date.now()) {
+  const ageMs = remoteBaseStationAgeMs(now);
+  const fresh = isRemoteBaseStationFresh(now);
+  const remote = state.remoteBaseStation ?? null;
+  return {
+    present: Boolean(remote),
+    fresh,
+    ageMs,
+    lastReceivedAt: remote?.receivedAt ?? null,
+    wifiLinkState: remote?.wifiLinkState ?? null,
+    loraLinkState: remote?.loraLinkState ?? null,
+    backendUrl: remote?.backendUrl ?? null,
+    lastCmdId: remote?.lastCmdId ?? null,
+    lastCmdStatus: remote?.lastCmdStatus ?? null,
+    queueDepth: remote?.queueDepth ?? null,
+    ackCount: remote?.ackCount ?? null,
   };
 }
 
@@ -2843,6 +2865,8 @@ app.get(API.HEALTH, (_req, res) => {
       geofenceFailsafeEnabled: GEOFENCE_FAILSAFE_ENABLED,
       geofenceFailsafeAction: resolveGeofenceFailsafeAction(),
     },
+    connectivity: connection,
+    remoteBaseStation: buildRemoteBaseStationDiagnostics(),
     missionState,
     telemetryStale: connection.robot.telemetryStale,
     lora: {
@@ -3197,16 +3221,37 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
 app.post(API.BASE_STATION_STATUS, requireBoard, rateLimitTelemetry, async (req, res) => {
   const normalized = normalizeRemoteBaseStationStatus(req.body);
   if (!normalized) {
+    metrics.remoteBaseStationRejected += 1;
+    console.warn('[remote-base-station] rejected status payload');
     return res.status(400).json({ ok: false, error: 'Unsupported base station status payload' });
   }
 
+  metrics.remoteBaseStationAccepted += 1;
+  metrics.remoteBaseStationLastAt = normalized.receivedAt;
   state.remoteBaseStation = normalized;
   state.baseStation = normalized;
+  console.log(
+    '[remote-base-station] status received',
+    JSON.stringify({
+      at: normalized.receivedAt,
+      wifi: normalized.wifiLinkState,
+      lora: normalized.loraLinkState,
+      queueDepth: normalized.queueDepth,
+      cmdId: normalized.lastCmdId,
+      cmdStatus: normalized.lastCmdStatus,
+      backendUrl: normalized.backendUrl,
+    })
+  );
   publishSupervision();
   publishOperator();
   publish(WS_EVENT.STATE_SNAPSHOT, publicState());
   scheduleRuntimeStateSave('base_station.remote_status');
-  return res.json({ ok: true, receivedAt: normalized.receivedAt });
+  return res.json({
+    ok: true,
+    receivedAt: normalized.receivedAt,
+    connectivity: buildConnectionState(),
+    remoteBaseStation: buildRemoteBaseStationDiagnostics(),
+  });
 });
 
 app.get(API.STATE, requireAppOrBoard, (_req, res) => {
