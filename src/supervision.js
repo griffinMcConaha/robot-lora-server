@@ -18,6 +18,8 @@ function isTelemetryStale(robot, staleThresholdMs, now = Date.now()) {
 }
 
 function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, zeroDispersionPath, gpsReady, gpsReason, demoModeEnabled }) {
+  const gpsGateOpen = gpsReady || gpsReason === 'Robot telemetry is unavailable';
+
   return [
     { id: 'input-area', enabled: true, reason: null },
     { id: 'path-plan', enabled: hasCoverage, reason: hasCoverage ? null : 'Area is not configured' },
@@ -35,12 +37,12 @@ function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, 
     },
     {
       id: 'mission-start',
-      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || hasPath) && !zeroDispersionPath && gpsReady && !demoModeEnabled,
+      enabled: missionState === MISSION_STATE.CONFIGURING && (wpPushState === 'committed' || hasPath) && !zeroDispersionPath && gpsGateOpen && !demoModeEnabled,
       reason: demoModeEnabled
         ? 'Demo mode is on. Live mission start is locked.'
         : missionState !== MISSION_STATE.CONFIGURING
         ? 'Mission must be CONFIGURING'
-        : !gpsReady
+        : !gpsGateOpen
           ? (gpsReason ?? 'Robot GPS readiness is required before mission start')
         : zeroDispersionPath
           ? 'Zero-dispersion path cannot be started'
@@ -49,12 +51,12 @@ function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, 
     { id: 'mission-pause', enabled: missionState === MISSION_STATE.RUNNING, reason: missionState === MISSION_STATE.RUNNING ? null : 'Mission is not RUNNING' },
     {
       id: 'mission-resume',
-      enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed' && gpsReady && !demoModeEnabled,
+      enabled: missionState === MISSION_STATE.PAUSED && wpPushState === 'committed' && gpsGateOpen && !demoModeEnabled,
       reason: demoModeEnabled
         ? 'Demo mode is on. Live mission resume is locked.'
         : missionState !== MISSION_STATE.PAUSED
         ? 'Mission is not PAUSED'
-        : !gpsReady
+        : !gpsGateOpen
           ? (gpsReason ?? 'Robot GPS readiness is required before mission resume')
           : null,
     },

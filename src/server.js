@@ -88,6 +88,9 @@ const RUNTIME_STATE_SAVE_DEBOUNCE_MS = Number(process.env.RUNTIME_STATE_SAVE_DEB
 const RUNTIME_STATE_TRAIL_LIMIT = Number(process.env.RUNTIME_STATE_TRAIL_LIMIT ?? 300);
 const COMMAND_HISTORY_LIMIT = Number(process.env.COMMAND_HISTORY_LIMIT ?? 50);
 const REMOTE_BASE_STATION_STALE_MS = Number(process.env.REMOTE_BASE_STATION_STALE_MS ?? 15000);
+const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? Math.max(LORA_WIRE.MAX_WAYPOINTS + 8, 256));
+const REMOTE_COMMAND_STALE_MS = Number(process.env.REMOTE_COMMAND_STALE_MS ?? 300000);
+const REMOTE_COMMAND_ACK_RETENTION_MS = Number(process.env.REMOTE_COMMAND_ACK_RETENTION_MS ?? 15000);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -102,6 +105,7 @@ const BOARD_API_KEYS = new Set();
 const API_AUTH_ENABLED = false;
 
 const rateLimitStore = new Map();
+const remoteCommandQueue = [];
 
 const metrics = {
   startedAt: Date.now(),
@@ -746,6 +750,15 @@ function isRemoteBaseStationFresh(now = Date.now()) {
   return typeof age === 'number' && age <= REMOTE_BASE_STATION_STALE_MS;
 }
 
+function isRemoteCommandFallbackReady(now = Date.now()) {
+  if (!isRemoteBaseStationFresh(now)) {
+    return false;
+  }
+
+  const wifiState = String(state.remoteBaseStation?.wifiLinkState ?? '').trim().toLowerCase();
+  return !wifiState || ['online', 'connected'].includes(wifiState);
+}
+
 function normalizeRemoteBaseStationStatus(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
 
@@ -803,6 +816,189 @@ function buildRemoteBaseStationDiagnostics(now = Date.now()) {
     queueDepth: remote?.queueDepth ?? null,
     ackCount: remote?.ackCount ?? null,
   };
+}
+
+function normalizeRemoteTrackedStatus(rawStatus) {
+  const token = String(rawStatus ?? '').trim().toLowerCase();
+  if (!token) return null;
+  if (['applied', 'complete', 'completed'].includes(token)) return COMMAND_STATUS.APPLIED;
+  if (['acknowledged', 'ack', 'acked'].includes(token)) return COMMAND_STATUS.ACKNOWLEDGED;
+  if (['forwarded', 'sent'].includes(token)) return COMMAND_STATUS.FORWARDED;
+  if (['queued', 'pending', 'retry', 'retrying'].includes(token)) return COMMAND_STATUS.QUEUED;
+  if (['failed', 'error'].includes(token)) return COMMAND_STATUS.FAILED;
+  return null;
+}
+
+function transportStageForStatus(status) {
+  switch (status) {
+    case COMMAND_STATUS.APPLIED:
+      return COMMAND_TRANSPORT_STAGE.ROBOT_APPLIED;
+    case COMMAND_STATUS.ACKNOWLEDGED:
+      return COMMAND_TRANSPORT_STAGE.LORA_ACKNOWLEDGED;
+    case COMMAND_STATUS.FORWARDED:
+      return COMMAND_TRANSPORT_STAGE.BASE_STATION_FORWARDED;
+    case COMMAND_STATUS.FAILED:
+      return COMMAND_TRANSPORT_STAGE.FAILED;
+    case COMMAND_STATUS.TIMED_OUT:
+      return COMMAND_TRANSPORT_STAGE.TIMED_OUT;
+    default:
+      return COMMAND_TRANSPORT_STAGE.BACKEND_QUEUED;
+  }
+}
+
+function pruneRemoteCommandQueue(now = Date.now()) {
+  for (let index = remoteCommandQueue.length - 1; index >= 0; index -= 1) {
+    const entry = remoteCommandQueue[index];
+    const createdAt = Number(entry?.createdAt ?? now);
+    const ackedAt = Number(entry?.ackedAt ?? 0);
+    const ageMs = Math.max(0, now - createdAt);
+    const ackAgeMs = ackedAt > 0 ? Math.max(0, now - ackedAt) : 0;
+
+    if (!entry?.deliveryAcked && ageMs > REMOTE_COMMAND_STALE_MS) {
+      updateCommandTracking(entry.commandId, {
+        cmd: entry.cmd,
+        source: entry.source ?? 'remote-bridge',
+        status: COMMAND_STATUS.TIMED_OUT,
+        error: 'Remote base station command delivery timed out',
+        detail: { stage: COMMAND_TRANSPORT_STAGE.TIMED_OUT, ageMs },
+      });
+      remoteCommandQueue.splice(index, 1);
+      continue;
+    }
+
+    if (entry?.deliveryAcked && ackAgeMs > REMOTE_COMMAND_ACK_RETENTION_MS) {
+      remoteCommandQueue.splice(index, 1);
+    }
+  }
+}
+
+function pendingRemoteCommandCount(now = Date.now()) {
+  pruneRemoteCommandQueue(now);
+  return remoteCommandQueue.filter((entry) => !entry.deliveryAcked).length;
+}
+
+function enqueueRemoteCommand({ commandId, cmd, source = 'remote-bridge' }) {
+  pruneRemoteCommandQueue();
+  const existing = remoteCommandQueue.find((entry) => entry.commandId === commandId);
+  if (existing) {
+    return existing;
+  }
+  if (pendingRemoteCommandCount() >= REMOTE_COMMAND_MAX_QUEUE) {
+    return null;
+  }
+
+  const entry = {
+    commandId,
+    cmd,
+    source,
+    createdAt: Date.now(),
+    deliveryAcked: false,
+    ackedAt: null,
+    deliveryStatus: COMMAND_STATUS.QUEUED,
+    leaseCount: 0,
+    lastLeaseAt: null,
+    lastError: null,
+  };
+  remoteCommandQueue.push(entry);
+  return entry;
+}
+
+function queueRemoteWaypointPush(points, source = 'remote-bridge') {
+  if (!Array.isArray(points) || points.length === 0) {
+    return { ok: false, status: 400, error: 'No waypoint set available for remote queue', sent: 0 };
+  }
+
+  const commands = [
+    LORA_WIRE.WP_CLEAR,
+    ...points.map((point, index) => {
+      const salt = clampNumber(Math.round(Number(point?.salt ?? 0)), 0, 100);
+      const brine = clampNumber(Math.round(Number(point?.brine ?? 0)), 0, 100);
+      return `${LORA_WIRE.WP_ADD}:${index}:${Number(point.lat).toFixed(6)},${Number(point.lon).toFixed(6)},${salt},${brine}`;
+    }),
+    `${LORA_WIRE.WP_LOAD}:${points.length}`,
+  ];
+
+  const queueDepth = pendingRemoteCommandCount();
+  if ((queueDepth + commands.length) > REMOTE_COMMAND_MAX_QUEUE) {
+    bridge.resetWpState();
+    return {
+      ok: false,
+      status: 503,
+      error: `Remote waypoint queue is full (${queueDepth}/${REMOTE_COMMAND_MAX_QUEUE})`,
+      sent: 0,
+    };
+  }
+
+  let finalCommandId = null;
+  for (const command of commands) {
+    const commandId = createCommandId();
+    const queued = enqueueRemoteCommand({ commandId, cmd: command, source: `${source}.remote` });
+    if (!queued) {
+      bridge.resetWpState();
+      return { ok: false, status: 503, error: 'Unable to queue remote waypoint command', sent: 0 };
+    }
+    finalCommandId = commandId;
+    bridge.observeCommand(command);
+  }
+
+  if (finalCommandId) {
+    updateCommandTracking(finalCommandId, {
+      cmd: `${LORA_WIRE.WP_LOAD}:${points.length}`,
+      source,
+      status: COMMAND_STATUS.QUEUED,
+      detail: {
+        stage: COMMAND_TRANSPORT_STAGE.BACKEND_QUEUED,
+        remoteQueued: true,
+        queueDepth: pendingRemoteCommandCount(),
+        waypointCount: points.length,
+        commandBatchSize: commands.length,
+      },
+    });
+  }
+
+  return {
+    ok: true,
+    status: 202,
+    sent: points.length,
+    queuedRemote: true,
+    commandId: finalCommandId,
+  };
+}
+
+function peekRemoteCommandForBoard(now = Date.now()) {
+  pruneRemoteCommandQueue(now);
+  return remoteCommandQueue.find((entry) => !entry.deliveryAcked) ?? null;
+}
+
+function acknowledgeRemoteCommand(commandId, payload = {}) {
+  const entry = remoteCommandQueue.find((item) => item.commandId === commandId);
+  if (!entry) {
+    return null;
+  }
+
+  const status = normalizeRemoteTrackedStatus(payload?.status) ?? COMMAND_STATUS.FORWARDED;
+  entry.deliveryStatus = status;
+  entry.lastError = typeof payload?.error === 'string' ? payload.error : null;
+  entry.deliveryAcked = payload?.status !== 'retry';
+  entry.ackedAt = Date.now();
+
+  updateCommandTracking(commandId, {
+    cmd: entry.cmd,
+    source: entry.source ?? 'remote-bridge',
+    status,
+    error: entry.lastError,
+    detail: {
+      stage: transportStageForStatus(status),
+      remoteQueued: true,
+      queueDepth: pendingRemoteCommandCount(),
+    },
+  });
+
+  scheduleRuntimeStateSave('command.remote_ack');
+  publishSupervision();
+  publishOperator();
+  pruneRemoteCommandQueue();
+  return entry;
 }
 
 function getWorkflowAck(workflowId, stepId) {
@@ -1008,7 +1204,7 @@ function buildConnectionState(now = Date.now()) {
     timestampMs: state.robot?.timestampMs ?? null,
   };
 
-  const commandTransportAvailable = localBaseStationReachable;
+  const commandTransportAvailable = localBaseStationReachable || remoteBaseStationFresh;
   const commandPathReady = dbOk && commandTransportAvailable && robotReachable && !telemetryStale;
   const commandPath = {
     state: commandPathReady ? CONNECTION_STATE.READY : (baseStationReachable ? CONNECTION_STATE.DEGRADED : CONNECTION_STATE.OFFLINE),
@@ -1795,6 +1991,67 @@ function isDemoSafeCommand(cmd) {
   ].includes(cmd);
 }
 
+function queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission = true }) {
+  const queued = enqueueRemoteCommand({ commandId, cmd, source });
+  if (!queued) {
+    metrics.commandsFailed += 1;
+    const queueError = `Remote base station queue is full (${pendingRemoteCommandCount()}/${REMOTE_COMMAND_MAX_QUEUE})`;
+    updateCommandTracking(commandId, {
+      cmd,
+      source,
+      status: COMMAND_STATUS.FAILED,
+      error: queueError,
+      detail: {
+        stage: COMMAND_TRANSPORT_STAGE.FAILED,
+        remoteQueued: false,
+        queueDepth: pendingRemoteCommandCount(),
+      },
+    });
+    return { ok: false, status: 503, error: queueError };
+  }
+
+  if (isWaypointCommand(cmd)) {
+    bridge.observeCommand(cmd);
+  }
+
+  updateCommandTracking(commandId, {
+    cmd,
+    source,
+    status: COMMAND_STATUS.QUEUED,
+    detail: {
+      stage: COMMAND_TRANSPORT_STAGE.BACKEND_QUEUED,
+      remoteQueued: true,
+      queueDepth: pendingRemoteCommandCount(),
+      queuedAt: queued.createdAt,
+    },
+  });
+  db.logEvent(mission.currentId(), EVENT_TYPE.COMMAND_SENT, {
+    cmd,
+    commandId,
+    status: COMMAND_STATUS.QUEUED,
+    source,
+    remoteQueued: true,
+  });
+  mission.recordCommand();
+
+  if (syncMission) {
+    syncMissionToCommand(cmd);
+  }
+
+  scheduleRuntimeStateSave(`dispatch.remote.${cmd}`, { immediate: !DRIVE_COMMANDS.has(cmd) });
+  publishSupervision();
+  publishOperator();
+  metrics.commandsDispatched += 1;
+
+  return {
+    ok: true,
+    status: 202,
+    body: 'queued_remote',
+    commandId,
+    queuedRemote: true,
+  };
+}
+
 async function dispatchCommand(cmd, options = {}) {
   const { syncMission = true, source = 'api.command', waitForAck = false, waitForState = false } = options;
   const commandId = createCommandId();
@@ -1818,8 +2075,59 @@ async function dispatchCommand(cmd, options = {}) {
     status: COMMAND_STATUS.QUEUED,
   });
 
+  const remoteFallbackReady = isRemoteCommandFallbackReady() && !bridge.getStatus().baseStation?.statusOk;
+  if (remoteFallbackReady) {
+    return queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission });
+  }
+
   const result = await bridge.sendCommand(cmd, { waitForAck, commandId, commandSource: source });
   if (!result.ok) {
+    const ackTimedOut = waitForAck && result.status === 504;
+    if (ackTimedOut) {
+      if (isWaypointCommand(cmd)) {
+        bridge.observeCommand(cmd);
+      }
+      updateCommandTracking(commandId, {
+        cmd,
+        source,
+        status: COMMAND_STATUS.FORWARDED,
+        error: null,
+        detail: {
+          stage: COMMAND_TRANSPORT_STAGE.BASE_STATION_FORWARDED,
+          ackTimedOut: true,
+          warning: result.error ?? null,
+        },
+      });
+      db.logEvent(mission.currentId(), EVENT_TYPE.COMMAND_SENT, {
+        cmd,
+        commandId,
+        status: COMMAND_STATUS.FORWARDED,
+        source,
+        ackTimedOut: true,
+      });
+      mission.recordCommand();
+      if (syncMission) {
+        syncMissionToCommand(cmd);
+      }
+      scheduleRuntimeStateSave(`dispatch.${cmd}`, { immediate: !DRIVE_COMMANDS.has(cmd) });
+      publishSupervision();
+      publishOperator();
+      metrics.commandsDispatched += 1;
+      return {
+        ok: true,
+        status: 202,
+        body: result.body ?? '',
+        commandId,
+        ackTimedOut: true,
+        warning: result.error ?? null,
+      };
+    }
+
+    const remoteFallbackReadyAfterFailure = isRemoteCommandFallbackReady() && !bridge.getStatus().baseStation?.statusOk;
+    if (remoteFallbackReadyAfterFailure) {
+      return queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission });
+    }
+
     metrics.commandsFailed += 1;
     updateCommandTracking(commandId, {
       cmd,
@@ -1940,15 +2248,39 @@ async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge') {
     return { ok: false, status: 409, error: 'Waypoint push blocked: path has 0% salt and 0% brine' };
   }
 
-  const result = await bridge.pushWaypoints(points);
-  if (!result.ok) {
-    return { ok: false, status: 502, error: result.error, sent: result.sent };
+  const shouldPreferRemoteQueue = isRemoteCommandFallbackReady() && !bridge.getStatus().baseStation?.statusOk;
+  const result = shouldPreferRemoteQueue
+    ? queueRemoteWaypointPush(points, source)
+    : await bridge.pushWaypoints(points);
+
+  if (!result.ok && !shouldPreferRemoteQueue && isRemoteCommandFallbackReady()) {
+    const remoteResult = queueRemoteWaypointPush(points, source);
+    if (remoteResult.ok) {
+      db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
+        wpPushCount: remoteResult.sent,
+        source,
+        remoteQueued: true,
+      });
+      scheduleRuntimeStateSave('waypoints.remote_queued', { immediate: true });
+      publishSupervision();
+      publishOperator();
+      return { ok: true, status: remoteResult.status ?? 202, sent: remoteResult.sent, points, queuedRemote: true };
+    }
+    return remoteResult;
   }
-  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, { wpPushCount: result.sent, source });
-  scheduleRuntimeStateSave('waypoints.committed', { immediate: true });
+
+  if (!result.ok) {
+    return { ok: false, status: result.status ?? 502, error: result.error, sent: result.sent };
+  }
+  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
+    wpPushCount: result.sent,
+    source,
+    remoteQueued: Boolean(result.queuedRemote),
+  });
+  scheduleRuntimeStateSave(result.queuedRemote ? 'waypoints.remote_queued' : 'waypoints.committed', { immediate: true });
   publishSupervision();
   publishOperator();
-  return { ok: true, status: 200, sent: result.sent, points };
+  return { ok: true, status: result.status ?? 200, sent: result.sent, points, queuedRemote: Boolean(result.queuedRemote) };
 }
 
 async function startMissionAction(source = 'mission.start') {
@@ -1961,7 +2293,7 @@ async function startMissionAction(source = 'mission.start') {
     return { ok: false, status: 409, error: 'Mission start blocked: path has 0% salt and 0% brine' };
   }
   const gpsStatus = getRobotGpsStatus();
-  if (!gpsStatus.ready) {
+  if (state.robot && !gpsStatus.ready) {
     return { ok: false, status: 409, error: `Mission start blocked: ${gpsStatus.reason}` };
   }
 
@@ -1975,7 +2307,7 @@ async function startMissionAction(source = 'mission.start') {
     return { ok: false, status: 409, error: 'Mission start requires a committed waypoint set' };
   }
 
-  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: true, waitForState: true });
+  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: false, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
@@ -1990,7 +2322,7 @@ async function pauseMissionAction(reason = null, source = 'mission.pause') {
   if (currentMissionState() !== MISSION_STATE.RUNNING) {
     return { ok: false, status: 409, error: 'Mission must be RUNNING before pause' };
   }
-  const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source, waitForAck: true, waitForState: true });
+  const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source, waitForAck: false, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
@@ -2007,13 +2339,13 @@ async function resumeMissionAction(source = 'mission.resume') {
     return { ok: false, status: 409, error: 'Mission must be PAUSED before resume' };
   }
   const gpsStatus = getRobotGpsStatus();
-  if (!gpsStatus.ready) {
+  if (state.robot && !gpsStatus.ready) {
     return { ok: false, status: 409, error: `Mission resume blocked: ${gpsStatus.reason}` };
   }
   if (bridge.getStatus().wpPushState !== 'committed') {
     return { ok: false, status: 409, error: 'Mission resume requires committed waypoints' };
   }
-  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: true, waitForState: true });
+  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: false, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
@@ -2027,7 +2359,7 @@ async function completeMissionAction(source = 'mission.complete') {
   if (currentMissionState() !== MISSION_STATE.RUNNING) {
     return { ok: false, status: 409, error: 'Mission must be RUNNING before complete' };
   }
-  const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source, waitForAck: true, waitForState: true });
+  const dispatched = await dispatchCommand(CMD.PAUSE, { syncMission: false, source, waitForAck: false, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
@@ -2048,7 +2380,7 @@ async function abortMissionAction(reason = 'operator', source = 'mission.abort')
   if (![MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
     return { ok: false, status: 409, error: 'Mission must be RUNNING or PAUSED before abort' };
   }
-  const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source, waitForAck: true, waitForState: true });
+  const dispatched = await dispatchCommand(CMD.ESTOP, { syncMission: false, source, waitForAck: false, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
@@ -3230,6 +3562,24 @@ app.post(API.BASE_STATION_STATUS, requireBoard, rateLimitTelemetry, async (req, 
   metrics.remoteBaseStationLastAt = normalized.receivedAt;
   state.remoteBaseStation = normalized;
   state.baseStation = normalized;
+
+  if (typeof normalized.lastCmdId === 'string' && normalized.lastCmdId.trim()) {
+    const trackedStatus = normalizeRemoteTrackedStatus(normalized.lastCmdStatus);
+    if (trackedStatus) {
+      updateCommandTracking(normalized.lastCmdId.trim(), {
+        cmd: normalized.lastCmd ?? null,
+        source: 'remote-base-station.status',
+        status: trackedStatus,
+        error: trackedStatus === COMMAND_STATUS.FAILED ? 'Remote base station reported a command failure' : null,
+        detail: {
+          stage: transportStageForStatus(trackedStatus),
+          remoteQueued: true,
+          queueDepth: normalized.queueDepth ?? null,
+        },
+      });
+    }
+  }
+
   console.log(
     '[remote-base-station] status received',
     JSON.stringify({
@@ -3252,6 +3602,44 @@ app.post(API.BASE_STATION_STATUS, requireBoard, rateLimitTelemetry, async (req, 
     connectivity: buildConnectionState(),
     remoteBaseStation: buildRemoteBaseStationDiagnostics(),
   });
+});
+
+app.get(API.BASE_STATION_COMMAND, requireBoard, (_req, res) => {
+  const pending = peekRemoteCommandForBoard();
+  if (!pending) {
+    return res.json({ ok: true, pending: false, queueDepth: pendingRemoteCommandCount() });
+  }
+
+  pending.leaseCount = Number(pending.leaseCount ?? 0) + 1;
+  pending.lastLeaseAt = Date.now();
+
+  return res.json({
+    ok: true,
+    pending: true,
+    commandId: pending.commandId,
+    cmd: pending.cmd,
+    source: pending.source,
+    queuedAt: pending.createdAt,
+    queueDepth: pendingRemoteCommandCount(),
+  });
+});
+
+app.post(API.BASE_STATION_COMMAND_ACK, requireBoard, (req, res) => {
+  const commandId = typeof req.body?.commandId === 'string' ? req.body.commandId.trim() : '';
+  if (!commandId) {
+    return res.status(400).json({ ok: false, error: 'commandId is required' });
+  }
+
+  const ack = acknowledgeRemoteCommand(commandId, {
+    status: req.body?.status,
+    error: req.body?.error,
+  });
+
+  if (!ack) {
+    return res.status(404).json({ ok: false, error: 'Command not found or already expired' });
+  }
+
+  return res.json({ ok: true, commandId, status: ack.deliveryStatus, queueDepth: pendingRemoteCommandCount() });
 });
 
 app.get(API.STATE, requireAppOrBoard, (_req, res) => {

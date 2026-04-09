@@ -282,6 +282,8 @@ const API = Object.freeze({
   INPUT_AREA:       '/api/input-area',        // POST
   TELEMETRY:        '/api/telemetry',         // POST
   BASE_STATION_STATUS: '/api/base-station/status', // POST
+  BASE_STATION_COMMAND: '/api/base-station/command', // GET
+  BASE_STATION_COMMAND_ACK: '/api/base-station/command-ack', // POST
   STATE:            '/api/state',             // GET
   COMMAND_HISTORY:  '/api/commands/recent',   // GET
   COVERAGE:         '/api/coverage',          // GET
