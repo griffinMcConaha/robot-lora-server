@@ -87,6 +87,7 @@ const GPS_FAILSAFE_COOLDOWN_MS = Number(process.env.GPS_FAILSAFE_COOLDOWN_MS ?? 
 const RUNTIME_STATE_SAVE_DEBOUNCE_MS = Number(process.env.RUNTIME_STATE_SAVE_DEBOUNCE_MS ?? 750);
 const RUNTIME_STATE_TRAIL_LIMIT = Number(process.env.RUNTIME_STATE_TRAIL_LIMIT ?? 300);
 const COMMAND_HISTORY_LIMIT = Number(process.env.COMMAND_HISTORY_LIMIT ?? 50);
+const REMOTE_BASE_STATION_STALE_MS = Number(process.env.REMOTE_BASE_STATION_STALE_MS ?? 15000);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -128,6 +129,7 @@ const state = {
   boundary: null,
   coverage: null,
   robot: null,
+  remoteBaseStation: null,
   trail: [],
   lastPath: [],
   lastCommand: null,
@@ -728,6 +730,56 @@ function isTelemetryStale(now = Date.now()) {
   return supervisionIsTelemetryStale(state.robot, SUPERVISION_TELEMETRY_STALE_MS, now);
 }
 
+function remoteBaseStationAgeMs(now = Date.now()) {
+  if (!state.remoteBaseStation?.receivedAt) return null;
+  return Math.max(0, now - state.remoteBaseStation.receivedAt);
+}
+
+function isRemoteBaseStationFresh(now = Date.now()) {
+  const age = remoteBaseStationAgeMs(now);
+  return typeof age === 'number' && age <= REMOTE_BASE_STATION_STALE_MS;
+}
+
+function normalizeRemoteBaseStationStatus(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+
+  const receivedAt = Date.now();
+  const queueDepth = Number.isFinite(Number(payload.queue_depth ?? payload.queueDepth))
+    ? Number(payload.queue_depth ?? payload.queueDepth)
+    : null;
+  const ackCount = Number.isFinite(Number(payload.ack_count ?? payload.ackCount))
+    ? Number(payload.ack_count ?? payload.ackCount)
+    : null;
+  const configured = typeof payload.configured === 'boolean'
+    ? payload.configured
+    : (String(payload.configured ?? '').toLowerCase() === 'true');
+
+  return {
+    receivedAt,
+    source: 'remote_status',
+    connectionPath: 'remote_bridge',
+    connectionPathLabel: 'Remote bridge',
+    discoverySource: 'remote_status',
+    reachable: true,
+    statusVersion: payload.status_version ?? payload.statusVersion ?? null,
+    mode: payload.mode ?? null,
+    state: payload.state ?? null,
+    wifiLinkState: payload.wifi_link_state ?? payload.wifiLinkState ?? null,
+    loraLinkState: payload.lora_link_state ?? payload.loraLinkState ?? null,
+    queueDepth,
+    ackCount,
+    lastCmd: payload.last_cmd ?? payload.lastCmd ?? null,
+    lastCmdId: payload.last_cmd_id ?? payload.lastCmdId ?? null,
+    lastCmdStatus: payload.last_cmd_status ?? payload.lastCmdStatus ?? null,
+    lastAck: payload.last_ack ?? payload.lastAck ?? null,
+    lastLoRa: payload.last_lora ?? payload.lastLoRa ?? null,
+    backendUrl: payload.backend_url ?? payload.backendUrl ?? null,
+    configured,
+    apSsid: payload.ap_ssid ?? payload.apSsid ?? null,
+    raw: cloneJsonSafe(payload, null),
+  };
+}
+
 function getWorkflowAck(workflowId, stepId) {
   return state.operator.workflowAcks[workflowId]?.[stepId] ?? null;
 }
@@ -829,16 +881,26 @@ function buildConnectionState(now = Date.now()) {
   const telemetryStale = isTelemetryStale(now);
   const gpsStatus = getRobotGpsStatus();
   const missionState = currentMissionState();
-  const baseStationReachable = bridgeStatus.baseStation?.statusOk === true;
+  const localBaseStationReachable = bridgeStatus.baseStation?.statusOk === true;
+  const remoteBaseStationFresh = isRemoteBaseStationFresh(now);
+  const remoteBaseStation = remoteBaseStationFresh ? state.remoteBaseStation : null;
+  const baseStationReachable = localBaseStationReachable || Boolean(remoteBaseStation);
   const robotReachable = Boolean(state.robot);
-  const selectedBaseUrl = String(bridgeStatus.baseStation?.selectedUrl ?? bridgeStatus.baseStationUrl ?? '').toLowerCase();
-  const discoverySource = String(bridgeStatus.baseStation?.discoverySource ?? '').toLowerCase();
-  const baseStationPath = discoverySource === 'mdns'
+  const effectiveBaseStation = localBaseStationReachable
+    ? bridgeStatus.baseStation
+    : remoteBaseStation;
+  const selectedBaseUrl = String(effectiveBaseStation?.selectedUrl ?? bridgeStatus.baseStationUrl ?? '').toLowerCase();
+  const discoverySource = String(effectiveBaseStation?.discoverySource ?? '').toLowerCase();
+  const baseStationPath = discoverySource === 'remote_status'
+    ? 'remote_bridge'
+    : discoverySource === 'mdns'
     ? 'field_network'
     : (selectedBaseUrl.includes('192.168.4.1') || selectedBaseUrl.includes('base-station.local')
       ? 'direct_backup'
       : 'field_network');
-  const baseStationPathLabel = discoverySource === 'mdns'
+  const baseStationPathLabel = discoverySource === 'remote_status'
+    ? 'Remote bridge'
+    : discoverySource === 'mdns'
     ? 'Field network (auto)'
     : (baseStationPath === 'direct_backup' ? 'Direct backup' : 'Field network');
 
@@ -857,7 +919,9 @@ function buildConnectionState(now = Date.now()) {
 
   const baseStationState = !baseStationReachable
     ? CONNECTION_STATE.OFFLINE
-    : bridgeStatus.degraded
+    : (!localBaseStationReachable && Boolean(remoteBaseStation))
+      ? CONNECTION_STATE.ONLINE
+      : bridgeStatus.degraded
       ? CONNECTION_STATE.DEGRADED
       : CONNECTION_STATE.ONLINE;
 
@@ -866,27 +930,34 @@ function buildConnectionState(now = Date.now()) {
     reachable: baseStationReachable,
     connectionPath: baseStationPath,
     connectionPathLabel: baseStationPathLabel,
-    discoverySource: bridgeStatus.baseStation?.discoverySource ?? null,
-    mdnsEnabled: bridgeStatus.baseStation?.mdnsEnabled ?? false,
-    mdnsNames: bridgeStatus.baseStation?.mdnsNames ?? [],
-    mdnsServices: bridgeStatus.baseStation?.mdnsServices ?? [],
-    mode: bridgeStatus.baseStation?.mode ?? null,
-    stationState: bridgeStatus.baseStation?.state ?? null,
-    statusVersion: bridgeStatus.baseStation?.statusVersion ?? null,
-    wifiLinkState: bridgeStatus.baseStation?.wifiLinkState ?? null,
-    loraLinkState: bridgeStatus.baseStation?.loraLinkState ?? null,
-    queueDepth: bridgeStatus.baseStation?.queueDepth ?? null,
-    lastCmdId: bridgeStatus.baseStation?.lastCmdId ?? null,
-    lastCmdStatus: bridgeStatus.baseStation?.lastCmdStatus ?? null,
-    ackCount: bridgeStatus.baseStation?.ackCount ?? null,
-    lastAck: bridgeStatus.baseStation?.lastAck ?? null,
-    lastAckParsed: bridgeStatus.baseStation?.lastAckParsed ?? null,
-    lastLoRa: bridgeStatus.baseStation?.lastLoRa ?? null,
-    lastSuccessAt: bridgeStatus.lastSuccessAt ?? null,
-    lastErrorAt: bridgeStatus.lastErrorAt ?? null,
-    lastError: bridgeStatus.lastCmdError ?? bridgeStatus.baseStation?.statusError ?? null,
-    degraded: Boolean(bridgeStatus.degraded),
+    discoverySource: effectiveBaseStation?.discoverySource ?? null,
+    mdnsEnabled: effectiveBaseStation?.mdnsEnabled ?? false,
+    mdnsNames: effectiveBaseStation?.mdnsNames ?? [],
+    mdnsServices: effectiveBaseStation?.mdnsServices ?? [],
+    mode: effectiveBaseStation?.mode ?? null,
+    stationState: effectiveBaseStation?.state ?? null,
+    statusVersion: effectiveBaseStation?.statusVersion ?? null,
+    wifiLinkState: effectiveBaseStation?.wifiLinkState ?? null,
+    loraLinkState: effectiveBaseStation?.loraLinkState ?? null,
+    queueDepth: effectiveBaseStation?.queueDepth ?? null,
+    lastCmdId: effectiveBaseStation?.lastCmdId ?? null,
+    lastCmdStatus: effectiveBaseStation?.lastCmdStatus ?? null,
+    ackCount: effectiveBaseStation?.ackCount ?? null,
+    lastAck: effectiveBaseStation?.lastAck ?? null,
+    lastAckParsed: effectiveBaseStation?.lastAckParsed ?? null,
+    lastLoRa: effectiveBaseStation?.lastLoRa ?? null,
+    lastSuccessAt: localBaseStationReachable
+      ? (bridgeStatus.lastSuccessAt ?? null)
+      : (remoteBaseStation?.receivedAt ?? null),
+    lastErrorAt: localBaseStationReachable ? (bridgeStatus.lastErrorAt ?? null) : null,
+    lastError: localBaseStationReachable
+      ? (bridgeStatus.lastCmdError ?? bridgeStatus.baseStation?.statusError ?? null)
+      : null,
+    degraded: localBaseStationReachable ? Boolean(bridgeStatus.degraded) : false,
     consecutiveFailures: bridgeStatus.consecutiveFailures ?? 0,
+    remoteFresh: remoteBaseStationFresh,
+    remoteAgeMs: remoteBaseStationAgeMs(now),
+    remoteOnly: !localBaseStationReachable && Boolean(remoteBaseStation),
   };
 
   const robotState = !robotReachable
@@ -912,10 +983,12 @@ function buildConnectionState(now = Date.now()) {
     timestampMs: state.robot?.timestampMs ?? null,
   };
 
-  const commandPathReady = dbOk && baseStationReachable && robotReachable && !telemetryStale;
+  const commandTransportAvailable = localBaseStationReachable;
+  const commandPathReady = dbOk && commandTransportAvailable && robotReachable && !telemetryStale;
   const commandPath = {
     state: commandPathReady ? CONNECTION_STATE.READY : (baseStationReachable ? CONNECTION_STATE.DEGRADED : CONNECTION_STATE.OFFLINE),
     ready: commandPathReady,
+    transportAvailable: commandTransportAvailable,
     wpPushState: bridgeStatus.wpPushState,
     lastCmd: bridgeStatus.lastCmd ?? state.lastCommand ?? null,
     lastCommandId: state.lastCommandId,
@@ -961,6 +1034,9 @@ function buildConnectionState(now = Date.now()) {
   } else if (!baseStationReachable) {
     overallState = CONNECTION_STATE.DEGRADED;
     reason = 'Backend cannot reach the base station';
+  } else if (!localBaseStationReachable && Boolean(remoteBaseStation)) {
+    overallState = CONNECTION_STATE.DEGRADED;
+    reason = 'Base station telemetry is connected through the remote bridge, but direct command transport is unavailable';
   } else if (!robotReachable) {
     overallState = CONNECTION_STATE.DEGRADED;
     reason = 'Robot telemetry has not been received yet';
@@ -2659,6 +2735,7 @@ function publish(event, payload) {
 function publicState() {
   return {
     baseStation: state.baseStation,
+    remoteBaseStation: state.remoteBaseStation,
     boundary: state.boundary,
     demo: state.demo,
     robot: state.robot,
@@ -3040,6 +3117,19 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
   publishSupervision();
 
   return res.json({ ok: true, coverage: stats });
+});
+
+app.post(API.BASE_STATION_STATUS, requireBoard, rateLimitTelemetry, async (req, res) => {
+  const normalized = normalizeRemoteBaseStationStatus(req.body);
+  if (!normalized) {
+    return res.status(400).json({ ok: false, error: 'Unsupported base station status payload' });
+  }
+
+  state.remoteBaseStation = normalized;
+  publishSupervision();
+  publishOperator();
+  scheduleRuntimeStateSave('base_station.remote_status');
+  return res.json({ ok: true, receivedAt: normalized.receivedAt });
 });
 
 app.get(API.STATE, requireAppOrBoard, (_req, res) => {
