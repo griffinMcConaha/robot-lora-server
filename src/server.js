@@ -289,6 +289,7 @@ function buildRuntimeSnapshot(reason = 'unspecified') {
     reason,
     state: {
       baseStation: cloneJsonSafe(state.baseStation, null),
+      remoteBaseStation: cloneJsonSafe(state.remoteBaseStation, null),
       boundary: cloneJsonSafe(state.boundary, null),
       coverage: serializeCoverageRuntime(state.coverage),
       robot: cloneJsonSafe(state.robot, null),
@@ -360,9 +361,11 @@ function restoreRuntimeState() {
     ? saved.boundary
     : (Array.isArray(missionSnapshot?.boundary) && missionSnapshot.boundary.length >= 3 ? missionSnapshot.boundary : null);
   const baseStation = saved?.baseStation ?? missionSnapshot?.baseStation ?? null;
+  const remoteBaseStation = cloneJsonSafe(saved?.remoteBaseStation, null);
   const cellSizeM = Number(saved?.coverage?.cellSizeM ?? missionSnapshot?.cellSizeM ?? 2.0);
 
   state.baseStation = baseStation;
+  state.remoteBaseStation = remoteBaseStation;
   state.boundary = boundary;
   state.robot = cloneJsonSafe(saved?.robot, null);
   state.trail = Array.isArray(saved?.trail) ? cloneJsonSafe(saved.trail, []) : [];
@@ -1034,9 +1037,6 @@ function buildConnectionState(now = Date.now()) {
   } else if (!baseStationReachable) {
     overallState = CONNECTION_STATE.DEGRADED;
     reason = 'Backend cannot reach the base station';
-  } else if (!localBaseStationReachable && Boolean(remoteBaseStation)) {
-    overallState = CONNECTION_STATE.DEGRADED;
-    reason = 'Base station telemetry is connected through the remote bridge, but direct command transport is unavailable';
   } else if (!robotReachable) {
     overallState = CONNECTION_STATE.DEGRADED;
     reason = 'Robot telemetry has not been received yet';
@@ -2782,7 +2782,7 @@ function buildWebSocketDiagnostics() {
 
 function publicState() {
   return {
-    baseStation: state.baseStation,
+    baseStation: state.baseStation ?? state.remoteBaseStation,
     remoteBaseStation: state.remoteBaseStation,
     boundary: state.boundary,
     demo: state.demo,
@@ -3201,8 +3201,10 @@ app.post(API.BASE_STATION_STATUS, requireBoard, rateLimitTelemetry, async (req, 
   }
 
   state.remoteBaseStation = normalized;
+  state.baseStation = normalized;
   publishSupervision();
   publishOperator();
+  publish(WS_EVENT.STATE_SNAPSHOT, publicState());
   scheduleRuntimeStateSave('base_station.remote_status');
   return res.json({ ok: true, receivedAt: normalized.receivedAt });
 });
