@@ -1714,6 +1714,77 @@
       `;
     }
 
+    function formatResultValue(value) {
+      if (value === null || value === undefined) return null;
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!trimmed) return null;
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+          try {
+            return formatResultValue(JSON.parse(trimmed));
+          } catch {
+            return trimmed;
+          }
+        }
+        return trimmed;
+      }
+      if (typeof value === 'number' || typeof value === 'boolean') {
+        return String(value);
+      }
+      if (Array.isArray(value)) {
+        return value.map(formatResultValue).filter(Boolean).join(', ');
+      }
+      if (typeof value === 'object') {
+        const parts = Object.entries(value)
+          .map(([key, inner]) => {
+            const formatted = formatResultValue(inner);
+            return formatted ? `${key}: ${formatted}` : null;
+          })
+          .filter(Boolean);
+        return parts.length ? parts.join(' | ') : null;
+      }
+      return null;
+    }
+
+    function summarizeTestPayload(actionId, payload) {
+      if (!payload || typeof payload !== 'object') {
+        return `${actionId}: Completed`;
+      }
+
+      if (payload.error) {
+        return `${actionId}: ${payload.error}`;
+      }
+
+      const result = payload.result && typeof payload.result === 'object' ? payload.result : null;
+      if (!result) {
+        return `${actionId}: ${payload.ok ? 'Completed' : 'Failed'}`;
+      }
+
+      if (Array.isArray(result.steps)) {
+        const failed = result.steps.find((step) => step && step.ok === false);
+        if (failed) {
+          return `${actionId}: ${failed.command || 'A step'} failed${failed.error ? ` (${failed.error})` : ''}`;
+        }
+        return `${actionId}: ${result.steps.length} step${result.steps.length === 1 ? '' : 's'} completed`;
+      }
+
+      if (typeof result.sent === 'number') {
+        return `${actionId}: ${result.sent} waypoint${result.sent === 1 ? '' : 's'} committed`;
+      }
+
+      if (result.mission && typeof result.mission === 'object' && result.mission.state) {
+        return `${actionId}: Mission ${String(result.mission.state).toLowerCase()}`;
+      }
+
+      if (result.command) {
+        const body = formatResultValue(result.body);
+        return `${actionId}: ${result.command}${body ? ` | ${body}` : ''}`;
+      }
+
+      const formatted = formatResultValue(result);
+      return `${actionId}: ${formatted || (payload.ok ? 'Completed' : 'Failed')}`;
+    }
+
     async function runTestAction(actionId) {
       const resultEl = document.getElementById('testResult');
       const test = testMenu.find(item => item.id === actionId);
@@ -1721,9 +1792,9 @@
 
       try {
         const payload = await runTestActionWithPayload(actionId, null, false);
-        resultEl.textContent = JSON.stringify(payload, null, 2);
+        resultEl.textContent = summarizeTestPayload(test?.title || actionId, payload);
       } catch (error) {
-        resultEl.textContent = JSON.stringify({ ok: false, actionId, error: error.message }, null, 2);
+        resultEl.textContent = `${test?.title || actionId}: ${error.message}`;
         addLogEntry('Test', `${test?.title || actionId} failed to run`, 'warning');
       }
     }
@@ -1734,9 +1805,9 @@
       resultEl.textContent = `Running ${test?.title || actionId}...`;
       try {
         const payload = await runTestActionWithPayload(actionId, null, false);
-        resultEl.textContent = JSON.stringify(payload, null, 2);
+        resultEl.textContent = summarizeTestPayload(test?.title || actionId, payload);
       } catch (error) {
-        resultEl.textContent = JSON.stringify({ ok: false, actionId, error: error.message }, null, 2);
+        resultEl.textContent = `${test?.title || actionId}: ${error.message}`;
       }
     }
 
@@ -1761,7 +1832,7 @@
         });
         const payload = await response.json();
         if (updateResultPane) {
-          resultEl.textContent = JSON.stringify(payload, null, 2);
+          resultEl.textContent = summarizeTestPayload(test?.title || actionId, payload);
         }
         if (recordHistory) {
           recordTestRun(actionId, extraPayload, payload, test);
@@ -1772,7 +1843,7 @@
       } catch (error) {
         const payload = { ok: false, actionId, error: error.message };
         if (updateResultPane) {
-          resultEl.textContent = JSON.stringify(payload, null, 2);
+          resultEl.textContent = `${test?.title || actionId}: ${error.message}`;
         }
         if (recordHistory) {
           recordTestRun(actionId, extraPayload, payload, test);
@@ -1835,7 +1906,7 @@
       handleDriveRelease(false);
       const manualResult = await runTestActionWithPayload('mode-manual', null, false, false);
       if (!manualResult?.ok) {
-        document.getElementById('testResult').textContent = JSON.stringify(manualResult, null, 2);
+        document.getElementById('testResult').textContent = summarizeTestPayload('Manual Mode', manualResult);
         await loadTestMenu();
         return;
       }
@@ -1845,7 +1916,7 @@
       const driveResult = await runTestActionWithPayload(actionId, null, false, false);
       if (!driveResult?.ok) {
         handleDriveRelease(false);
-        document.getElementById('testResult').textContent = JSON.stringify(driveResult, null, 2);
+        document.getElementById('testResult').textContent = summarizeTestPayload(test?.title || actionId, driveResult);
         await loadTestMenu();
         return;
       }
