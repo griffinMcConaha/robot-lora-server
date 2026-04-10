@@ -77,7 +77,7 @@ const COVERAGE_MARK_RADIUS_M = Number(process.env.COVERAGE_MARK_RADIUS_M ?? 0.5)
 const REQUEST_RATE_LIMIT_WINDOW_MS = Number(process.env.REQUEST_RATE_LIMIT_WINDOW_MS ?? 60000);
 const COMMAND_RATE_LIMIT_PER_WINDOW = Number(process.env.COMMAND_RATE_LIMIT_PER_WINDOW ?? 240);
 const TELEMETRY_RATE_LIMIT_PER_WINDOW = Number(process.env.TELEMETRY_RATE_LIMIT_PER_WINDOW ?? 6000);
-const COMMAND_STATE_CONFIRM_TIMEOUT_MS = Number(process.env.COMMAND_STATE_CONFIRM_TIMEOUT_MS ?? 8000);
+const COMMAND_STATE_CONFIRM_TIMEOUT_MS = Number(process.env.COMMAND_STATE_CONFIRM_TIMEOUT_MS ?? 15000);
 const COMMAND_STATE_CONFIRM_POLL_MS = Number(process.env.COMMAND_STATE_CONFIRM_POLL_MS ?? 150);
 const GPS_READY_MIN_SAT = Number(process.env.GPS_READY_MIN_SAT ?? 5);
 const GPS_READY_MAX_HDOP = Number(process.env.GPS_READY_MAX_HDOP ?? 3.0);
@@ -851,6 +851,10 @@ function normalizeRemoteBaseStationStatus(payload) {
   };
 }
 
+function isGatewayHeartbeatPayload(value) {
+  return typeof value === 'string' && /^GW:(?:ALIVE|HB)(?::|$)/i.test(value.trim());
+}
+
 function buildRemoteBaseStationDiagnostics(now = Date.now()) {
   const ageMs = remoteBaseStationAgeMs(now);
   const fresh = isRemoteBaseStationFresh(now);
@@ -1262,16 +1266,19 @@ function buildConnectionState(now = Date.now()) {
   const gatewayLastLoRa = effectiveBaseStation?.lastLoRa ?? null;
   const gatewayEvidence = robotReachable && !telemetryStale
     ? 'robot-telemetry'
-    : gatewayLastAck
-      ? 'lora-ack'
-      : gatewayLastLoRa
-        ? 'lora-traffic'
-        : null;
+    : isGatewayHeartbeatPayload(gatewayLastLoRa)
+      ? 'gateway-heartbeat'
+      : gatewayLastAck
+        ? 'lora-ack'
+        : gatewayLastLoRa
+          ? 'lora-traffic'
+          : null;
   const gatewayReachable = baseStationReachable && (
     ['online', 'connected', 'ready'].includes(gatewayLinkToken) || Boolean(gatewayEvidence)
   );
   const gatewayWorking = gatewayReachable && (
-    ['online', 'connected', 'ready'].includes(gatewayLinkToken) || gatewayEvidence === 'robot-telemetry'
+    ['online', 'connected', 'ready'].includes(gatewayLinkToken)
+      || ['robot-telemetry', 'gateway-heartbeat', 'lora-ack'].includes(gatewayEvidence ?? '')
   );
   const gatewayState = !baseStationReachable
     ? CONNECTION_STATE.OFFLINE
@@ -1291,11 +1298,13 @@ function buildConnectionState(now = Date.now()) {
       ? 'Base station is not reachable'
       : gatewayEvidence === 'robot-telemetry'
         ? 'Robot telemetry is flowing through the gateway'
-        : gatewayEvidence === 'lora-ack'
-          ? 'Gateway is acknowledging LoRa commands'
-          : gatewayEvidence === 'lora-traffic'
-            ? 'Base station is receiving LoRa traffic from the gateway'
-            : (gatewayLinkToken === 'degraded' ? 'LoRa link is degraded' : 'No recent gateway traffic seen'),
+        : gatewayEvidence === 'gateway-heartbeat'
+          ? 'Gateway heartbeat is being received over LoRa'
+          : gatewayEvidence === 'lora-ack'
+            ? 'Gateway is acknowledging LoRa commands'
+            : gatewayEvidence === 'lora-traffic'
+              ? 'Base station is receiving LoRa traffic from the gateway'
+              : (gatewayLinkToken === 'degraded' ? 'LoRa link is degraded' : 'No recent gateway traffic seen'),
     lastAck: gatewayLastAck,
     lastLoRa: gatewayLastLoRa,
     lastSeenAt: gatewayEvidence === 'robot-telemetry'
@@ -1826,6 +1835,10 @@ function syncMissionToCommand(cmd) {
   }
 }
 
+function commandRequiresStrictConfirmation(cmd) {
+  return [CMD.AUTO, CMD.MANUAL, CMD.PAUSE, CMD.ESTOP, CMD.RESET].includes(cmd);
+}
+
 function expectedRobotStateForCommand(cmd) {
   switch (cmd) {
     case CMD.AUTO:
@@ -2220,6 +2233,8 @@ function queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission = tr
 async function dispatchCommand(cmd, options = {}) {
   const { syncMission = true, source = 'api.command', waitForAck = false, waitForState = false } = options;
   const commandId = createCommandId();
+  const shouldWaitForAck = waitForAck;
+  const shouldWaitForState = waitForState || commandRequiresStrictConfirmation(cmd);
 
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
@@ -2245,9 +2260,9 @@ async function dispatchCommand(cmd, options = {}) {
     return queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission });
   }
 
-  const result = await bridge.sendCommand(cmd, { waitForAck, commandId, commandSource: source });
+  const result = await bridge.sendCommand(cmd, { waitForAck: shouldWaitForAck, commandId, commandSource: source });
   if (!result.ok) {
-    const ackTimedOut = waitForAck && result.status === 504;
+    const ackTimedOut = shouldWaitForAck && result.status === 504;
     if (ackTimedOut) {
       if (isWaypointCommand(cmd)) {
         bridge.observeCommand(cmd);
@@ -2313,9 +2328,9 @@ async function dispatchCommand(cmd, options = {}) {
     bridge.observeCommand(cmd);
   }
 
-  const forwardedStatus = waitForState
+  const forwardedStatus = shouldWaitForState
     ? COMMAND_STATUS.FORWARDED
-    : (waitForAck ? COMMAND_STATUS.ACKNOWLEDGED : COMMAND_STATUS.SENT);
+    : (shouldWaitForAck ? COMMAND_STATUS.ACKNOWLEDGED : COMMAND_STATUS.SENT);
   updateCommandTracking(commandId, {
     cmd,
     source,
@@ -2329,7 +2344,7 @@ async function dispatchCommand(cmd, options = {}) {
     syncMissionToCommand(cmd);
   }
 
-  if (waitForState) {
+  if (shouldWaitForState) {
     const expectedState = expectedRobotStateForCommand(cmd);
     const confirmation = await waitForRobotState(expectedState, {
       afterTimestampMs: state.lastCommandAt,
