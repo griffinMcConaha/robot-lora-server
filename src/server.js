@@ -166,6 +166,16 @@ const state = {
       end: null,
     },
   },
+  automation: {
+    enabled: false,
+    scheduledRunAt: null,
+    label: null,
+    notify: true,
+    armedAt: 0,
+    lastTriggeredAt: 0,
+    lastResult: null,
+    lastError: null,
+  },
   operator: createOperatorState(),
   persistence: {
     restoredAt: null,
@@ -178,6 +188,7 @@ const state = {
 
 let safetyMonitorInFlight = false;
 let runtimeStateSaveTimer = null;
+let scheduledMissionInFlight = false;
 
 const DRIVE_COMMANDS = new Set([
   CMD.FORWARD,
@@ -185,12 +196,54 @@ const DRIVE_COMMANDS = new Set([
   CMD.LEFT,
   CMD.RIGHT,
   CMD.STOP,
+  CMD.DRIVE,
 ]);
 
 function pathHasZeroDispersion(points = state.lastPath) {
   return Array.isArray(points)
     && points.length > 0
     && points.every((point) => Number(point?.salt ?? 0) <= 0 && Number(point?.brine ?? 0) <= 0);
+}
+
+function getAutomationSnapshot(now = Date.now()) {
+  const scheduledRunAt = Number(state.automation?.scheduledRunAt ?? 0) || 0;
+  return {
+    enabled: Boolean(state.automation?.enabled) && scheduledRunAt > 0,
+    scheduledRunAt: scheduledRunAt || null,
+    label: state.automation?.label ?? null,
+    notify: state.automation?.notify !== false,
+    armedAt: Number(state.automation?.armedAt ?? 0) || null,
+    lastTriggeredAt: Number(state.automation?.lastTriggeredAt ?? 0) || null,
+    lastResult: state.automation?.lastResult ?? null,
+    lastError: state.automation?.lastError ?? null,
+    dueInMs: scheduledRunAt > 0 ? Math.max(0, scheduledRunAt - now) : null,
+  };
+}
+
+function clearAutomationSchedule(reason = 'cleared', error = null) {
+  state.automation = {
+    ...state.automation,
+    enabled: false,
+    scheduledRunAt: null,
+    label: null,
+    lastResult: reason,
+    lastError: error,
+  };
+  return getAutomationSnapshot();
+}
+
+function armAutomationSchedule({ atMs, label, notify = true }) {
+  state.automation = {
+    ...state.automation,
+    enabled: true,
+    scheduledRunAt: atMs,
+    label: typeof label === 'string' && label.trim() ? label.trim() : new Date(atMs).toLocaleString(),
+    notify: Boolean(notify),
+    armedAt: Date.now(),
+    lastResult: 'armed',
+    lastError: null,
+  };
+  return getAutomationSnapshot();
 }
 
 function parseMaybeJson(value) {
@@ -360,6 +413,7 @@ function buildRuntimeSnapshot(reason = 'unspecified') {
       lastFault: cloneJsonSafe(state.lastFault, null),
       safety: cloneJsonSafe(state.safety, {}),
       demo: cloneJsonSafe(state.demo, { enabled: false, updatedAt: 0, source: 'default', spots: { start: null, end: null } }),
+      automation: cloneJsonSafe(state.automation, { enabled: false, scheduledRunAt: null, label: null, notify: true, armedAt: 0, lastTriggeredAt: 0, lastResult: null, lastError: null }),
       operator: cloneJsonSafe({
         workflowAcks: state.operator.workflowAcks,
         notes: state.operator.notes,
@@ -442,6 +496,10 @@ function restoreRuntimeState() {
       ...(state.demo?.spots ?? { start: null, end: null }),
       ...((cloneJsonSafe(saved?.demo?.spots, {}) ?? {})),
     },
+  };
+  state.automation = {
+    ...state.automation,
+    ...(cloneJsonSafe(saved?.automation, {}) ?? {}),
   };
   state.operator = createOperatorState();
   state.operator.workflowAcks = cloneJsonSafe(saved?.operator?.workflowAcks, {});
@@ -1456,6 +1514,33 @@ function buildConnectionState(now = Date.now()) {
   };
 }
 
+async function maybeRunScheduledMission() {
+  const automation = getAutomationSnapshot();
+  if (!automation.enabled || !automation.scheduledRunAt) return;
+  if (scheduledMissionInFlight) return;
+  if (Date.now() < automation.scheduledRunAt) return;
+
+  scheduledMissionInFlight = true;
+  try {
+    const result = currentMissionState() === MISSION_STATE.PAUSED
+      ? await resumeMissionAction('mission.schedule')
+      : await startMissionAction('mission.schedule');
+
+    state.automation.lastTriggeredAt = Date.now();
+    if (!result.ok) {
+      clearAutomationSchedule('schedule blocked', result.error ?? 'Scheduled autonomy could not start');
+      scheduleRuntimeStateSave('mission.schedule.failed', { immediate: true });
+    } else {
+      scheduleRuntimeStateSave('mission.schedule.started', { immediate: true });
+    }
+
+    publishSupervision();
+    publishOperator();
+  } finally {
+    scheduledMissionInFlight = false;
+  }
+}
+
 function buildSupervisionSummary() {
   const now = Date.now();
   const robotAgeMs = telemetryAgeMs(now);
@@ -1508,6 +1593,7 @@ function buildSupervisionSummary() {
       spots: state.demo?.spots ?? { start: null, end: null },
       spotGpsStatus: getDemoSpotStatuses(),
     },
+    automation: getAutomationSnapshot(now),
     connectivity,
     alerts: buildAlerts(now),
     allowedActions: buildAllowedActions(),
@@ -1780,6 +1866,7 @@ function publishOperator() {
     workflows: buildOperatorWorkflows(),
     notes: state.operator.notes,
     demo: state.demo,
+    automation: getAutomationSnapshot(),
   });
 }
 
@@ -2215,17 +2302,18 @@ function isDemoSafeCommand(cmd) {
     CMD.ESTOP,
     CMD.PAUSE,
     CMD.STOP,
+    CMD.DRIVE,
     CMD.MANUAL,
     CMD.RESET,
     CMD.FORWARD,
-    CMD.BACK,
+    CMD.BACKWARD,
     CMD.LEFT,
     CMD.RIGHT,
   ].includes(cmd);
 }
 
-function queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission = true }) {
-  const queued = enqueueRemoteCommand({ commandId, cmd, source });
+function queueDispatchedRemoteCommand({ commandId, cmd, wireCommand = cmd, source, syncMission = true }) {
+  const queued = enqueueRemoteCommand({ commandId, cmd: wireCommand, source });
   if (!queued) {
     metrics.commandsFailed += 1;
     const queueError = `Remote base station queue is full (${pendingRemoteCommandCount()}/${REMOTE_COMMAND_MAX_QUEUE})`;
@@ -2286,11 +2374,20 @@ function queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission = tr
 }
 
 async function dispatchCommand(cmd, options = {}) {
-  const { syncMission = true, source = 'api.command', waitForAck = false, waitForState = false } = options;
+  const {
+    syncMission = true,
+    source = 'api.command',
+    waitForAck = false,
+    waitForState = false,
+    wireCommand = cmd,
+  } = options;
   const commandId = createCommandId();
   const shouldWaitForAck = waitForAck;
   const explicitlyWaitForState = waitForState;
   const shouldWaitForState = explicitlyWaitForState || commandRequiresStrictConfirmation(cmd);
+  const commandText = typeof wireCommand === 'string' && wireCommand.trim()
+    ? wireCommand.trim().toUpperCase()
+    : cmd;
 
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
@@ -2313,10 +2410,10 @@ async function dispatchCommand(cmd, options = {}) {
 
   const remoteFallbackReady = isRemoteCommandFallbackReady() && !bridge.getStatus().baseStation?.statusOk;
   if (remoteFallbackReady) {
-    return queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission });
+    return queueDispatchedRemoteCommand({ commandId, cmd, wireCommand: commandText, source, syncMission });
   }
 
-  const result = await bridge.sendCommand(cmd, { waitForAck: shouldWaitForAck, commandId, commandSource: source });
+  const result = await bridge.sendCommand(commandText, { waitForAck: shouldWaitForAck, commandId, commandSource: source });
   if (!result.ok) {
     const ackTimedOut = shouldWaitForAck && result.status === 504;
     if (ackTimedOut) {
@@ -2361,7 +2458,7 @@ async function dispatchCommand(cmd, options = {}) {
 
     const remoteFallbackReadyAfterFailure = isRemoteCommandFallbackReady() && !bridge.getStatus().baseStation?.statusOk;
     if (remoteFallbackReadyAfterFailure) {
-      return queueDispatchedRemoteCommand({ commandId, cmd, source, syncMission });
+      return queueDispatchedRemoteCommand({ commandId, cmd, wireCommand: commandText, source, syncMission });
     }
 
     metrics.commandsFailed += 1;
@@ -2563,8 +2660,18 @@ async function startMissionAction(source = 'mission.start') {
   }
 
   const current = mission.start();
+  state.automation = {
+    ...state.automation,
+    enabled: false,
+    scheduledRunAt: null,
+    label: null,
+    lastTriggeredAt: Date.now(),
+    lastResult: source === 'mission.schedule' ? 'started automatically' : 'started manually',
+    lastError: null,
+  };
   scheduleRuntimeStateSave('mission.start', { immediate: true });
   publishSupervision();
+  publishOperator();
   return { ok: true, status: 200, mission: current };
 }
 
@@ -2600,8 +2707,18 @@ async function resumeMissionAction(source = 'mission.resume') {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
   const current = mission.resume();
+  state.automation = {
+    ...state.automation,
+    enabled: false,
+    scheduledRunAt: null,
+    label: null,
+    lastTriggeredAt: Date.now(),
+    lastResult: source === 'mission.schedule' ? 'resumed automatically' : 'resumed manually',
+    lastError: null,
+  };
   scheduleRuntimeStateSave('mission.resume', { immediate: true });
   publishSupervision();
+  publishOperator();
   return { ok: true, status: 200, mission: current };
 }
 
@@ -3675,7 +3792,11 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
     return res.status(409).type('text/plain').send('Command blocked: demo mode is active');
   }
 
-  const dispatched = await dispatchCommand(cmd);
+  const wireCommand = cmd === CMD.DRIVE && typeof parsedBody === 'object' && parsedBody !== null
+    ? `DRIVE,THROTTLE:${clampNumber(Math.round(Number(parsedBody.throttle ?? parsedBody.drive ?? 0)), -100, 100)},TURN:${clampNumber(Math.round(Number(parsedBody.turn ?? parsedBody.steer ?? 0)), -100, 100)}`
+    : (typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : cmd);
+
+  const dispatched = await dispatchCommand(cmd, { wireCommand });
   if (!dispatched.ok) {
     return res.status(dispatched.status ?? 500).type('text/plain').send(dispatched.error);
   }
@@ -4100,6 +4221,44 @@ app.get(API.MISSION_CURRENT, requireAppOrBoard, (_req, res) => {
   return res.json({ ok: true, mission: m });
 });
 
+app.get(API.MISSION_SCHEDULE, requireAppOrBoard, (_req, res) => {
+  return res.json({ ok: true, automation: getAutomationSnapshot() });
+});
+
+app.post(API.MISSION_SCHEDULE, requireApp, (req, res) => {
+  const rawAt = Number(req.body?.at ?? req.body?.scheduledRunAt ?? 0);
+  const atMs = rawAt > 1e12 ? rawAt : rawAt * 1000;
+  const label = typeof req.body?.label === 'string' ? req.body.label : '';
+  const notify = req.body?.notify !== false;
+
+  if (!Number.isFinite(atMs) || atMs <= Date.now() + 15000) {
+    return res.status(400).json({ ok: false, error: 'Choose a future time at least 15 seconds from now.' });
+  }
+  if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+    return res.status(409).json({ ok: false, error: 'Prepare the route first, then arm the automatic run while the mission is configuring or paused.' });
+  }
+  if (!Array.isArray(state.lastPath) || state.lastPath.length < 2) {
+    return res.status(409).json({ ok: false, error: 'Build a route before arming automatic autonomy.' });
+  }
+  if (pathHasZeroDispersion()) {
+    return res.status(409).json({ ok: false, error: 'Automatic autonomy is blocked while the path uses 0% salt and 0% brine.' });
+  }
+
+  const automation = armAutomationSchedule({ atMs, label, notify });
+  scheduleRuntimeStateSave('mission.schedule.armed', { immediate: true });
+  publishSupervision();
+  publishOperator();
+  return res.json({ ok: true, automation });
+});
+
+app.post(API.MISSION_SCHEDULE_CANCEL, requireApp, (_req, res) => {
+  const automation = clearAutomationSchedule('cancelled', null);
+  scheduleRuntimeStateSave('mission.schedule.cancelled', { immediate: true });
+  publishSupervision();
+  publishOperator();
+  return res.json({ ok: true, automation });
+});
+
 // GET /api/mission/history?limit=50
 app.get(API.MISSION_HISTORY, requireAppOrBoard, (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 50), 500);
@@ -4287,6 +4446,7 @@ wss.on('connection', (socket) => {
 const port = Number(process.env.PORT ?? 8080);
 
 const safetyTimer = setInterval(() => {
+  void maybeRunScheduledMission();
   void enforceTelemetryFailsafePolicy();
   void enforceGpsFailsafePolicy();
   void enforceGeofenceFailsafePolicy('monitor');

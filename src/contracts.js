@@ -76,6 +76,7 @@ const CMD = Object.freeze({
   LEFT:     'LEFT',
   RIGHT:    'RIGHT',
   STOP:     'STOP',
+  DRIVE:    'DRIVE',
   PAUSE:    'PAUSE',
   AUTO:     'AUTO',
   MANUAL:   'MANUAL',
@@ -85,8 +86,10 @@ const CMD = Object.freeze({
 
 /** Aliases accepted on inbound normalisation (not sent by firmware). */
 const CMD_ALIASES = Object.freeze({
-  FWD:  CMD.FORWARD,
-  BACK: CMD.BACKWARD,
+  FWD:      CMD.FORWARD,
+  BACK:     CMD.BACKWARD,
+  JOY:      CMD.DRIVE,
+  JOYSTICK: CMD.DRIVE,
 });
 
 // ---------------------------------------------------------------------------
@@ -297,6 +300,8 @@ const API = Object.freeze({
   MISSION_CURRENT:  '/api/mission/current',   // GET
   MISSION_HISTORY:  '/api/mission/history',   // GET
   MISSION_EVENTS:   '/api/mission/:id/events',// GET
+  MISSION_SCHEDULE: '/api/mission/schedule',  // GET/POST
+  MISSION_SCHEDULE_CANCEL: '/api/mission/schedule/cancel', // POST
   OPERATOR_WORKFLOWS: '/api/operator/workflows',
   OPERATOR_WORKFLOW_STEP: '/api/operator/workflows/:workflowId/steps/:stepId',
   OPERATOR_NOTES: '/api/operator/notes',

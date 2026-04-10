@@ -15,18 +15,59 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForHealthy(url, timeoutMs = 10000) {
+async function waitForCondition(predicate, {
+  timeoutMs = 5000,
+  intervalMs = 25,
+  label = 'condition',
+} = {}) {
   const start = Date.now();
+  let lastError = null;
+
   while (Date.now() - start < timeoutMs) {
     try {
-      const res = await fetch(`${url}/api/health`);
-      if (res.ok) return;
-    } catch {
-      // retry
+      const result = await predicate();
+      if (result) return result;
+    } catch (error) {
+      lastError = error;
     }
-    await wait(100);
+    await wait(intervalMs);
   }
-  throw new Error(`Timed out waiting for health at ${url}`);
+
+  const detail = lastError?.message ? ` (last error: ${lastError.message})` : '';
+  throw new Error(`Timed out waiting for ${label}${detail}`);
+}
+
+async function waitForHealthy(url, timeoutMs = 5000) {
+  await waitForCondition(async () => {
+    const res = await fetch(`${url}/api/health`);
+    return res.ok;
+  }, {
+    timeoutMs,
+    intervalMs: 50,
+    label: `health at ${url}`,
+  });
+}
+
+async function waitForMissionState(url, expectedState, options = {}) {
+  return waitForCondition(async () => {
+    const { res, json } = await getJson(`${url}/api/mission/current`);
+    if (res.status !== 200) return false;
+    return json?.mission?.state === expectedState ? json : false;
+  }, {
+    label: `mission state ${expectedState}`,
+    ...options,
+  });
+}
+
+async function waitForSummaryAlert(url, alertCode, options = {}) {
+  return waitForCondition(async () => {
+    const { res, json } = await getJson(`${url}/api/supervision/summary`);
+    if (res.status !== 200 || !json?.summary) return false;
+    return json.summary.alerts.some((alert) => alert.code === alertCode) ? json : false;
+  }, {
+    label: `summary alert ${alertCode}`,
+    ...options,
+  });
 }
 
 async function postJson(url, body) {
@@ -56,6 +97,7 @@ async function getJson(url) {
 
 function createMockBaseStation() {
   const commands = [];
+  const sockets = new Set();
   const server = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/command') {
       const chunks = [];
@@ -79,12 +121,22 @@ function createMockBaseStation() {
     res.end();
   });
 
+  server.keepAliveTimeout = 1;
+  server.headersTimeout = 1000;
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+
   return {
     commands,
     async start() {
       await new Promise((resolve) => server.listen(BASE_PORT, '127.0.0.1', resolve));
     },
     async stop() {
+      if (!server.listening) return;
+      for (const socket of sockets) socket.destroy();
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
     },
   };
@@ -116,9 +168,43 @@ function startServer(dataDir, envOverrides = {}) {
     get stdout() { return stdout; },
     get stderr() { return stderr; },
     async stop() {
-      if (child.killed) return;
-      child.kill();
-      await new Promise((resolve) => child.once('exit', resolve));
+      if (child.exitCode !== null || child.signalCode !== null) return;
+
+      await new Promise((resolve) => {
+        let settled = false;
+        let forceKillTimer = null;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          if (forceKillTimer) clearTimeout(forceKillTimer);
+          resolve();
+        };
+
+        child.once('exit', finish);
+        child.once('close', finish);
+
+        forceKillTimer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              finish();
+            }
+          }
+        }, 250);
+        if (typeof forceKillTimer.unref === 'function') forceKillTimer.unref();
+
+        try {
+          child.kill();
+        } catch {
+          finish();
+          return;
+        }
+
+        if (child.exitCode !== null || child.signalCode !== null) {
+          finish();
+        }
+      });
     },
   };
 }
@@ -199,11 +285,12 @@ test('Phase E supervision summary and Phase F fail-safe scenarios', async () => 
       assert.ok(base.commands.includes('AUTO'));
     }
 
-    await wait(300);
-
     {
-      const { json } = await getJson(`${SERVER_URL}/api/supervision/summary`);
-      assert.ok(json.summary.alerts.some((alert) => alert.code === 'TELEMETRY_STALE'));
+      const summary = await waitForSummaryAlert(SERVER_URL, 'TELEMETRY_STALE', {
+        timeoutMs: 800,
+        intervalMs: 25,
+      });
+      assert.ok(summary.summary.alerts.some((alert) => alert.code === 'TELEMETRY_STALE'));
     }
 
     {
@@ -303,13 +390,17 @@ test('P0 telemetry stale fail-safe issues ESTOP and aborts mission', async () =>
       assert.ok(base.commands.includes('AUTO'));
     }
 
-    await wait(900);
-
-    assert.ok(base.commands.includes('ESTOP'));
+    await waitForCondition(() => base.commands.includes('ESTOP'), {
+      timeoutMs: 800,
+      intervalMs: 25,
+      label: 'ESTOP command',
+    });
 
     {
-      const { res, json } = await getJson(`${SERVER_URL}/api/mission/current`);
-      assert.equal(res.status, 200);
+      const json = await waitForMissionState(SERVER_URL, 'ABORTED', {
+        timeoutMs: 800,
+        intervalMs: 25,
+      });
       assert.equal(json.mission.state, 'ABORTED');
     }
 
@@ -375,8 +466,11 @@ test('RESET stays usable during telemetry outage and clears failsafe after recov
       assert.ok(base.commands.includes('AUTO'));
     }
 
-    await wait(900);
-    assert.ok(base.commands.includes('ESTOP'));
+    await waitForCondition(() => base.commands.includes('ESTOP'), {
+      timeoutMs: 800,
+      intervalMs: 25,
+      label: 'ESTOP command before recovery reset',
+    });
 
     {
       const { res, text } = await postText(`${SERVER_URL}/command`, 'RESET');
@@ -397,14 +491,20 @@ test('RESET stays usable during telemetry outage and clears failsafe after recov
       assert.equal(res.status, 200);
     }
 
-    await wait(100);
-
     {
-      const { res, json } = await getJson(`${SERVER_URL}/api/supervision/summary`);
-      assert.equal(res.status, 200);
-      assert.equal(json.summary.robot.state, 'PAUSE');
-      assert.equal(json.summary.safety.telemetryFailsafeAt, null);
-      assert.equal(json.summary.safety.telemetryFailsafeReason, null);
+      const summary = await waitForCondition(async () => {
+        const { res, json } = await getJson(`${SERVER_URL}/api/supervision/summary`);
+        if (res.status !== 200 || !json?.summary) return false;
+        if (json.summary.robot.state !== 'PAUSE') return false;
+        return json.summary.safety.telemetryFailsafeAt == null ? json : false;
+      }, {
+        timeoutMs: 600,
+        intervalMs: 25,
+        label: 'failsafe recovery summary',
+      });
+      assert.equal(summary.summary.robot.state, 'PAUSE');
+      assert.equal(summary.summary.safety.telemetryFailsafeAt, null);
+      assert.equal(summary.summary.safety.telemetryFailsafeReason, null);
     }
   } finally {
     await server.stop();
@@ -470,12 +570,17 @@ test('P0 geofence fail-safe issues ESTOP and aborts mission when robot exits bou
       assert.equal(res.status, 200);
     }
 
-    await wait(500);
-    assert.ok(base.commands.includes('ESTOP'));
+    await waitForCondition(() => base.commands.includes('ESTOP'), {
+      timeoutMs: 600,
+      intervalMs: 25,
+      label: 'geofence ESTOP command',
+    });
 
     {
-      const { res, json } = await getJson(`${SERVER_URL}/api/mission/current`);
-      assert.equal(res.status, 200);
+      const json = await waitForMissionState(SERVER_URL, 'ABORTED', {
+        timeoutMs: 600,
+        intervalMs: 25,
+      });
       assert.equal(json.mission.state, 'ABORTED');
     }
 
@@ -536,15 +641,20 @@ test('P0 health endpoint reports degraded when telemetry is stale during running
       assert.equal(res.status, 200);
     }
 
-    await wait(350);
-
     {
-      const res = await fetch(`${SERVER_URL}/api/health`);
-      const json = await res.json();
-      assert.equal(res.status, 503);
-      assert.equal(json.ok, false);
-      assert.equal(json.checks.telemetry, false);
-      assert.equal(json.missionState, 'RUNNING');
+      const health = await waitForCondition(async () => {
+        const res = await fetch(`${SERVER_URL}/api/health`);
+        const json = await res.json();
+        return res.status === 503 ? { res, json } : false;
+      }, {
+        timeoutMs: 700,
+        intervalMs: 25,
+        label: 'degraded health status',
+      });
+      assert.equal(health.res.status, 503);
+      assert.equal(health.json.ok, false);
+      assert.equal(health.json.checks.telemetry, false);
+      assert.equal(health.json.missionState, 'RUNNING');
     }
   } finally {
     await server.stop();
