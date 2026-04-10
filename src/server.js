@@ -1256,6 +1256,53 @@ function buildConnectionState(now = Date.now()) {
     timestampMs: state.robot?.timestampMs ?? null,
   };
 
+  const gatewayLinkState = effectiveBaseStation?.loraLinkState ?? null;
+  const gatewayLinkToken = String(gatewayLinkState ?? '').trim().toLowerCase();
+  const gatewayLastAck = effectiveBaseStation?.lastAck ?? null;
+  const gatewayLastLoRa = effectiveBaseStation?.lastLoRa ?? null;
+  const gatewayEvidence = robotReachable && !telemetryStale
+    ? 'robot-telemetry'
+    : gatewayLastAck
+      ? 'lora-ack'
+      : gatewayLastLoRa
+        ? 'lora-traffic'
+        : null;
+  const gatewayReachable = baseStationReachable && (
+    ['online', 'connected', 'ready'].includes(gatewayLinkToken) || Boolean(gatewayEvidence)
+  );
+  const gatewayWorking = gatewayReachable && (
+    ['online', 'connected', 'ready'].includes(gatewayLinkToken) || gatewayEvidence === 'robot-telemetry'
+  );
+  const gatewayState = !baseStationReachable
+    ? CONNECTION_STATE.OFFLINE
+    : gatewayWorking
+      ? CONNECTION_STATE.ONLINE
+      : (Boolean(gatewayEvidence) || ['degraded', 'idle', 'stale'].includes(gatewayLinkToken))
+        ? CONNECTION_STATE.DEGRADED
+        : CONNECTION_STATE.OFFLINE;
+
+  const gateway = {
+    state: gatewayState,
+    reachable: gatewayReachable,
+    working: gatewayWorking,
+    linkState: gatewayLinkState,
+    evidence: gatewayEvidence,
+    reason: !baseStationReachable
+      ? 'Base station is not reachable'
+      : gatewayEvidence === 'robot-telemetry'
+        ? 'Robot telemetry is flowing through the gateway'
+        : gatewayEvidence === 'lora-ack'
+          ? 'Gateway is acknowledging LoRa commands'
+          : gatewayEvidence === 'lora-traffic'
+            ? 'Base station is receiving LoRa traffic from the gateway'
+            : (gatewayLinkToken === 'degraded' ? 'LoRa link is degraded' : 'No recent gateway traffic seen'),
+    lastAck: gatewayLastAck,
+    lastLoRa: gatewayLastLoRa,
+    lastSeenAt: gatewayEvidence === 'robot-telemetry'
+      ? (state.robot?.timestampMs ?? null)
+      : (baseStation.lastSuccessAt ?? null),
+  };
+
   const commandTransportAvailable = localBaseStationReachable || remoteBaseStationFresh;
   const commandPathReady = dbOk && commandTransportAvailable && robotReachable && !telemetryStale;
   const commandPath = {
@@ -1332,6 +1379,7 @@ function buildConnectionState(now = Date.now()) {
     },
     backend,
     baseStation,
+    gateway,
     robot,
     commandPath,
     recovery: {
@@ -3293,10 +3341,11 @@ app.get(API.HEALTH, (_req, res) => {
   const checks = {
     db: dbOk,
     bridge: connection.baseStation.reachable,
+    gateway: connection.gateway?.reachable ?? false,
     telemetry: !telemetryStaleWhileRunning,
   };
 
-  const ready = Object.values(checks).every(Boolean);
+  const ready = Boolean(checks.db && checks.bridge && checks.telemetry);
   const status = ready ? 200 : 503;
 
   res.status(status).json({
