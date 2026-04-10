@@ -17,7 +17,7 @@ function isTelemetryStale(robot, staleThresholdMs, now = Date.now()) {
   return ageMs == null ? true : ageMs > staleThresholdMs;
 }
 
-function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, zeroDispersionPath, gpsReady, gpsReason, demoModeEnabled }) {
+function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, zeroDispersionPath, gpsReady, gpsReason, demoModeEnabled, resetNeeded = false }) {
   const gpsGateOpen = gpsReady || gpsReason === 'Robot telemetry is unavailable';
 
   return [
@@ -69,7 +69,7 @@ function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, 
     },
     {
       id: 'command-reset',
-      enabled: [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
+      enabled: resetNeeded || [MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState),
       reason: null,
     },
   ];

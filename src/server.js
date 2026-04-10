@@ -792,6 +792,60 @@ function isTelemetryStale(now = Date.now()) {
   return supervisionIsTelemetryStale(state.robot, SUPERVISION_TELEMETRY_STALE_MS, now);
 }
 
+function recoveryResetNeeded() {
+  const robotState = String(state.robot?.state ?? '').trim().toUpperCase();
+  if ([ROBOT_STATE.ESTOP, ROBOT_STATE.ERROR].includes(robotState)) {
+    return true;
+  }
+
+  const lastFaultAction = String(state.lastFault?.action ?? '').trim().toUpperCase();
+  if ([FAULT_ACTION.ESTOP, FAULT_ACTION.PAUSE].includes(lastFaultAction)) {
+    return true;
+  }
+
+  return Boolean(
+    state.safety?.telemetryFailsafeAt
+    || state.safety?.gpsFailsafeAt
+    || state.safety?.geofenceFailsafeAt
+  );
+}
+
+function clearRecoveredSafetyState({ telemetryRecovered = false, gpsRecovered = false, geofenceRecovered = false, faultRecovered = false } = {}) {
+  let changed = false;
+
+  if (telemetryRecovered && (state.safety.telemetryFailsafeAt || state.safety.telemetryFailsafeAction || state.safety.telemetryFailsafeReason)) {
+    state.safety.telemetryFailsafeAt = 0;
+    state.safety.telemetryFailsafeAction = null;
+    state.safety.telemetryFailsafeReason = null;
+    changed = true;
+  }
+
+  if (gpsRecovered && (state.safety.gpsFailsafeAt || state.safety.gpsFailsafeAction || state.safety.gpsFailsafeReason)) {
+    state.safety.gpsFailsafeAt = 0;
+    state.safety.gpsFailsafeAction = null;
+    state.safety.gpsFailsafeReason = null;
+    changed = true;
+  }
+
+  if (geofenceRecovered && (state.safety.geofenceFailsafeAt || state.safety.geofenceFailsafeAction || state.safety.geofenceFailsafeReason)) {
+    state.safety.geofenceFailsafeAt = 0;
+    state.safety.geofenceFailsafeAction = null;
+    state.safety.geofenceFailsafeReason = null;
+    changed = true;
+  }
+
+  if (
+    faultRecovered
+    && state.lastFault
+    && [FAULT_ACTION.ESTOP, FAULT_ACTION.PAUSE].includes(String(state.lastFault.action ?? '').trim().toUpperCase())
+  ) {
+    state.lastFault = null;
+    changed = true;
+  }
+
+  return changed;
+}
+
 function remoteBaseStationAgeMs(now = Date.now()) {
   if (!state.remoteBaseStation?.receivedAt) return null;
   return Math.max(0, now - state.remoteBaseStation.receivedAt);
@@ -1116,6 +1170,7 @@ function buildAllowedActions() {
     gpsReady: gpsStatus.ready,
     gpsReason: gpsStatus.reason,
     demoModeEnabled: Boolean(state.demo?.enabled),
+    resetNeeded: recoveryResetNeeded(),
   });
 }
 
@@ -1749,10 +1804,10 @@ function arbitrateCommand(cmd) {
       return { ok: true };
     }
     if (cmd === CMD.RESET) {
-      if ([MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState)) {
+      if ([MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState) || recoveryResetNeeded()) {
         return { ok: true };
       }
-      return { ok: false, status: 409, error: 'RESET allowed only when mission is PAUSED, ABORTED, or ERROR' };
+      return { ok: false, status: 409, error: 'RESET allowed only when recovery is needed or the mission is PAUSED, ABORTED, or ERROR' };
     }
     if (cmd === CMD.AUTO) {
       if (wpPushState === 'committed') {
@@ -2234,7 +2289,8 @@ async function dispatchCommand(cmd, options = {}) {
   const { syncMission = true, source = 'api.command', waitForAck = false, waitForState = false } = options;
   const commandId = createCommandId();
   const shouldWaitForAck = waitForAck;
-  const shouldWaitForState = waitForState || commandRequiresStrictConfirmation(cmd);
+  const explicitlyWaitForState = waitForState;
+  const shouldWaitForState = explicitlyWaitForState || commandRequiresStrictConfirmation(cmd);
 
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
@@ -2344,33 +2400,47 @@ async function dispatchCommand(cmd, options = {}) {
     syncMissionToCommand(cmd);
   }
 
+  let responseStatus = result.status ?? 200;
+  let responseWarning = null;
+
   if (shouldWaitForState) {
     const expectedState = expectedRobotStateForCommand(cmd);
     const confirmation = await waitForRobotState(expectedState, {
       afterTimestampMs: state.lastCommandAt,
     });
     if (!confirmation.ok) {
-      metrics.commandsFailed += 1;
       updateCommandTracking(commandId, {
         cmd,
         source,
         status: COMMAND_STATUS.TIMED_OUT,
         error: confirmation.error,
+        detail: {
+          ...confirmation,
+          expectedState,
+          stateConfirmationPending: !explicitlyWaitForState,
+        },
+      });
+
+      if (explicitlyWaitForState) {
+        metrics.commandsFailed += 1;
+        return {
+          ok: false,
+          status: 504,
+          error: confirmation.error,
+          detail: confirmation,
+        };
+      }
+
+      responseStatus = 202;
+      responseWarning = confirmation.error;
+    } else {
+      updateCommandTracking(commandId, {
+        cmd,
+        source,
+        status: COMMAND_STATUS.APPLIED,
         detail: confirmation,
       });
-      return {
-        ok: false,
-        status: 504,
-        error: confirmation.error,
-        detail: confirmation,
-      };
     }
-    updateCommandTracking(commandId, {
-      cmd,
-      source,
-      status: COMMAND_STATUS.APPLIED,
-      detail: confirmation,
-    });
   }
 
   scheduleRuntimeStateSave(`dispatch.${cmd}`, { immediate: !DRIVE_COMMANDS.has(cmd) });
@@ -2379,7 +2449,7 @@ async function dispatchCommand(cmd, options = {}) {
 
   metrics.commandsDispatched += 1;
 
-  return { ok: true, status: result.status, body: result.body, commandId };
+  return { ok: true, status: responseStatus, body: result.body, commandId, warning: responseWarning };
 }
 
 function buildSampleWaypointSet() {
@@ -3700,6 +3770,13 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
     timestampMs: Date.now(),
     raw: parsed.raw,
   };
+
+  clearRecoveredSafetyState({
+    telemetryRecovered: true,
+    gpsRecovered: getRobotGpsStatus(state.robot).ready,
+    geofenceRecovered: isRobotInsideCoverageArea(state.robot),
+    faultRecovered: ![ROBOT_STATE.ESTOP, ROBOT_STATE.ERROR].includes(state.robot.state),
+  });
 
   state.trail.push({ lat: state.robot.lat, lon: state.robot.lon, t: state.robot.timestampMs });
   if (state.trail.length > 5000) {
