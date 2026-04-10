@@ -60,7 +60,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-const SUPERVISION_TELEMETRY_STALE_MS = Number(process.env.SUPERVISION_TELEMETRY_STALE_MS ?? 15000);
+const SUPERVISION_TELEMETRY_STALE_MS = Number(process.env.SUPERVISION_TELEMETRY_STALE_MS ?? 30000);
 const TELEMETRY_FAILSAFE_ENABLED = String(process.env.TELEMETRY_FAILSAFE_ENABLED ?? '1') !== '0';
 const TELEMETRY_FAILSAFE_ACTION = String(process.env.TELEMETRY_FAILSAFE_ACTION ?? CMD.ESTOP).trim().toUpperCase();
 const TELEMETRY_FAILSAFE_COOLDOWN_MS = Number(process.env.TELEMETRY_FAILSAFE_COOLDOWN_MS ?? Math.max(SUPERVISION_TELEMETRY_STALE_MS, 5000));
