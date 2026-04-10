@@ -1071,7 +1071,7 @@
   <header>
     <div class="header-panel">
       <h1>🛰️ LoRa Anti-Icing Server</h1>
-      <p class="subtitle">Live operator dashboard for planning, mission control, and service checks.</p>
+      <p class="subtitle">Live dashboard for planning, route control, and system checks.</p>
       <div class="header-chip-row">
         <span class="header-chip">Mobile app</span>
         <span class="header-chip">Hosted server</span>
@@ -1088,10 +1088,10 @@
 
   <div class="container">
     <div class="card grid-3">
-      <div class="card-title">Operator Flow</div>
+      <div class="card-title">Quick Flow</div>
       <div class="hero-summary">
         <div class="hero-copy">
-          <div class="hero-heading">Mission status, planning, and service tools</div>
+          <div class="hero-heading">System status, planning, and service tools</div>
           <p>Use this dashboard to confirm system health, review the active area and path, and run service checks from one place.</p>
         </div>
         <div class="flow-grid">
@@ -1113,14 +1113,14 @@
             <span class="flow-step-number">3</span>
             <div>
               <div class="flow-step-title">Commit and start</div>
-              <div class="flow-step-copy">Use the mission controls here to commit the route and start autonomy after preflight checks.</div>
+              <div class="flow-step-copy">Use the route controls here to commit the path and start after the readiness checks.</div>
             </div>
           </div>
           <div class="flow-step">
             <span class="flow-step-number">4</span>
             <div>
-              <div class="flow-step-title">Monitor and recover</div>
-              <div class="flow-step-copy">Pause, stop, or run guided service checks from this page if conditions change.</div>
+              <div class="flow-step-title">Monitor and adjust</div>
+              <div class="flow-step-copy">Pause, stop, or run guided system checks from this page if conditions change.</div>
             </div>
           </div>
         </div>
@@ -1211,7 +1211,7 @@
     </div>
 
     <div class="card grid-3">
-      <div class="card-title">Manual Drive + Mission Control</div>
+      <div class="card-title">Manual Drive + Run Controls</div>
       <div class="controller-shell">
       <div class="controller-panel">
         <div>
@@ -1296,7 +1296,7 @@
             <div class="section-header">
               <div>
                 <div class="section-title">Subsystem Tests</div>
-                <div class="section-copy">Grouped by system so support staff can scan quickly and run only the checks they need.</div>
+                <div class="section-copy">Grouped by system so everything is easy to scan and run only when needed.</div>
               </div>
             </div>
             <div id="testMenu" class="test-groups">
@@ -1449,7 +1449,7 @@
       if (event === 'mission.updated') {
         updateMissionDisplay(payload || {});
         updateControllerStatus();
-        addLogEntry('Mission', `State changed to ${(payload || {}).state || 'unknown'}`, 'event');
+        addLogEntry('Mission', `State changed to ${formatMissionStateLabel((payload || {}).state || 'unknown', 'Unknown')}`, 'event');
       } else if (event === 'telemetry.updated') {
         const robot = payload?.robot || null;
         updateRobotDisplay(robot);
@@ -1478,18 +1478,98 @@
       }
     }
 
+    function toFriendlyLabel(value, fallback = '—') {
+      if (!value) return fallback;
+      return String(value)
+        .replace(/[_-]+/g, ' ')
+        .toLowerCase()
+        .replace(/\b\w/g, (char) => char.toUpperCase());
+    }
+
+    function formatMissionStateLabel(value, fallback = '—') {
+      switch (String(value || '').toUpperCase()) {
+        case 'IDLE':
+        case 'READY':
+          return 'Ready';
+        case 'CONFIGURING':
+        case 'PLANNED':
+          return 'Setup';
+        case 'RUNNING':
+          return 'Running';
+        case 'PAUSED':
+          return 'Paused';
+        case 'COMPLETED':
+          return 'Complete';
+        case 'ABORTED':
+          return 'Stopped';
+        case 'ERROR':
+          return 'Needs Attention';
+        default:
+          return toFriendlyLabel(value, fallback);
+      }
+    }
+
+    function formatRobotStateLabel(value, fallback = '—') {
+      switch (String(value || '').toUpperCase()) {
+        case 'IDLE':
+        case 'READY':
+          return 'Ready';
+        case 'MANUAL':
+          return 'Manual';
+        case 'AUTO':
+        case 'AUTONOMOUS':
+          return 'Automatic';
+        case 'RUNNING':
+          return 'Running';
+        case 'PAUSED':
+          return 'Paused';
+        case 'ESTOP':
+          return 'Emergency Stop';
+        case 'SAFE_OFF':
+          return 'Safe Stop';
+        case 'ERROR':
+        case 'FAULT':
+          return 'Needs Attention';
+        case 'OFFLINE':
+          return 'Offline';
+        default:
+          return toFriendlyLabel(value, fallback);
+      }
+    }
+
+    function formatConnectionStateLabel(value, fallback = '—') {
+      switch (String(value || '').toLowerCase()) {
+        case 'online':
+          return 'Connected';
+        case 'ready':
+          return 'Ready';
+        case 'degraded':
+        case 'stale':
+          return 'Delayed';
+        case 'offline':
+          return 'Offline';
+        case 'unknown':
+        case '':
+          return fallback;
+        default:
+          return toFriendlyLabel(value, fallback);
+      }
+    }
+
     function updateMissionDisplay(mission) {
-      document.getElementById('missionState').textContent = mission?.state || '—';
+      document.getElementById('missionState').textContent = formatMissionStateLabel(mission?.state, '—');
       const statusEl = document.getElementById('missionStatus');
       let statusHtml = '';
       if (mission?.state === 'RUNNING') {
-        statusHtml = '<span class="badge success">Active</span>';
-      } else if (mission?.state === 'IDLE') {
-        statusHtml = '<span class="badge">Idle</span>';
+        statusHtml = '<span class="badge success">Running</span>';
+      } else if (mission?.state === 'IDLE' || mission?.state === 'READY') {
+        statusHtml = '<span class="badge">Ready</span>';
+      } else if (mission?.state === 'CONFIGURING' || mission?.state === 'PLANNED') {
+        statusHtml = '<span class="badge">Setup</span>';
       } else if (mission?.state === 'PAUSED') {
         statusHtml = '<span class="badge warning">Paused</span>';
       } else if (mission?.state === 'ERROR' || mission?.state === 'ABORTED') {
-        statusHtml = '<span class="badge error">Fault</span>';
+        statusHtml = '<span class="badge error">Check</span>';
       }
       statusEl.innerHTML = statusHtml || '—';
     }
@@ -1694,38 +1774,38 @@
       container.innerHTML = `
         <div class="monitor-card ${backendClass}">
           <div class="monitor-title">Backend</div>
-          <div class="monitor-row"><span>State</span><strong>${backend.state || '—'}</strong></div>
+          <div class="monitor-row"><span>State</span><strong>${formatConnectionStateLabel(backend.state || '—', '—')}</strong></div>
           <div class="monitor-row"><span>DB</span><strong>${backend.dbOk ? 'OK' : 'Issue'}</strong></div>
-          <div class="monitor-row"><span>Overall</span><strong>${overall.state || '—'}</strong></div>
+          <div class="monitor-row"><span>Overall</span><strong>${formatConnectionStateLabel(overall.state || '—', '—')}</strong></div>
           <div class="monitor-row"><span>Reason</span><strong>${overall.reason || '—'}</strong></div>
         </div>
         <div class="monitor-card ${baseClass}">
           <div class="monitor-title">Base Station</div>
-          <div class="monitor-row"><span>State</span><strong>${baseStation.state || '—'}</strong></div>
-          <div class="monitor-row"><span>Wi-Fi</span><strong>${lora.wifi_link_state || '—'}</strong></div>
-          <div class="monitor-row"><span>LoRa</span><strong>${lora.lora_link_state || '—'}</strong></div>
+          <div class="monitor-row"><span>State</span><strong>${formatConnectionStateLabel(baseStation.state || '—', '—')}</strong></div>
+          <div class="monitor-row"><span>Wi-Fi</span><strong>${toFriendlyLabel(lora.wifi_link_state || '—', '—')}</strong></div>
+          <div class="monitor-row"><span>LoRa</span><strong>${toFriendlyLabel(lora.lora_link_state || '—', '—')}</strong></div>
           <div class="monitor-row"><span>Queue</span><strong>${baseStation.queueDepth ?? lora.queueDepth ?? '—'}</strong></div>
           <div class="monitor-row"><span>Last ACK</span><strong>${baseStation.lastAck || lora.lastAck || '—'}</strong></div>
         </div>
         <div class="monitor-card ${robotClass}">
           <div class="monitor-title">Robot Link</div>
-          <div class="monitor-row"><span>State</span><strong>${robotLink.state || '—'}</strong></div>
-          <div class="monitor-row"><span>Robot</span><strong>${robot.state || robotLink.robotState || '—'}</strong></div>
-          <div class="monitor-row"><span>Telemetry</span><strong>${robotLink.telemetryStale ? 'Stale' : 'Live'}</strong></div>
+          <div class="monitor-row"><span>State</span><strong>${formatConnectionStateLabel(robotLink.state || '—', '—')}</strong></div>
+          <div class="monitor-row"><span>Robot</span><strong>${formatRobotStateLabel(robot.state || robotLink.robotState || '—', '—')}</strong></div>
+          <div class="monitor-row"><span>Telemetry</span><strong>${robotLink.telemetryStale ? 'Delayed' : 'Live'}</strong></div>
           <div class="monitor-row"><span>GPS Ready</span><strong>${(robotLink.gpsReady ?? gps.ready) ? 'Yes' : 'No'}</strong></div>
           <div class="monitor-row"><span>Sat / HDOP</span><strong>${robot.gpsSat ?? '—'} / ${robot.gpsHdop ?? '—'}</strong></div>
         </div>
         <div class="monitor-card ${commandClass}">
           <div class="monitor-title">Command Path</div>
-          <div class="monitor-row"><span>State</span><strong>${commandPath.state || '—'}</strong></div>
-          <div class="monitor-row"><span>Mission</span><strong>${mission.state || overall.missionState || '—'}</strong></div>
-          <div class="monitor-row"><span>Waypoints</span><strong>${latestTestSnapshot?.lora?.wpPushState || '—'}</strong></div>
+          <div class="monitor-row"><span>State</span><strong>${formatConnectionStateLabel(commandPath.state || '—', '—')}</strong></div>
+          <div class="monitor-row"><span>Mission</span><strong>${formatMissionStateLabel(mission.state || overall.missionState || '—', '—')}</strong></div>
+          <div class="monitor-row"><span>Waypoints</span><strong>${toFriendlyLabel(latestTestSnapshot?.lora?.wpPushState || '—', '—')}</strong></div>
           <div class="monitor-row"><span>Last Cmd</span><strong>${commandPath.lastCmd || latestTestSnapshot?.lora?.lastCmd || '—'}</strong></div>
-          <div class="monitor-row"><span>Status</span><strong>${commandPath.lastCommandStatus || latestTestSnapshot?.lora?.lastCommandStatus || '—'}</strong></div>
+          <div class="monitor-row"><span>Status</span><strong>${toFriendlyLabel(commandPath.lastCommandStatus || latestTestSnapshot?.lora?.lastCommandStatus || '—', '—')}</strong></div>
         </div>
         <div class="monitor-card ${mission.state === 'RUNNING' ? 'ok' : 'warn'}">
           <div class="monitor-title">Mission</div>
-          <div class="monitor-row"><span>State</span><strong>${mission.state || '—'}</strong></div>
+          <div class="monitor-row"><span>State</span><strong>${formatMissionStateLabel(mission.state || '—', '—')}</strong></div>
           <div class="monitor-row"><span>Coverage</span><strong>${mission.coveragePct != null ? `${Number(mission.coveragePct).toFixed(1)}%` : '—'}</strong></div>
           <div class="monitor-row"><span>Command ID</span><strong>${commandPath.lastCommandId || '—'}</strong></div>
           <div class="monitor-row"><span>Ready</span><strong>${overall.ready ? 'Yes' : 'No'}</strong></div>
@@ -1752,9 +1832,9 @@
       const backendState = latestTestSnapshot?.connectivity?.backend?.state || 'offline';
       const commandPathState = latestTestSnapshot?.connectivity?.commandPath?.state || 'offline';
 
-      document.getElementById('controllerMissionState').textContent = missionState;
-      document.getElementById('controllerRobotState').textContent = robotState;
-      document.getElementById('controllerLinkState').textContent = linkState;
+      document.getElementById('controllerMissionState').textContent = formatMissionStateLabel(missionState, '—');
+      document.getElementById('controllerRobotState').textContent = formatRobotStateLabel(robotState, '—');
+      document.getElementById('controllerLinkState').textContent = formatConnectionStateLabel(linkState, toFriendlyLabel(linkState, '—'));
       document.getElementById('controllerHeldAction').textContent = heldDriveAction ? heldDriveAction.replace('drive-', '').toUpperCase() : 'None';
 
       const robotCard = document.getElementById('controllerRobotState')?.parentElement;
