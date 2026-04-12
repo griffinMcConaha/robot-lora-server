@@ -91,7 +91,7 @@ const REMOTE_BASE_STATION_STALE_MS = Number(process.env.REMOTE_BASE_STATION_STAL
 const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? Math.max(LORA_WIRE.MAX_WAYPOINTS + 8, 256));
 const REMOTE_COMMAND_STALE_MS = Number(process.env.REMOTE_COMMAND_STALE_MS ?? 300000);
 const REMOTE_COMMAND_ACK_RETENTION_MS = Number(process.env.REMOTE_COMMAND_ACK_RETENTION_MS ?? 15000);
-const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 1200);
+const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 500);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
