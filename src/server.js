@@ -260,6 +260,29 @@ function parseMaybeJson(value) {
   }
 }
 
+function coerceFiniteNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number)) {
+      return number;
+    }
+  }
+  return null;
+}
+
+function coerceBooleanLike(...values) {
+  for (const value of values) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return value !== 0;
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (['1', 'true', 'yes', 'y', 'ok', 'fix', 'fixed'].includes(normalized)) return true;
+      if (['0', 'false', 'no', 'n', 'off', 'none', 'nofix', 'no fix'].includes(normalized)) return false;
+    }
+  }
+  return null;
+}
+
 function normalizeCommand(raw) {
   if (typeof raw !== 'string') return null;
   // Strip optional CMD: prefix (STM32 LoRa protocol uses CMD:AUTO, CMD:MANUAL, etc.)
@@ -3032,6 +3055,15 @@ function buildTestMenu() {
       group: 'Dispersion',
     },
     {
+      id: 'all-on',
+      title: 'All Outputs On',
+      kind: 'dispersion',
+      description: 'Enable salt, brine, agitator, thrower, and relay outputs together.',
+      caution: 'danger',
+      shortcut: 'U',
+      group: 'Dispersion',
+    },
+    {
       id: 'safe-off',
       title: 'Safe Outputs Off',
       kind: 'dispersion',
@@ -3312,6 +3344,10 @@ async function runTestMenuAction(actionId, input = {}) {
       const result = await bridge.sendCommand('RELAY ON', { waitForAck: false });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'RELAY ON' } };
     }
+    case 'all-on': {
+      const result = await bridge.sendCommand('ALLON', { waitForAck: false });
+      return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'ALLON' } };
+    }
     case 'safe-off': {
       const commands = ['PCT:0', 'AGITATOR OFF', 'THROWER OFF', 'RELAY OFF'];
       const steps = [];
@@ -3419,16 +3455,18 @@ function parseIncomingTelemetry(payload) {
     };
   }
 
-  if (body?.robot && typeof body.robot.lat === 'number' && typeof body.robot.lon === 'number') {
+  const robotLat = coerceFiniteNumber(body?.robot?.lat, body?.robot?.latitude, body?.robot?.gps?.lat, body?.robot?.gps?.latitude);
+  const robotLon = coerceFiniteNumber(body?.robot?.lon, body?.robot?.longitude, body?.robot?.gps?.lon, body?.robot?.gps?.longitude);
+  if (body?.robot && robotLat !== null && robotLon !== null) {
     return {
       robot: {
-        lat: body.robot.lat,
-        lon: body.robot.lon,
-        heading: Number(body.robot.heading ?? body.heading?.yaw ?? 0),
-        speed: Number(body.robot.speed ?? 0),
-        gpsFix: Boolean(body.robot.fix ?? body.gps?.fix ?? false),
-        gpsHdop: Number(body.robot.hdop ?? body.gps?.hdop ?? 0),
-        gpsSat: Number(body.robot.sat ?? body.gps?.sat ?? 0),
+        lat: robotLat,
+        lon: robotLon,
+        heading: coerceFiniteNumber(body.robot.heading, body.heading?.yaw, body.robot.yaw, 0) ?? 0,
+        speed: coerceFiniteNumber(body.robot.speed, body.robot.velocity, 0) ?? 0,
+        gpsFix: coerceBooleanLike(body.robot.fix, body.robot.gpsFix, body.gps?.fix, false) ?? false,
+        gpsHdop: coerceFiniteNumber(body.robot.hdop, body.robot.gpsHdop, body.gps?.hdop, 0) ?? 0,
+        gpsSat: coerceFiniteNumber(body.robot.sat, body.robot.gpsSat, body.gps?.sat, 0) ?? 0,
       },
       source: String(body.source ?? 'unknown'),
       stateName: typeof body.state === 'string' ? body.state : null,
@@ -3436,23 +3474,48 @@ function parseIncomingTelemetry(payload) {
     };
   }
 
-  if (body?.gps && typeof body.gps.lat === 'number' && typeof body.gps.lon === 'number') {
-    const motorM1 = Number(body.motor?.m1 ?? 0);
-    const motorM2 = Number(body.motor?.m2 ?? 0);
+  const gpsLat = coerceFiniteNumber(body?.gps?.lat, body?.gps?.latitude, body?.lat, body?.latitude);
+  const gpsLon = coerceFiniteNumber(body?.gps?.lon, body?.gps?.longitude, body?.lon, body?.longitude);
+  if (gpsLat !== null && gpsLon !== null && (body?.gps || body?.state || body?.motor || body?.heading)) {
+    const motorM1 = coerceFiniteNumber(body.motor?.m1, body.motor?.left, body.m1, 0) ?? 0;
+    const motorM2 = coerceFiniteNumber(body.motor?.m2, body.motor?.right, body.m2, 0) ?? 0;
     const approxSpeed = Math.abs((motorM1 + motorM2) / 2) / 100;
 
     return {
       robot: {
-        lat: body.gps.lat,
-        lon: body.gps.lon,
-        heading: Number(body.heading?.yaw ?? 0),
-        speed: Number(body.speed ?? approxSpeed),
-        gpsFix: Boolean(body.gps.fix),
-        gpsHdop: Number(body.gps.hdop ?? 0),
-        gpsSat: Number(body.gps.sat ?? 0),
+        lat: gpsLat,
+        lon: gpsLon,
+        heading: coerceFiniteNumber(body.heading?.yaw, body.heading, body.yaw, body.h, 0) ?? 0,
+        speed: coerceFiniteNumber(body.speed, body.velocity, approxSpeed) ?? approxSpeed,
+        gpsFix: coerceBooleanLike(body.gps?.fix, body.fix, body.gpsFix, false) ?? false,
+        gpsHdop: coerceFiniteNumber(body.gps?.hdop, body.hdop, body.gpsHdop, 0) ?? 0,
+        gpsSat: coerceFiniteNumber(body.gps?.sat, body.sat, body.gpsSat, 0) ?? 0,
       },
       source: String(body.source ?? 'lora'),
       stateName: typeof body.state === 'string' ? body.state : null,
+      raw: body,
+    };
+  }
+
+  if (typeof body?.state === 'string' && (body?.motor || body?.heading || body?.prox || body?.disp)) {
+    const prevLat = coerceFiniteNumber(state.robot?.lat, 0) ?? 0;
+    const prevLon = coerceFiniteNumber(state.robot?.lon, 0) ?? 0;
+    const motorM1 = coerceFiniteNumber(body.motor?.m1, body.motor?.left, 0) ?? 0;
+    const motorM2 = coerceFiniteNumber(body.motor?.m2, body.motor?.right, 0) ?? 0;
+    const approxSpeed = Math.abs((motorM1 + motorM2) / 2) / 100;
+
+    return {
+      robot: {
+        lat: prevLat,
+        lon: prevLon,
+        heading: coerceFiniteNumber(body.heading?.yaw, body.heading, body.yaw, 0) ?? 0,
+        speed: coerceFiniteNumber(body.speed, body.velocity, approxSpeed) ?? approxSpeed,
+        gpsFix: coerceBooleanLike(body.gps?.fix, body.fix, state.robot?.gpsFix, false) ?? false,
+        gpsHdop: coerceFiniteNumber(body.gps?.hdop, body.hdop, state.robot?.gpsHdop, 0) ?? 0,
+        gpsSat: coerceFiniteNumber(body.gps?.sat, body.sat, state.robot?.gpsSat, 0) ?? 0,
+      },
+      source: String(body.source ?? 'lora-state'),
+      stateName: body.state,
       raw: body,
     };
   }
@@ -3977,6 +4040,16 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
   const parsed = parseIncomingTelemetry(req.body);
   if (!parsed) {
     metrics.telemetryRejected += 1;
+    const rawSnippet = typeof req.body === 'string'
+      ? req.body
+      : (() => {
+          try {
+            return JSON.stringify(req.body);
+          } catch {
+            return String(req.body ?? '');
+          }
+        })();
+    console.warn(`[telemetry] rejected payload: ${String(rawSnippet).slice(0, 240)}`);
     return res.status(400).json({ ok: false, error: 'Unsupported telemetry payload' });
   }
   const result = await ingestParsedTelemetry(parsed);
