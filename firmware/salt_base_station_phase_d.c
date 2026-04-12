@@ -98,6 +98,9 @@ static char last_cmd[192]    = "none";
 
 // Phase D: separate verbatim store for last LoRa RX, served via GET /last_lora
 static char last_lora_rx[256] = "";
+static char last_ack[256] = "";
+static uint32_t ack_count = 0;
+static char last_cmd_status[32] = "idle";
 static uint32_t lora_tx_ok_count = 0;
 static uint32_t lora_tx_fail_count = 0;
 static uint32_t lora_tx_fail_streak = 0;
@@ -195,11 +198,17 @@ static esp_err_t command_post_handler(httpd_req_t *req) {
 
     // Phase D: include live queue depth in status JSON
     xSemaphoreTake(status_lock, portMAX_DELAY);
+    snprintf(last_cmd_status, sizeof(last_cmd_status), "%s", "queued");
     snprintf(status_json, sizeof(status_json),
              "{\"battery\":85,\"state\":\"CMD_QUEUED\",\"mode\":\"HTTP\","
-             "\"last_cmd\":\"%.120s\",\"queue_depth\":%d,"
+             "\"last_cmd\":\"%.120s\",\"last_cmd_status\":\"%.24s\","
+             "\"ack_count\":%lu,\"last_ack\":\"%.180s\","
+             "\"queue_depth\":%d,"
              "\"lora_tx_ok\":%lu,\"lora_tx_fail\":%lu,\"lora_tx_fail_streak\":%lu}",
              last_cmd,
+             last_cmd_status,
+             (unsigned long)ack_count,
+             last_ack,
              (int)uxQueueMessagesWaiting(lora_cmd_q),
              (unsigned long)lora_tx_ok_count,
              (unsigned long)lora_tx_fail_count,
@@ -370,14 +379,19 @@ static void lora_tx_task(void *arg) {
                     lora_last_tx_fail_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
                     ESP_LOGE(TAG, "LoRaSend failed after 3 retries: %.*s", c.len, c.payload);
                     xSemaphoreTake(status_lock, portMAX_DELAY);
+                    snprintf(last_cmd_status, sizeof(last_cmd_status), "%s", "failed");
                     snprintf(status_json, sizeof(status_json),
                              "{\"battery\":85,\"state\":\"LORA_TX_FAIL\",\"mode\":\"LORA\","
                              "\"queue_depth\":%d,\"last_cmd\":\"%.120s\","
+                             "\"last_cmd_status\":\"%.24s\",\"ack_count\":%lu,\"last_ack\":\"%.180s\","
                              "\"lora_tx_ok\":%lu,\"lora_tx_fail\":%lu,\"lora_tx_fail_streak\":%lu,"
                              "\"lora_last_tx_ok_ms\":%lu,\"lora_last_tx_fail_ms\":%lu,"
                              "\"bridge_degraded\":%s}",
                              (int)uxQueueMessagesWaiting(lora_cmd_q),
                              last_cmd,
+                             last_cmd_status,
+                             (unsigned long)ack_count,
+                             last_ack,
                              (unsigned long)lora_tx_ok_count,
                              (unsigned long)lora_tx_fail_count,
                              (unsigned long)lora_tx_fail_streak,
@@ -389,6 +403,9 @@ static void lora_tx_task(void *arg) {
                     lora_tx_ok_count++;
                     lora_tx_fail_streak = 0;
                     lora_last_tx_ok_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+                    xSemaphoreTake(status_lock, portMAX_DELAY);
+                    snprintf(last_cmd_status, sizeof(last_cmd_status), "%s", "sent");
+                    xSemaphoreGive(status_lock);
                 }
             }
         }
@@ -410,16 +427,25 @@ static void lora_rx_task(void *arg) {
 
             // Phase D: store verbatim for /last_lora
             snprintf(last_lora_rx, sizeof(last_lora_rx), "%s", (char*)rx);
+            if (strncmp((char*)rx, "ACK:", 4) == 0) {
+                snprintf(last_ack, sizeof(last_ack), "%s", (char*)rx);
+                ack_count++;
+                snprintf(last_cmd_status, sizeof(last_cmd_status), "%s", "acknowledged");
+            }
 
             // Phase D: include queue depth in /status JSON
             snprintf(status_json, sizeof(status_json),
                      "{\"battery\":85,\"state\":\"IDLE\",\"mode\":\"LORA\","
                      "\"queue_depth\":%d,\"last_lora\":\"%.200s\","
+                     "\"last_cmd_status\":\"%.24s\",\"ack_count\":%lu,\"last_ack\":\"%.180s\","
                      "\"lora_tx_ok\":%lu,\"lora_tx_fail\":%lu,\"lora_tx_fail_streak\":%lu,"
                      "\"lora_last_tx_ok_ms\":%lu,\"lora_last_tx_fail_ms\":%lu,"
                      "\"bridge_degraded\":%s}",
                      (int)uxQueueMessagesWaiting(lora_cmd_q),
                      last_lora_rx,
+                     last_cmd_status,
+                     (unsigned long)ack_count,
+                     last_ack,
                      (unsigned long)lora_tx_ok_count,
                      (unsigned long)lora_tx_fail_count,
                      (unsigned long)lora_tx_fail_streak,

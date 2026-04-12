@@ -91,6 +91,7 @@ const REMOTE_BASE_STATION_STALE_MS = Number(process.env.REMOTE_BASE_STATION_STAL
 const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? Math.max(LORA_WIRE.MAX_WAYPOINTS + 8, 256));
 const REMOTE_COMMAND_STALE_MS = Number(process.env.REMOTE_COMMAND_STALE_MS ?? 300000);
 const REMOTE_COMMAND_ACK_RETENTION_MS = Number(process.env.REMOTE_COMMAND_ACK_RETENTION_MS ?? 15000);
+const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 1200);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -189,6 +190,7 @@ const state = {
 let safetyMonitorInFlight = false;
 let runtimeStateSaveTimer = null;
 let scheduledMissionInFlight = false;
+let lastPolledLoRaFrame = null;
 
 const DRIVE_COMMANDS = new Set([
   CMD.FORWARD,
@@ -701,8 +703,20 @@ function resolveGeofenceFailsafeAction() {
 function isRobotInsideCoverageArea(robotPoint) {
   if (!state.coverage || !robotPoint) return true;
   const { row, col } = worldToGrid(state.coverage, robotPoint);
-  if (!withinGrid(state.coverage, row, col)) return false;
-  return Boolean(state.coverage.cells[row][col]?.inside);
+  const toleranceCells = 1;
+
+  for (let rowOffset = -toleranceCells; rowOffset <= toleranceCells; rowOffset++) {
+    for (let colOffset = -toleranceCells; colOffset <= toleranceCells; colOffset++) {
+      const candidateRow = row + rowOffset;
+      const candidateCol = col + colOffset;
+      if (!withinGrid(state.coverage, candidateRow, candidateCol)) continue;
+      if (state.coverage.cells[candidateRow]?.[candidateCol]?.inside) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 function resolveCoverageMarkRadiusM() {
@@ -902,6 +916,23 @@ function clearRecoveredSafetyState({ telemetryRecovered = false, gpsRecovered = 
   }
 
   return changed;
+}
+
+function clearResetRecoveryState() {
+  clearRecoveredSafetyState({
+    telemetryRecovered: true,
+    gpsRecovered: true,
+    geofenceRecovered: true,
+    faultRecovered: true,
+  });
+
+  if (state.robot && [ROBOT_STATE.ESTOP, ROBOT_STATE.ERROR].includes(String(state.robot.state ?? '').trim().toUpperCase())) {
+    state.robot = {
+      ...state.robot,
+      state: ROBOT_STATE.PAUSE,
+      timestampMs: Date.now(),
+    };
+  }
 }
 
 function remoteBaseStationAgeMs(now = Date.now()) {
@@ -1973,6 +2004,9 @@ function syncMissionToCommand(cmd) {
       mission.reset();
       bridge.resetWpState();
     }
+    clearResetRecoveryState();
+    publishSupervision();
+    publishOperator();
     scheduleRuntimeStateSave('command.reset', { immediate: true });
   }
 }
@@ -2537,6 +2571,12 @@ async function dispatchCommand(cmd, options = {}) {
         status: COMMAND_STATUS.APPLIED,
         detail: confirmation,
       });
+      if (cmd === CMD.RESET) {
+        clearResetRecoveryState();
+        publishSupervision();
+        publishOperator();
+        publish(WS_EVENT.STATE_SNAPSHOT, publicState());
+      }
     }
   }
 
@@ -3501,6 +3541,110 @@ function parseIncomingTelemetry(payload) {
   return null;
 }
 
+async function ingestParsedTelemetry(parsed) {
+  if (!parsed) {
+    return { ok: false, error: 'Unsupported telemetry payload' };
+  }
+
+  metrics.telemetryAccepted += 1;
+
+  if (parsed.isFault) {
+    state.lastFault = { fault: parsed.fault, action: parsed.action, at: Date.now() };
+    publish(WS_EVENT.FAULT_RECEIVED, { fault: parsed.fault, action: parsed.action, at: state.lastFault.at });
+
+    db.logEvent(mission.currentId(), EVENT_TYPE.FAULT_RECEIVED, {
+      fault: parsed.fault,
+      action: parsed.action,
+    });
+    mission.recordFault();
+
+    if (parsed.action === 'ESTOP') {
+      if ([MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
+        try { mission.abort(`fault:${parsed.fault}`, buildFinalMissionStats()); } catch (_) { /* ignore */ }
+      }
+      bridge.resetWpState();
+    } else if (parsed.action === 'PAUSE' && mission.isRunning()) {
+      try { mission.pause(`fault:${parsed.fault}`); } catch (_) { /* ignore */ }
+    }
+
+    publishSupervision();
+    publishOperator();
+    scheduleRuntimeStateSave('telemetry.fault', { immediate: true });
+
+    return { ok: true, fault: parsed.fault, action: parsed.action };
+  }
+
+  state.robot = {
+    lat: parsed.robot.lat,
+    lon: parsed.robot.lon,
+    heading: parsed.robot.heading,
+    speed: parsed.robot.speed,
+    gpsFix: parsed.robot.gpsFix,
+    gpsHdop: parsed.robot.gpsHdop,
+    gpsSat: parsed.robot.gpsSat,
+    source: parsed.source,
+    state: parsed.stateName ?? state.robot?.state ?? ROBOT_STATE.IDLE,
+    timestampMs: Date.now(),
+    raw: parsed.raw,
+  };
+
+  clearRecoveredSafetyState({
+    telemetryRecovered: true,
+    gpsRecovered: getRobotGpsStatus(state.robot).ready,
+    geofenceRecovered: isRobotInsideCoverageArea(state.robot),
+    faultRecovered: ![ROBOT_STATE.ESTOP, ROBOT_STATE.ERROR].includes(state.robot.state),
+  });
+
+  state.trail.push({ lat: state.robot.lat, lon: state.robot.lon, t: state.robot.timestampMs });
+  if (state.trail.length > 5000) {
+    state.trail = state.trail.slice(-5000);
+  }
+
+  let stats = null;
+  if (state.coverage) {
+    markCoverage(state.coverage, state.robot, resolveCoverageMarkRadiusM(), state.robot.timestampMs);
+    stats = coverageStats(state.coverage);
+  }
+
+  publish(WS_EVENT.TELEMETRY_UPDATED, { robot: state.robot, coverage: stats });
+
+  db.logEvent(mission.currentId(), EVENT_TYPE.TELEMETRY_RECEIVED, {
+    lat: state.robot.lat,
+    lon: state.robot.lon,
+    heading: state.robot.heading,
+    state: state.robot.state,
+  });
+
+  if (stats) mission.updateCoverage(getCoveragePct(stats));
+
+  await enforceGeofenceFailsafePolicy('telemetry');
+
+  scheduleRuntimeStateSave('telemetry.update');
+  publishSupervision();
+
+  return { ok: true, coverage: stats };
+}
+
+async function pollBaseStationLoRaTelemetry() {
+  try {
+    const lora = await bridge.refreshStatus();
+    const raw = typeof lora?.baseStation?.lastLoRa === 'string' ? lora.baseStation.lastLoRa.trim() : '';
+    if (!raw || raw === lastPolledLoRaFrame) {
+      return;
+    }
+
+    lastPolledLoRaFrame = raw;
+    const parsed = parseIncomingTelemetry({ last_lora: raw });
+    if (!parsed) {
+      return;
+    }
+
+    await ingestParsedTelemetry(parsed);
+  } catch (_) {
+    // Best-effort poll only; direct POST telemetry remains supported.
+  }
+}
+
 function publish(event, payload) {
   const packet = JSON.stringify({ event, payload, at: Date.now() });
   let delivered = 0;
@@ -3877,89 +4021,8 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
     metrics.telemetryRejected += 1;
     return res.status(400).json({ ok: false, error: 'Unsupported telemetry payload' });
   }
-
-  metrics.telemetryAccepted += 1;
-
-  // Handle fault notification separately — don't overwrite robot position.
-  if (parsed.isFault) {
-    state.lastFault = { fault: parsed.fault, action: parsed.action, at: Date.now() };
-    publish(WS_EVENT.FAULT_RECEIVED, { fault: parsed.fault, action: parsed.action, at: state.lastFault.at });
-
-    // Event log + mission counter
-    db.logEvent(mission.currentId(), EVENT_TYPE.FAULT_RECEIVED, {
-      fault:  parsed.fault,
-      action: parsed.action,
-    });
-    mission.recordFault();
-
-    // Auto-pause a running mission on ESTOP/PAUSE action
-    if (parsed.action === 'ESTOP') {
-      if ([MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
-        try { mission.abort(`fault:${parsed.fault}`, buildFinalMissionStats()); } catch (_) { /* ignore */ }
-      }
-      bridge.resetWpState();
-    } else if (parsed.action === 'PAUSE' && mission.isRunning()) {
-      try { mission.pause(`fault:${parsed.fault}`); } catch (_) { /* ignore */ }
-    }
-
-    publishSupervision();
-    publishOperator();
-    scheduleRuntimeStateSave('telemetry.fault', { immediate: true });
-
-    return res.json({ ok: true, fault: parsed.fault, action: parsed.action });
-  }
-
-  state.robot = {
-    lat: parsed.robot.lat,
-    lon: parsed.robot.lon,
-    heading: parsed.robot.heading,
-    speed: parsed.robot.speed,
-    gpsFix: parsed.robot.gpsFix,
-    gpsHdop: parsed.robot.gpsHdop,
-    gpsSat: parsed.robot.gpsSat,
-    source: parsed.source,
-    state: parsed.stateName ?? state.robot?.state ?? ROBOT_STATE.IDLE,
-    timestampMs: Date.now(),
-    raw: parsed.raw,
-  };
-
-  clearRecoveredSafetyState({
-    telemetryRecovered: true,
-    gpsRecovered: getRobotGpsStatus(state.robot).ready,
-    geofenceRecovered: isRobotInsideCoverageArea(state.robot),
-    faultRecovered: ![ROBOT_STATE.ESTOP, ROBOT_STATE.ERROR].includes(state.robot.state),
-  });
-
-  state.trail.push({ lat: state.robot.lat, lon: state.robot.lon, t: state.robot.timestampMs });
-  if (state.trail.length > 5000) {
-    state.trail = state.trail.slice(-5000);
-  }
-
-  let stats = null;
-  if (state.coverage) {
-    markCoverage(state.coverage, state.robot, resolveCoverageMarkRadiusM(), state.robot.timestampMs);
-    stats = coverageStats(state.coverage);
-  }
-
-  publish(WS_EVENT.TELEMETRY_UPDATED, { robot: state.robot, coverage: stats });
-
-  // Event log (sampled — log every telemetry update)
-  db.logEvent(mission.currentId(), EVENT_TYPE.TELEMETRY_RECEIVED, {
-    lat:     state.robot.lat,
-    lon:     state.robot.lon,
-    heading: state.robot.heading,
-    state:   state.robot.state,
-  });
-
-  // Update rolling coverage in mission row
-  if (stats) mission.updateCoverage(getCoveragePct(stats));
-
-  await enforceGeofenceFailsafePolicy('telemetry');
-
-  scheduleRuntimeStateSave('telemetry.update');
-  publishSupervision();
-
-  return res.json({ ok: true, coverage: stats });
+  const result = await ingestParsedTelemetry(parsed);
+  return res.json(result);
 });
 
 app.post(API.BASE_STATION_STATUS, requireBoard, rateLimitTelemetry, async (req, res) => {
@@ -4483,6 +4546,11 @@ const safetyTimer = setInterval(() => {
   void enforceGeofenceFailsafePolicy('monitor');
 }, Math.max(100, SAFETY_MONITOR_INTERVAL_MS));
 if (typeof safetyTimer.unref === 'function') safetyTimer.unref();
+
+const baseStationLoRaPollTimer = setInterval(() => {
+  void pollBaseStationLoRaTelemetry();
+}, Math.max(400, BASE_STATION_LORA_POLL_MS));
+if (typeof baseStationLoRaPollTimer.unref === 'function') baseStationLoRaPollTimer.unref();
 
 const retentionTimer = setInterval(() => {
   if (!Number.isFinite(EVENT_RETENTION_DAYS) || EVENT_RETENTION_DAYS <= 0) {

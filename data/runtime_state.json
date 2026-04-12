@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "savedAt": 1775977834298,
+  "reason": "startup.reconciled",
+  "state": {
+    "baseStation": {
+      "lat": 41.07530884188187,
+      "lon": -81.5141786634922
+    },
+    "homePoint": {
+      "lat": 41.07530884188187,
+      "lon": -81.5141786634922
+    },
+    "remoteBaseStation": null,
+    "boundary": [
+      {
+        "lat": 41.07530884188187,
+        "lon": -81.5141786634922
+      },
+      {
+        "lat": 41.07530884188187,
+        "lon": -81.51371899992228
+      },
+      {
+        "lat": 41.075253743062355,
+        "lon": -81.51371899992228
+      },
+      {
+        "lat": 41.075253743062355,
+        "lon": -81.5141786634922
+      }
+    ],
+    "coverage": {
+      "cellSizeM": 2,
+      "cells": [],
+      "stats": {
+        "insideCount": 57,
+        "coveredCount": 0,
+        "coveragePercent": 0,
+        "coveredPct": 0
+      }
+    },
+    "robot": null,
+    "trail": [],
+    "lastPath": [],
+    "commandHistory": [],
+    "lastFault": null,
+    "safety": {
+      "telemetryFailsafeAt": 0,
+      "telemetryFailsafeAction": null,
+      "telemetryFailsafeReason": null,
+      "gpsFailsafeAt": 0,
+      "gpsFailsafeAction": null,
+      "gpsFailsafeReason": null,
+      "geofenceFailsafeAt": 0,
+      "geofenceFailsafeAction": null,
+      "geofenceFailsafeReason": null
+    },
+    "demo": {
+      "enabled": false,
+      "updatedAt": 0,
+      "source": "default",
+      "spots": {
+        "start": null,
+        "end": null
+      }
+    },
+    "automation": {
+      "enabled": false,
+      "scheduledRunAt": null,
+      "label": null,
+      "notify": true,
+      "armedAt": 0,
+      "lastTriggeredAt": 0,
+      "lastResult": null,
+      "lastError": null
+    },
+    "operator": {t
+      "workflowAcks": {},
+      "notes": []
+    },
+    "bridge": {
+      "baseStationUrl": "http://192.168.4.1",
+      "baseStationCandidates": [
+        "http://192.168.4.1",
+        "http://base-station.local"
+      ],
+      "wpPushState": "none",
+      "wpPushCount": 0,
+      "wpPushAt": null,
+      "wpPushError": null,
+      "lastCmd": null,
+      "lastCmdAt": null,
+      "lastCmdError": null,
+      "lastSuccessAt": null,
+      "lastErrorAt": null,
+      "consecutiveFailures": 0,
+      "degraded": false,
+      "degradedSince": null,
+      "requestTimeoutMs": 3000,
+      "ackWaitTimeoutMs": 5000,
+      "ackPollMs": 120,
+      "baseStation": {
+        "statusOk": false,
+        "statusCode": null,
+        "statusError": null,
+        "statusVersion": null,
+        "state": null,
+        "mode": null,
+        "wifiLinkState": null,
+        "loraLinkState": null,
+        "queueDepth": null,
+        "lastCmdId": null,
+        "lastCmdStatus": null,
+        "ackCount": null,
+        "lastAck": null,
+        "lastAckParsed": null,
+        "lastLoRa": null,
+        "discoverySource": "configured",
+        "mdnsEnabled": true,
+        "mdnsNames": [
+          "base-station",
+          "base-station.local",
+          "saltrobot-base",
+          "saltrobot-base.local",
+          "salt-robot-base",
+          "salt-robot-base.local"
+        ],
+        "mdnsServices": [],
+        "refreshedAt": null,
+        "selectedUrl": "http://192.168.4.1",
+        "attemptedUrls": []
+      }
+    },
+    "mission": {
+      "id": 5,
+      "state": "CONFIGURING",
+      "startedAt": 1773699656428,
+      "endedAt": null,
+      "coveragePct": 0,
+      "faultCount": 0,
+      "cmdCount": 0,
+      "notes": "",
+      "baseStation": {
+        "lat": 41.07530884188187,
+        "lon": -81.5141786634922
+      },
+      "boundary": [
+        {
+          "lat": 41.07530884188187,
+          "lon": -81.5141786634922
+        },
+        {
+          "lat": 41.07530884188187,
+          "lon": -81.51371899992228
+        },
+        {
+          "lat": 41.075253743062355,
+          "lon": -81.51371899992228
+        },
+        {
+          "lat": 41.075253743062355,
+          "lon": -81.5141786634922
+        }
+      ],
+      "cellSizeM": 2
+    }
+  }
+}

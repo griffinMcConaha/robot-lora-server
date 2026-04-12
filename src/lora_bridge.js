@@ -437,6 +437,14 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
     return _baseStationSnapshot;
   }
 
+  const payloadLastLoRa = typeof payload.last_lora === 'string' ? payload.last_lora.trim() : null;
+  const payloadLastAck = typeof payload.last_ack === 'string' ? payload.last_ack.trim() : null;
+  const derivedLastAck = payloadLastAck || (_unwrapAckFrame(payloadLastLoRa)?.ack ? payloadLastLoRa : null);
+  const parsedAck = derivedLastAck ? _parseAckDetails(derivedLastAck) : null;
+  const derivedLoraLinkState = typeof payload.lora_link_state === 'string'
+    ? payload.lora_link_state
+    : (payloadLastLoRa ? 'rx' : _baseStationSnapshot.loraLinkState);
+
   _baseStationSnapshot = {
     ..._baseStationSnapshot,
     statusOk: Boolean(meta.ok ?? true),
@@ -446,14 +454,14 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
     state: typeof payload.state === 'string' ? payload.state : _baseStationSnapshot.state,
     mode: typeof payload.mode === 'string' ? payload.mode : _baseStationSnapshot.mode,
     wifiLinkState: typeof payload.wifi_link_state === 'string' ? payload.wifi_link_state : _baseStationSnapshot.wifiLinkState,
-    loraLinkState: typeof payload.lora_link_state === 'string' ? payload.lora_link_state : _baseStationSnapshot.loraLinkState,
+    loraLinkState: derivedLoraLinkState,
     queueDepth: Number.isFinite(Number(payload.queue_depth)) ? Number(payload.queue_depth) : _baseStationSnapshot.queueDepth,
     lastCmdId: typeof payload.last_cmd_id === 'string' ? payload.last_cmd_id.trim() : _baseStationSnapshot.lastCmdId,
     lastCmdStatus: typeof payload.last_cmd_status === 'string' ? payload.last_cmd_status.trim() : _baseStationSnapshot.lastCmdStatus,
     ackCount: Number.isFinite(Number(payload.ack_count)) ? Number(payload.ack_count) : _baseStationSnapshot.ackCount,
-    lastAck: typeof payload.last_ack === 'string' ? payload.last_ack.trim() : _baseStationSnapshot.lastAck,
-    lastAckParsed: typeof payload.last_ack === 'string' ? _parseAckDetails(payload.last_ack.trim()) : _baseStationSnapshot.lastAckParsed,
-    lastLoRa: typeof payload.last_lora === 'string' ? payload.last_lora.trim() : _baseStationSnapshot.lastLoRa,
+    lastAck: derivedLastAck ?? _baseStationSnapshot.lastAck,
+    lastAckParsed: parsedAck ?? _baseStationSnapshot.lastAckParsed,
+    lastLoRa: payloadLastLoRa ?? _baseStationSnapshot.lastLoRa,
     discoverySource: meta.discoverySource ?? _baseStationSnapshot.discoverySource,
     mdnsEnabled: BASE_STATION_MDNS_ENABLED,
     mdnsNames: BASE_STATION_MDNS_NAMES,
@@ -669,7 +677,7 @@ async function _waitForAck(expectedAck, options = {}) {
       if (frame?.ack) {
         lastSeenRaw = frame.raw;
         lastSeenAck = frame.ack;
-        if ((!wrappedOnly || frame.wrapped) && frame.ack === expectedAck && frame.raw !== baselineRaw) {
+        if (frame.ack === expectedAck && frame.raw !== baselineRaw) {
           return { ok: true, ack: frame.ack, raw: frame.raw, source: 'status' };
         }
       }
@@ -681,7 +689,7 @@ async function _waitForAck(expectedAck, options = {}) {
       lastSeenRaw = frame.raw;
       lastSeenAck = frame.ack;
 
-      if ((!wrappedOnly || frame.wrapped) && frame.ack === expectedAck && frame.raw !== baselineRaw) {
+      if (frame.ack === expectedAck && frame.raw !== baselineRaw) {
         return { ok: true, ack: frame.ack, raw: frame.raw, source: 'last_lora' };
       }
     }
