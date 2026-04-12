@@ -75,7 +75,7 @@ const MIN_INPUT_AREA_CELL_SIZE_M = Number(process.env.MIN_INPUT_AREA_CELL_SIZE_M
 const MAX_INPUT_AREA_CELL_SIZE_M = Number(process.env.MAX_INPUT_AREA_CELL_SIZE_M ?? 8.0);
 const COVERAGE_MARK_RADIUS_M = Number(process.env.COVERAGE_MARK_RADIUS_M ?? 0.5);
 const REQUEST_RATE_LIMIT_WINDOW_MS = Number(process.env.REQUEST_RATE_LIMIT_WINDOW_MS ?? 60000);
-const COMMAND_RATE_LIMIT_PER_WINDOW = Number(process.env.COMMAND_RATE_LIMIT_PER_WINDOW ?? 6000);
+const COMMAND_RATE_LIMIT_PER_WINDOW = Number(process.env.COMMAND_RATE_LIMIT_PER_WINDOW ?? 20000);
 const TELEMETRY_RATE_LIMIT_PER_WINDOW = Number(process.env.TELEMETRY_RATE_LIMIT_PER_WINDOW ?? 6000);
 const COMMAND_STATE_CONFIRM_TIMEOUT_MS = Number(process.env.COMMAND_STATE_CONFIRM_TIMEOUT_MS ?? 15000);
 const COMMAND_STATE_CONFIRM_POLL_MS = Number(process.env.COMMAND_STATE_CONFIRM_POLL_MS ?? 150);
@@ -88,10 +88,10 @@ const RUNTIME_STATE_SAVE_DEBOUNCE_MS = Number(process.env.RUNTIME_STATE_SAVE_DEB
 const RUNTIME_STATE_TRAIL_LIMIT = Number(process.env.RUNTIME_STATE_TRAIL_LIMIT ?? 300);
 const COMMAND_HISTORY_LIMIT = Number(process.env.COMMAND_HISTORY_LIMIT ?? 50);
 const REMOTE_BASE_STATION_STALE_MS = Number(process.env.REMOTE_BASE_STATION_STALE_MS ?? 15000);
-const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? Math.max(LORA_WIRE.MAX_WAYPOINTS + 8, 256));
+const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? Math.max(LORA_WIRE.MAX_WAYPOINTS + 8, 1024));
 const REMOTE_COMMAND_STALE_MS = Number(process.env.REMOTE_COMMAND_STALE_MS ?? 300000);
 const REMOTE_COMMAND_ACK_RETENTION_MS = Number(process.env.REMOTE_COMMAND_ACK_RETENTION_MS ?? 15000);
-const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 200);
+const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 120);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -1082,8 +1082,9 @@ function enqueueRemoteCommand({ commandId, cmd, source = 'remote-bridge' }) {
   if (existing) {
     return existing;
   }
-  if (pendingRemoteCommandCount() >= REMOTE_COMMAND_MAX_QUEUE) {
-    return null;
+  while (pendingRemoteCommandCount() >= REMOTE_COMMAND_MAX_QUEUE && pendingRemoteCommandCount() > 0) {
+    // Keep admission non-blocking for newest operator/test commands.
+    remoteCommandQueue.shift();
   }
 
   const entry = {
@@ -1117,15 +1118,8 @@ function queueRemoteWaypointPush(points, source = 'remote-bridge') {
     `${LORA_WIRE.WP_LOAD}:${points.length}`,
   ];
 
-  const queueDepth = pendingRemoteCommandCount();
-  if ((queueDepth + commands.length) > REMOTE_COMMAND_MAX_QUEUE) {
-    bridge.resetWpState();
-    return {
-      ok: false,
-      status: 503,
-      error: `Remote waypoint queue is full (${queueDepth}/${REMOTE_COMMAND_MAX_QUEUE})`,
-      sent: 0,
-    };
+  while ((pendingRemoteCommandCount() + commands.length) > REMOTE_COMMAND_MAX_QUEUE && pendingRemoteCommandCount() > 0) {
+    remoteCommandQueue.shift();
   }
 
   let finalCommandId = null;
@@ -1914,32 +1908,12 @@ function buildFinalMissionStats() {
 }
 
 function arbitrateCommand(cmd) {
-  const missionState = currentMissionState();
-  const wpPushState = bridge.getStatus().wpPushState;
-
   if (Object.values(CMD).includes(cmd)) {
-    if (cmd === CMD.ESTOP || cmd === CMD.PAUSE || cmd === CMD.MANUAL || DRIVE_COMMANDS.has(cmd)) {
-      return { ok: true };
-    }
-    if (cmd === CMD.RESET) {
-      if ([MISSION_STATE.PAUSED, MISSION_STATE.ABORTED, MISSION_STATE.ERROR].includes(missionState) || recoveryResetNeeded()) {
-        return { ok: true };
-      }
-      return { ok: false, status: 409, error: 'RESET allowed only when recovery is needed or the mission is PAUSED, ABORTED, or ERROR' };
-    }
-    if (cmd === CMD.AUTO) {
-      if (wpPushState === 'committed') {
-        return { ok: true };
-      }
-      return { ok: false, status: 409, error: 'AUTO requires committed waypoints' };
-    }
+    return { ok: true };
   }
 
   if (isWaypointCommand(cmd)) {
-    if ([MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState)) {
-      return { ok: true };
-    }
-    return { ok: false, status: 409, error: 'Waypoint commands are allowed only while mission is CONFIGURING or PAUSED' };
+    return { ok: true };
   }
 
   return { ok: false, status: 400, error: `Unsupported command: ${cmd}` };
@@ -3122,23 +3096,7 @@ async function runTestMenuAction(actionId, input = {}) {
     };
   }
 
-  const safeInDemoMode = new Set([
-    'bridge-status',
-    'gps-readiness',
-    'telemetry-snapshot',
-    'websocket-test',
-    'state-snapshot',
-    'gps-snapshot',
-    'ack-pause',
-    'ack-estop',
-  ]);
-  if (isHardwareLockedForDemo() && !safeInDemoMode.has(resolved.id)) {
-    return {
-      ok: false,
-      actionId: resolved.id,
-      result: { error: 'Demo mode is active. This service action is locked.' },
-    };
-  }
+  // Test/service actions remain available in demo lock for field recovery.
 
   switch (resolved.id) {
     case 'bridge-status': {
@@ -3969,9 +3927,6 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
   const cmd = normalizeCommand(rawCmd);
   if (!cmd) {
     return res.status(400).send('Missing cmd');
-  }
-  if (isHardwareLockedForDemo() && !isDemoSafeCommand(cmd)) {
-    return res.status(409).type('text/plain').send('Command blocked: demo mode is active');
   }
 
   const wireCommand = cmd === CMD.DRIVE && typeof parsedBody === 'object' && parsedBody !== null

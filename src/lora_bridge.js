@@ -67,7 +67,7 @@ const TRANSIENT_RETRY_MAX = Number(process.env.LORA_TRANSIENT_RETRY_MAX ?? 2);
 const TRANSIENT_RETRY_MS = Number(process.env.LORA_TRANSIENT_RETRY_MS ?? 200);
 const BRIDGE_DEGRADED_FAILURE_THRESHOLD = Number(process.env.BRIDGE_DEGRADED_FAILURE_THRESHOLD ?? 3);
 const ACK_WAIT_TIMEOUT_MS = Number(process.env.LORA_ACK_WAIT_TIMEOUT_MS ?? 5000);
-const ACK_POLL_MS = Number(process.env.LORA_ACK_POLL_MS ?? 120);
+const ACK_POLL_MS = Number(process.env.LORA_ACK_POLL_MS ?? 60);
 const ACK_REQUIRED = String(process.env.LORA_ACK_REQUIRED ?? '0') === '1';
 const BASE_STATUS_REFRESH_INTERVAL_MS = Number(process.env.BASE_STATUS_REFRESH_INTERVAL_MS ?? 500);
 

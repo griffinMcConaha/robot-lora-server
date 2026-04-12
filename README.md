@@ -501,4 +501,4 @@ For production, replace the `inject` node with your LoRa source node (serial/MQT
 - Coverage marks cells visited by robot position updates.
 - **Base station Wi-Fi**: the base station (`jakep2377/base_station`) first tries STA mode (SSID `42Fortress`) and falls back to AP mode (SSID `SaltRobot_Base`, IP `192.168.4.1`). In STA mode the IP is DHCP-assigned. The mobile app hard-codes `192.168.4.1`, so use AP mode for app connectivity.
 - **LoRa telemetry interval**: the STM32 transmits telemetry every **10 seconds**.
-- **SB ESP32 dispersion commands** (sent from STM32 over UART4 @ 9600 baud): `SALT:<pct>,BRINE:<pct>`, `PCT:<pct>` (applies same % to both). Responses: `STATUS:OK`, `STATUS:ERROR,BAD_CMD`, `STATUS:ERROR,OVERFLOW`, `FLOW:SALT:<ml_min>,BRINE:<ml_min>,RPM:<rpm>`.
+- **SB ESP32 dispersion commands** (sent from STM32 over UART4 @ 115200 baud): `SALT:<pct>,BRINE:<pct>`, `PCT:<pct>` (applies same % to both). Responses: `STATUS:OK`, `STATUS:ERROR,BAD_CMD`, `STATUS:ERROR,OVERFLOW`, `FLOW:SALT:<ml_min>,BRINE:<ml_min>,RPM:<rpm>`.
