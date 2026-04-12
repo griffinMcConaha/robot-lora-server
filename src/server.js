@@ -994,10 +994,6 @@ function normalizeRemoteBaseStationStatus(payload) {
   };
 }
 
-function isGatewayHeartbeatPayload(value) {
-  return typeof value === 'string' && /^GW:(?:ALIVE|HB)(?::|$)/i.test(value.trim());
-}
-
 function buildRemoteBaseStationDiagnostics(now = Date.now()) {
   const ageMs = remoteBaseStationAgeMs(now);
   const fresh = isRemoteBaseStationFresh(now);
@@ -1404,19 +1400,17 @@ function buildConnectionState(now = Date.now()) {
   const gatewayLastLoRa = effectiveBaseStation?.lastLoRa ?? null;
   const gatewayEvidence = robotReachable && !telemetryStale
     ? 'robot-telemetry'
-    : isGatewayHeartbeatPayload(gatewayLastLoRa)
-      ? 'gateway-heartbeat'
-      : gatewayLastAck
-        ? 'lora-ack'
-        : gatewayLastLoRa
-          ? 'lora-traffic'
-          : null;
+    : gatewayLastAck
+      ? 'lora-ack'
+      : gatewayLastLoRa
+        ? 'lora-traffic'
+        : null;
   const gatewayReachable = baseStationReachable && (
     ['online', 'connected', 'ready'].includes(gatewayLinkToken) || Boolean(gatewayEvidence)
   );
   const gatewayWorking = gatewayReachable && (
     ['online', 'connected', 'ready'].includes(gatewayLinkToken)
-      || ['robot-telemetry', 'gateway-heartbeat', 'lora-ack'].includes(gatewayEvidence ?? '')
+      || ['robot-telemetry', 'lora-ack'].includes(gatewayEvidence ?? '')
   );
   const gatewayState = !baseStationReachable
     ? CONNECTION_STATE.OFFLINE
@@ -1436,13 +1430,11 @@ function buildConnectionState(now = Date.now()) {
       ? 'Base station is not reachable'
       : gatewayEvidence === 'robot-telemetry'
         ? 'Robot telemetry is flowing through the gateway'
-        : gatewayEvidence === 'gateway-heartbeat'
-          ? 'Gateway heartbeat is being received over LoRa'
-          : gatewayEvidence === 'lora-ack'
-            ? 'Gateway is acknowledging LoRa commands'
-            : gatewayEvidence === 'lora-traffic'
-              ? 'Base station is receiving LoRa traffic from the gateway'
-              : (gatewayLinkToken === 'degraded' ? 'LoRa link is degraded' : 'No recent gateway traffic seen'),
+        : gatewayEvidence === 'lora-ack'
+          ? 'Gateway is acknowledging LoRa commands'
+          : gatewayEvidence === 'lora-traffic'
+            ? 'Base station is receiving LoRa traffic from the gateway'
+            : (gatewayLinkToken === 'degraded' ? 'LoRa link is degraded' : 'No recent gateway traffic seen'),
     lastAck: gatewayLastAck,
     lastLoRa: gatewayLastLoRa,
     lastSeenAt: gatewayEvidence === 'robot-telemetry'

@@ -1816,7 +1816,6 @@
           <div class="monitor-row"><span>Fix</span><strong>${robot.gpsFix == null ? '—' : (robot.gpsFix ? 'Yes' : 'No')}</strong></div>
           <div class="monitor-row"><span>Satellites</span><strong>${robot.gpsSat ?? '—'}</strong></div>
           <div class="monitor-row"><span>HDOP</span><strong>${robot.gpsHdop ?? '—'}</strong></div>
-          <div class="monitor-row"><span>Last LoRa</span><strong>${lora.lastLoRa || '—'}</strong></div>
         </div>
       `;
       renderControllerAlerts();
