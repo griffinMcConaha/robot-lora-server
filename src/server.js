@@ -3467,6 +3467,37 @@ function parseIncomingTelemetry(payload) {
     };
   }
 
+  // Compact manual-drive telemetry from STM32:
+  // {"s":"MANUAL","m1":55,"m2":55,"h":180.0,"pl":120,"pr":340}
+  // This packet intentionally omits GPS to reduce airtime. Keep telemetry fresh
+  // using last known robot GPS position when available.
+  if (typeof body?.s === 'string' && body.s.trim().toUpperCase() === 'MANUAL') {
+    const motorM1 = Number(body.m1 ?? 0);
+    const motorM2 = Number(body.m2 ?? 0);
+    const approxSpeed = Math.abs((motorM1 + motorM2) / 2) / 100;
+
+    const prevLat = Number(state.robot?.lat);
+    const prevLon = Number(state.robot?.lon);
+    const prevGpsFix = Boolean(state.robot?.gpsFix ?? false);
+    const prevGpsHdop = Number(state.robot?.gpsHdop ?? 0);
+    const prevGpsSat = Number(state.robot?.gpsSat ?? 0);
+
+    return {
+      robot: {
+        lat: Number.isFinite(prevLat) ? prevLat : 0,
+        lon: Number.isFinite(prevLon) ? prevLon : 0,
+        heading: Number(body.h ?? state.robot?.heading ?? 0),
+        speed: Number(body.speed ?? approxSpeed),
+        gpsFix: prevGpsFix,
+        gpsHdop: Number.isFinite(prevGpsHdop) ? prevGpsHdop : 0,
+        gpsSat: Number.isFinite(prevGpsSat) ? prevGpsSat : 0,
+      },
+      source: String(body.source ?? 'lora-manual'),
+      stateName: 'MANUAL',
+      raw: body,
+    };
+  }
+
   return null;
 }
 
@@ -4090,9 +4121,9 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     : 100;
 
   const requestedStartPoint = normalizeLatLonPoint(start, null);
-  const startPoint = normalizeLatLonPoint(state.robot, null)
+  const startPoint = requestedStartPoint
+    ?? normalizeLatLonPoint(state.robot, null)
     ?? normalizeLatLonPoint(state.homePoint, null)
-    ?? requestedStartPoint
     ?? normalizeLatLonPoint(state.baseStation, null);
   if (!startPoint) {
     return res.status(400).json({ ok: false, error: 'no start point available' });

@@ -662,3 +662,69 @@ test('P0 health endpoint reports degraded when telemetry is stale during running
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test('path planning honors explicit app start point over stale robot telemetry', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-path-start-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    TELEMETRY_FAILSAFE_ENABLED: '0',
+    GEOFENCE_FAILSAFE_ENABLED: '0',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    const areaBody = {
+      baseStation: { lat: 41.0, lon: -81.0 },
+      boundary: [
+        { lat: 41.0, lon: -81.0 },
+        { lat: 41.0, lon: -80.9995 },
+        { lat: 40.9995, lon: -80.9995 },
+        { lat: 40.9995, lon: -81.0 },
+      ],
+      cellSizeM: 2.0,
+    };
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/input-area`, areaBody);
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'IDLE',
+        gps: { lat: 40.99, lon: -80.99, fix: 1, sat: 8, hdop: 0.9 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 0.0, pitch: 0.0 },
+        disp: { salt: 50, brine: 50 },
+        temp: 1.2,
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res, json } = await postJson(`${SERVER_URL}/api/path/plan`, {
+        mode: 'coverage',
+        start: { lat: 41.0, lon: -81.0 },
+        homePoint: { lat: 41.0, lon: -81.0 },
+        coverageWidthM: 0.5,
+        returnToBase: true,
+        saltPct: 100,
+        brinePct: 0,
+      });
+      assert.equal(res.status, 200);
+      assert.equal(json.ok, true);
+      assert.ok(Array.isArray(json.points));
+      assert.ok(json.points.length > 1);
+      assert.ok(Math.abs(json.points[0].lat - 41.0) < 0.0003);
+      assert.ok(Math.abs(json.points[0].lon - (-81.0)) < 0.0003);
+    }
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
