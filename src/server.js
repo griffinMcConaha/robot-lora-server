@@ -75,7 +75,7 @@ const MIN_INPUT_AREA_CELL_SIZE_M = Number(process.env.MIN_INPUT_AREA_CELL_SIZE_M
 const MAX_INPUT_AREA_CELL_SIZE_M = Number(process.env.MAX_INPUT_AREA_CELL_SIZE_M ?? 8.0);
 const COVERAGE_MARK_RADIUS_M = Number(process.env.COVERAGE_MARK_RADIUS_M ?? 0.5);
 const REQUEST_RATE_LIMIT_WINDOW_MS = Number(process.env.REQUEST_RATE_LIMIT_WINDOW_MS ?? 60000);
-const COMMAND_RATE_LIMIT_PER_WINDOW = Number(process.env.COMMAND_RATE_LIMIT_PER_WINDOW ?? 240);
+const COMMAND_RATE_LIMIT_PER_WINDOW = Number(process.env.COMMAND_RATE_LIMIT_PER_WINDOW ?? 6000);
 const TELEMETRY_RATE_LIMIT_PER_WINDOW = Number(process.env.TELEMETRY_RATE_LIMIT_PER_WINDOW ?? 6000);
 const COMMAND_STATE_CONFIRM_TIMEOUT_MS = Number(process.env.COMMAND_STATE_CONFIRM_TIMEOUT_MS ?? 15000);
 const COMMAND_STATE_CONFIRM_POLL_MS = Number(process.env.COMMAND_STATE_CONFIRM_POLL_MS ?? 150);
@@ -2012,7 +2012,7 @@ function syncMissionToCommand(cmd) {
 }
 
 function commandRequiresStrictConfirmation(cmd) {
-  return [CMD.AUTO, CMD.MANUAL, CMD.PAUSE, CMD.ESTOP, CMD.RESET].includes(cmd);
+  return [CMD.PAUSE, CMD.ESTOP, CMD.RESET].includes(cmd);
 }
 
 function expectedRobotStateForCommand(cmd) {
@@ -3978,7 +3978,11 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
     ? `DRIVE,THROTTLE:${clampNumber(Math.round(Number(parsedBody.throttle ?? parsedBody.drive ?? 0)), -100, 100)},TURN:${clampNumber(Math.round(Number(parsedBody.turn ?? parsedBody.steer ?? 0)), -100, 100)}`
     : (typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : cmd);
 
-  const dispatched = await dispatchCommand(cmd, { wireCommand });
+  const dispatched = await dispatchCommand(cmd, {
+    wireCommand,
+    waitForAck: false,
+    waitForState: false,
+  });
   if (!dispatched.ok) {
     return res.status(dispatched.status ?? 500).type('text/plain').send(dispatched.error);
   }
