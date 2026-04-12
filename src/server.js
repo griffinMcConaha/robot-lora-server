@@ -91,7 +91,7 @@ const REMOTE_BASE_STATION_STALE_MS = Number(process.env.REMOTE_BASE_STATION_STAL
 const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? Math.max(LORA_WIRE.MAX_WAYPOINTS + 8, 256));
 const REMOTE_COMMAND_STALE_MS = Number(process.env.REMOTE_COMMAND_STALE_MS ?? 300000);
 const REMOTE_COMMAND_ACK_RETENTION_MS = Number(process.env.REMOTE_COMMAND_ACK_RETENTION_MS ?? 15000);
-const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 500);
+const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 200);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -4549,7 +4549,7 @@ if (typeof safetyTimer.unref === 'function') safetyTimer.unref();
 
 const baseStationLoRaPollTimer = setInterval(() => {
   void pollBaseStationLoRaTelemetry();
-}, Math.max(400, BASE_STATION_LORA_POLL_MS));
+}, Math.max(120, BASE_STATION_LORA_POLL_MS));
 if (typeof baseStationLoRaPollTimer.unref === 'function') baseStationLoRaPollTimer.unref();
 
 const retentionTimer = setInterval(() => {
