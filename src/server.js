@@ -101,6 +101,7 @@ const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? 
 const REMOTE_COMMAND_STALE_MS = Number(process.env.REMOTE_COMMAND_STALE_MS ?? 300000);
 const REMOTE_COMMAND_ACK_RETENTION_MS = Number(process.env.REMOTE_COMMAND_ACK_RETENTION_MS ?? 15000);
 const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 120);
+const DRIVE_DUPLICATE_SUPPRESS_MS = Number(process.env.DRIVE_DUPLICATE_SUPPRESS_MS ?? 350);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -200,6 +201,8 @@ let safetyMonitorInFlight = false;
 let runtimeStateSaveTimer = null;
 let scheduledMissionInFlight = false;
 let lastPolledLoRaFrame = null;
+let lastDriveWireCommand = null;
+let lastDriveWireAt = 0;
 
 const DRIVE_COMMANDS = new Set([
   CMD.FORWARD,
@@ -3996,6 +3999,15 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
   const wireCommand = cmd === CMD.DRIVE && typeof parsedBody === 'object' && parsedBody !== null
     ? `DRIVE,THROTTLE:${clampNumber(Math.round(Number(parsedBody.throttle ?? parsedBody.drive ?? 0)), -100, 100)},TURN:${clampNumber(Math.round(Number(parsedBody.turn ?? parsedBody.steer ?? 0)), -100, 100)}`
     : (typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : cmd);
+
+  if (cmd === CMD.DRIVE) {
+    const now = Date.now();
+    if (lastDriveWireCommand === wireCommand && (now - lastDriveWireAt) < DRIVE_DUPLICATE_SUPPRESS_MS) {
+      return res.type('text/plain').send('OK');
+    }
+    lastDriveWireCommand = wireCommand;
+    lastDriveWireAt = now;
+  }
 
   const dispatched = await dispatchCommand(cmd, {
     wireCommand,
