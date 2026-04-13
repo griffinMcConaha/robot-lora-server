@@ -668,6 +668,13 @@ function _parseAckDetails(text) {
     return details;
   }
 
+  if (ack.startsWith('ACK:CMD:')) {
+    details.category = 'robot_command';
+    details.source = 'robot';
+    details.command = ack.slice('ACK:CMD:'.length) || null;
+    return details;
+  }
+
   if (ack === LORA_WIRE.WP_ACK_CLEAR) {
     details.category = 'waypoint_clear';
     details.source = 'robot';
