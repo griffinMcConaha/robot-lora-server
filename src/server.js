@@ -105,6 +105,7 @@ const REMOTE_COMMAND_MAX_MOTION_LEASES = Number(process.env.REMOTE_COMMAND_MAX_M
 const REMOTE_COMMAND_MAX_MOTION_LEASE_AGE_MS = Number(process.env.REMOTE_COMMAND_MAX_MOTION_LEASE_AGE_MS ?? 3000);
 const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 120);
 const DRIVE_DUPLICATE_SUPPRESS_MS = Number(process.env.DRIVE_DUPLICATE_SUPPRESS_MS ?? 35);
+const MANUAL_DRIVE_WS_FLUSH_MS = Number(process.env.MANUAL_DRIVE_WS_FLUSH_MS ?? 30);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -206,6 +207,9 @@ let scheduledMissionInFlight = false;
 let lastPolledLoRaFrame = null;
 let lastDriveWireCommand = null;
 let lastDriveWireAt = 0;
+let latestWsManualDrive = null;
+let latestWsManualDriveQueuedAt = 0;
+let manualDriveWsDispatchInFlight = false;
 
 const DRIVE_COMMANDS = new Set([
   CMD.FORWARD,
@@ -330,6 +334,49 @@ function compactWireCommandForCmd(cmd) {
     case CMD.ESTOP: return 'E';
     case CMD.RESET: return 'X';
     default: return cmd;
+  }
+}
+
+function coerceManualDrivePayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const drive = clampNumber(Math.round(coerceFiniteNumber(payload.drive, payload.throttle, 0)), -100, 100);
+  const turn = clampNumber(Math.round(coerceFiniteNumber(payload.turn, payload.steer, 0)), -100, 100);
+  const seq = Number.isFinite(Number(payload.seq)) ? Math.max(0, Math.floor(Number(payload.seq))) : null;
+  const wireCommand = seq == null ? `D:${drive},${turn}` : `D:${drive},${turn},S:${seq}`;
+  return { drive, turn, seq, wireCommand };
+}
+
+function queueWsManualDrive(payload) {
+  const normalized = coerceManualDrivePayload(payload);
+  if (!normalized) {
+    return false;
+  }
+  latestWsManualDrive = normalized;
+  latestWsManualDriveQueuedAt = Date.now();
+  return true;
+}
+
+async function flushQueuedWsManualDrive() {
+  if (manualDriveWsDispatchInFlight || !latestWsManualDrive) {
+    return;
+  }
+
+  const pending = latestWsManualDrive;
+  latestWsManualDrive = null;
+  manualDriveWsDispatchInFlight = true;
+
+  try {
+    await dispatchCommand(CMD.DRIVE, {
+      wireCommand: pending.wireCommand,
+      waitForAck: false,
+      waitForState: false,
+      source: 'app.ws.manual-drive',
+    });
+  } finally {
+    manualDriveWsDispatchInFlight = false;
   }
 }
 
@@ -1644,6 +1691,59 @@ function buildConnectionState(now = Date.now()) {
       robotState: state.robot?.state ?? null,
     },
   };
+}
+
+function isIpv4Host(hostname) {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(hostname ?? '').trim());
+}
+
+function resolveManualCommandUrl(bridgeStatus) {
+  const selectedUrl = bridgeStatus?.baseStation?.selectedUrl ?? bridgeStatus?.baseStationUrl ?? null;
+  const discoverySource = String(bridgeStatus?.baseStation?.discoverySource ?? '').toLowerCase();
+  const mdnsServices = Array.isArray(bridgeStatus?.baseStation?.mdnsServices)
+    ? bridgeStatus.baseStation.mdnsServices
+    : [];
+
+  if (!selectedUrl || discoverySource === 'remote_status') {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(selectedUrl);
+    if (!parsed.hostname.endsWith('.local')) {
+      return selectedUrl;
+    }
+  } catch {
+    return selectedUrl;
+  }
+
+  const candidateUrls = mdnsServices
+    .flatMap((service) => Array.isArray(service?.urls) ? service.urls : [])
+    .filter((url) => typeof url === 'string' && url);
+
+  for (const candidateUrl of candidateUrls) {
+    try {
+      const parsed = new URL(candidateUrl);
+      if (isIpv4Host(parsed.hostname)) {
+        return candidateUrl;
+      }
+    } catch {
+      // Ignore malformed candidate URLs and continue.
+    }
+  }
+
+  for (const candidateUrl of candidateUrls) {
+    try {
+      const parsed = new URL(candidateUrl);
+      if (!parsed.hostname.endsWith('.local')) {
+        return candidateUrl;
+      }
+    } catch {
+      // Ignore malformed candidate URLs and continue.
+    }
+  }
+
+  return selectedUrl;
 }
 
 async function maybeRunScheduledMission() {
@@ -4177,6 +4277,7 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
 app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
   const connection = buildConnectionState();
   const bridgeStatus = bridge.getStatus();
+  const manualCommandUrl = resolveManualCommandUrl(bridgeStatus);
   res.json({
     battery: 85,
     state: state.robot?.state ?? ROBOT_STATE.IDLE,
@@ -4189,7 +4290,7 @@ app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
     last_fault: state.lastFault ?? null,
     demo: state.demo,
     base_station_url: bridgeStatus.baseStation?.selectedUrl ?? bridgeStatus.baseStationUrl ?? null,
-    manual_command_url: bridgeStatus.baseStation?.selectedUrl ?? bridgeStatus.baseStationUrl ?? null,
+    manual_command_url: manualCommandUrl,
     connectivity: connection.overall,
     robot: state.robot
       ? {
@@ -4845,6 +4946,37 @@ wss.on('connection', (socket) => {
   metrics.wsConnectionsOpened += 1;
   metrics.wsPeakClients = Math.max(metrics.wsPeakClients, wss.clients.size);
   socket.send(JSON.stringify({ event: WS_EVENT.STATE_SNAPSHOT, payload: publicState(), at: Date.now() }));
+  socket.on('message', (rawMessage) => {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(String(rawMessage ?? ''));
+    } catch {
+      return;
+    }
+
+    const event = typeof parsed?.event === 'string' ? parsed.event.trim().toLowerCase() : '';
+    const payload = parsed?.payload;
+
+    if (event === 'manual.drive') {
+      queueWsManualDrive(payload);
+      return;
+    }
+
+    if (event === 'manual.command') {
+      const command = normalizeCommand(payload?.command);
+      if (!command) {
+        return;
+      }
+      void dispatchCommand(command, {
+        wireCommand: typeof payload?.wireCommand === 'string' && payload.wireCommand.trim()
+          ? payload.wireCommand.trim().toUpperCase()
+          : compactWireCommandForCmd(command),
+        waitForAck: false,
+        waitForState: false,
+        source: 'app.ws.manual-command',
+      });
+    }
+  });
   socket.on('close', () => {
     metrics.wsConnectionsClosed += 1;
   });
@@ -4864,6 +4996,13 @@ const baseStationLoRaPollTimer = setInterval(() => {
   void pollBaseStationLoRaTelemetry();
 }, Math.max(120, BASE_STATION_LORA_POLL_MS));
 if (typeof baseStationLoRaPollTimer.unref === 'function') baseStationLoRaPollTimer.unref();
+
+const manualDriveWsTimer = setInterval(() => {
+  if (latestWsManualDrive && (Date.now() - latestWsManualDriveQueuedAt) >= 0) {
+    void flushQueuedWsManualDrive();
+  }
+}, Math.max(10, MANUAL_DRIVE_WS_FLUSH_MS));
+if (typeof manualDriveWsTimer.unref === 'function') manualDriveWsTimer.unref();
 
 const retentionTimer = setInterval(() => {
   if (!Number.isFinite(EVENT_RETENTION_DAYS) || EVENT_RETENTION_DAYS <= 0) {
