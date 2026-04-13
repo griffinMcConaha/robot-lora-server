@@ -101,7 +101,7 @@ const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? 
 const REMOTE_COMMAND_STALE_MS = Number(process.env.REMOTE_COMMAND_STALE_MS ?? 300000);
 const REMOTE_COMMAND_ACK_RETENTION_MS = Number(process.env.REMOTE_COMMAND_ACK_RETENTION_MS ?? 15000);
 const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 120);
-const DRIVE_DUPLICATE_SUPPRESS_MS = Number(process.env.DRIVE_DUPLICATE_SUPPRESS_MS ?? 350);
+const DRIVE_DUPLICATE_SUPPRESS_MS = Number(process.env.DRIVE_DUPLICATE_SUPPRESS_MS ?? 120);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -1108,12 +1108,49 @@ function pendingRemoteCommandCount(now = Date.now()) {
   return remoteCommandQueue.filter((entry) => !entry.deliveryAcked).length;
 }
 
+function normalizeRemoteQueueCommand(cmd) {
+  return typeof cmd === 'string' ? cmd.trim().toUpperCase() : '';
+}
+
+function isMotionWireCommand(cmd) {
+  const token = normalizeRemoteQueueCommand(cmd);
+  return token === CMD.FORWARD
+    || token === CMD.BACKWARD
+    || token === CMD.LEFT
+    || token === CMD.RIGHT
+    || token === CMD.STOP
+    || token === CMD.DRIVE
+    || token.startsWith('D:')
+    || token.startsWith('DRIVE,');
+}
+
+function isModeWireCommand(cmd) {
+  const token = normalizeRemoteQueueCommand(cmd);
+  return token === CMD.MANUAL
+    || token === CMD.AUTO
+    || token === CMD.PAUSE
+    || token === CMD.ESTOP
+    || token === CMD.RESET;
+}
+
 function enqueueRemoteCommand({ commandId, cmd, source = 'remote-bridge' }) {
   pruneRemoteCommandQueue();
   const existing = remoteCommandQueue.find((entry) => entry.commandId === commandId);
   if (existing) {
     return existing;
   }
+
+  // Keep manual/test interactions responsive: never allow stale motion backlog
+  // to delay the newest motion update or mode transition.
+  if (isMotionWireCommand(cmd) || isModeWireCommand(cmd)) {
+    for (let index = remoteCommandQueue.length - 1; index >= 0; index -= 1) {
+      const entry = remoteCommandQueue[index];
+      if (!entry?.deliveryAcked && isMotionWireCommand(entry.cmd)) {
+        remoteCommandQueue.splice(index, 1);
+      }
+    }
+  }
+
   while (pendingRemoteCommandCount() >= REMOTE_COMMAND_MAX_QUEUE && pendingRemoteCommandCount() > 0) {
     // Keep admission non-blocking for newest operator/test commands.
     remoteCommandQueue.shift();
