@@ -4050,7 +4050,7 @@ app.post(API.TELEMETRY, requireBoard, rateLimitTelemetry, async (req, res) => {
           }
         })();
     console.warn(`[telemetry] rejected payload: ${String(rawSnippet).slice(0, 240)}`);
-    return res.status(400).json({ ok: false, error: 'Unsupported telemetry payload' });
+    return res.status(202).json({ ok: false, ignored: true, error: 'Unsupported telemetry payload' });
   }
   const result = await ingestParsedTelemetry(parsed);
   return res.json(result);
