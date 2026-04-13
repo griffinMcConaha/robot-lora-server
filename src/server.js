@@ -1066,6 +1066,12 @@ function normalizeRemoteBaseStationStatus(payload) {
   const ackCount = Number.isFinite(Number(payload.ack_count ?? payload.ackCount))
     ? Number(payload.ack_count ?? payload.ackCount)
     : null;
+  const lastLoRaAgeMs = Number.isFinite(Number(payload.last_lora_age_ms ?? payload.lastLoRaAgeMs))
+    ? Number(payload.last_lora_age_ms ?? payload.lastLoRaAgeMs)
+    : null;
+  const lastAckAgeMs = Number.isFinite(Number(payload.last_ack_age_ms ?? payload.lastAckAgeMs))
+    ? Number(payload.last_ack_age_ms ?? payload.lastAckAgeMs)
+    : null;
   const configured = typeof payload.configured === 'boolean'
     ? payload.configured
     : (String(payload.configured ?? '').toLowerCase() === 'true');
@@ -1084,6 +1090,8 @@ function normalizeRemoteBaseStationStatus(payload) {
     loraLinkState: payload.lora_link_state ?? payload.loraLinkState ?? null,
     queueDepth,
     ackCount,
+    lastLoRaAgeMs,
+    lastAckAgeMs,
     lastCmd: payload.last_cmd ?? payload.lastCmd ?? null,
     lastCmdId: payload.last_cmd_id ?? payload.lastCmdId ?? null,
     lastCmdStatus: payload.last_cmd_status ?? payload.lastCmdStatus ?? null,
@@ -1561,8 +1569,18 @@ function buildConnectionState(now = Date.now()) {
 
   const gatewayLinkState = effectiveBaseStation?.loraLinkState ?? null;
   const gatewayLinkToken = String(gatewayLinkState ?? '').trim().toLowerCase();
-  const gatewayLastAck = effectiveBaseStation?.lastAck ?? null;
-  const gatewayLastLoRa = effectiveBaseStation?.lastLoRa ?? null;
+  const gatewayLastAckAgeMs = Number.isFinite(Number(effectiveBaseStation?.lastAckAgeMs))
+    ? Number(effectiveBaseStation.lastAckAgeMs)
+    : null;
+  const gatewayLastLoRaAgeMs = Number.isFinite(Number(effectiveBaseStation?.lastLoRaAgeMs))
+    ? Number(effectiveBaseStation.lastLoRaAgeMs)
+    : null;
+  const gatewayLastAck = gatewayLastAckAgeMs == null || gatewayLastAckAgeMs <= 3000
+    ? (effectiveBaseStation?.lastAck ?? null)
+    : null;
+  const gatewayLastLoRa = gatewayLastLoRaAgeMs == null || gatewayLastLoRaAgeMs <= 4500
+    ? (effectiveBaseStation?.lastLoRa ?? null)
+    : null;
   const gatewayEvidence = robotReachable && !telemetryStale
     ? 'robot-telemetry'
     : gatewayLastAck
