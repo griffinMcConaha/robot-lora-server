@@ -4231,7 +4231,7 @@ app.get(API.BASE_STATION_COMMAND, requireBoard, (_req, res) => {
   });
 });
 
-app.post(API.BASE_STATION_COMMAND_ACK, requireBoard, (req, res) => {
+const handleBaseStationCommandAck = (req, res) => {
   const commandId = typeof req.body?.commandId === 'string' ? req.body.commandId.trim() : '';
   if (!commandId) {
     return res.status(400).json({ ok: false, error: 'commandId is required' });
@@ -4247,7 +4247,11 @@ app.post(API.BASE_STATION_COMMAND_ACK, requireBoard, (req, res) => {
   }
 
   return res.json({ ok: true, commandId, status: ack.deliveryStatus, queueDepth: pendingRemoteCommandCount() });
-});
+};
+
+app.post(API.BASE_STATION_COMMAND_ACK, requireBoard, handleBaseStationCommandAck);
+app.post('/api/base-station/command/ack', requireBoard, handleBaseStationCommandAck);
+app.post('/api/base-station/ack', requireBoard, handleBaseStationCommandAck);
 
 app.get(API.STATE, requireAppOrBoard, (_req, res) => {
   res.json({ ok: true, state: publicState() });
