@@ -299,6 +299,7 @@ function normalizeCommand(raw) {
   if (typeof raw !== 'string') return null;
   // Strip optional CMD: prefix (STM32 LoRa protocol uses CMD:AUTO, CMD:MANUAL, etc.)
   let token = raw.trim().toUpperCase();
+  if (/^D\s*:\s*-?\d+\s*,\s*-?\d+$/.test(token)) return CMD.DRIVE;
   if (token.startsWith('CMD:')) token = token.slice(4).trim();
   // Strip SALT/BRINE params (e.g. AUTO,SALT:25,BRINE:75 -> AUTO)
   const commaIdx = token.indexOf(',');
@@ -2869,6 +2870,15 @@ function buildTestMenu() {
       group: 'Modes',
     },
     {
+      id: 'mode-test',
+      title: 'Mode Test/Telemetry',
+      kind: 'command',
+      description: 'Exit MANUAL and return to PAUSE telemetry/test mode.',
+      caution: 'safe',
+      shortcut: 'T',
+      group: 'Modes',
+    },
+    {
       id: 'mode-auto',
       title: 'Mode Auto',
       kind: 'command',
@@ -3230,6 +3240,15 @@ async function runTestMenuAction(actionId, input = {}) {
       const result = await dispatchCommand(CMD.MANUAL, {
         syncMission: false,
         source: 'test-menu.mode-manual',
+        waitForAck: true,
+        waitForState: true,
+      });
+      return { ok: result.ok, actionId: resolved.id, result };
+    }
+    case 'mode-test': {
+      const result = await dispatchCommand(CMD.PAUSE, {
+        syncMission: false,
+        source: 'test-menu.mode-test',
         waitForAck: true,
         waitForState: true,
       });
@@ -3996,9 +4015,33 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
     return res.status(400).send('Missing cmd');
   }
 
-  const wireCommand = cmd === CMD.DRIVE && typeof parsedBody === 'object' && parsedBody !== null
-    ? `DRIVE,THROTTLE:${clampNumber(Math.round(Number(parsedBody.throttle ?? parsedBody.drive ?? 0)), -100, 100)},TURN:${clampNumber(Math.round(Number(parsedBody.turn ?? parsedBody.steer ?? 0)), -100, 100)}`
-    : (typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : cmd);
+  let wireCommand = typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : cmd;
+  if (cmd === CMD.DRIVE) {
+    let driveValue = null;
+    let turnValue = null;
+
+    if (typeof parsedBody === 'object' && parsedBody !== null) {
+      driveValue = coerceFiniteNumber(parsedBody.throttle, parsedBody.drive);
+      turnValue = coerceFiniteNumber(parsedBody.turn, parsedBody.steer);
+    }
+
+    if (typeof rawCmd === 'string') {
+      const compactMatch = rawCmd.trim().toUpperCase().match(/^D\s*:\s*(-?\d+)\s*,\s*(-?\d+)$/);
+      if (compactMatch) {
+        driveValue = coerceFiniteNumber(driveValue, compactMatch[1]);
+        turnValue = coerceFiniteNumber(turnValue, compactMatch[2]);
+      }
+
+      const driveMatch = rawCmd.trim().toUpperCase().match(/(?:THROTTLE|DRIVE)\s*:\s*(-?\d+)/);
+      const turnMatch = rawCmd.trim().toUpperCase().match(/(?:TURN|STEER)\s*:\s*(-?\d+)/);
+      if (driveMatch) driveValue = coerceFiniteNumber(driveValue, driveMatch[1]);
+      if (turnMatch) turnValue = coerceFiniteNumber(turnValue, turnMatch[1]);
+    }
+
+    const drive = clampNumber(Math.round(coerceFiniteNumber(driveValue, 0)), -100, 100);
+    const turn = clampNumber(Math.round(coerceFiniteNumber(turnValue, 0)), -100, 100);
+    wireCommand = `D:${drive},${turn}`;
+  }
 
   if (cmd === CMD.DRIVE) {
     const now = Date.now();

@@ -86,10 +86,12 @@ const CMD = Object.freeze({
 
 /** Aliases accepted on inbound normalisation (not sent by firmware). */
 const CMD_ALIASES = Object.freeze({
-  FWD:      CMD.FORWARD,
-  BACK:     CMD.BACKWARD,
-  JOY:      CMD.DRIVE,
-  JOYSTICK: CMD.DRIVE,
+  FWD:       CMD.FORWARD,
+  BACK:      CMD.BACKWARD,
+  JOY:       CMD.DRIVE,
+  JOYSTICK:  CMD.DRIVE,
+  TEST:      CMD.PAUSE,
+  TELEMETRY: CMD.PAUSE,
 });
 
 // ---------------------------------------------------------------------------
