@@ -1376,12 +1376,69 @@
     let lastTestRun = null;
     let heldDriveAction = null;
     let heldDrivePulse = null;
+    let manualDriveSeq = 0;
+    const HOLD_DRIVE_REPEAT_MS = 120;
+    const DRIVE_VECTORS = {
+      'drive-forward': { drive: 100, turn: 0 },
+      'drive-backward': { drive: -100, turn: 0 },
+      'drive-left': { drive: 0, turn: -100 },
+      'drive-right': { drive: 0, turn: 100 },
+      'drive-stop': { drive: 0, turn: 0 },
+    };
 
     window.handleShortcutRun = (shortcut) => runTestAction(shortcut);
     window.repeatLastTest = () => repeatLastTest();
     window.runControllerAction = (actionId) => runControllerAction(actionId);
     window.handleDrivePress = (actionId) => handleDrivePress(actionId);
     window.handleDriveRelease = () => handleDriveRelease();
+
+    function nextManualDriveSeq() {
+      manualDriveSeq = (manualDriveSeq + 1) % 2147483647;
+      if (manualDriveSeq <= 0) {
+        manualDriveSeq = 1;
+      }
+      return manualDriveSeq;
+    }
+
+    function isRobotInManualMode() {
+      const robotState = latestTestSnapshot?.robot?.state || state?.robot?.state || null;
+      return robotState === 'MANUAL';
+    }
+
+    async function sendDriveVector(actionId = 'drive-stop') {
+      const vector = DRIVE_VECTORS[actionId] || DRIVE_VECTORS['drive-stop'];
+      const payload = {
+        drive: vector.drive,
+        turn: vector.turn,
+        seq: nextManualDriveSeq(),
+      };
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          event: 'manual.drive',
+          payload,
+        }));
+        return { ok: true, via: 'websocket', payload };
+      }
+
+      const response = await fetch('/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cmd: 'DRIVE',
+          drive: payload.drive,
+          turn: payload.turn,
+          seq: payload.seq,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `Drive command failed (${response.status})`);
+      }
+
+      return { ok: true, via: 'http', payload };
+    }
 
     function connect() {
       try {
@@ -2173,27 +2230,33 @@
         return;
       }
 
+      const switchingBetweenHeldDirections = Boolean(heldDriveAction);
       handleDriveRelease(false);
-      const manualResult = await runTestActionWithPayload('mode-manual', null, false, false);
-      if (!manualResult?.ok) {
-        document.getElementById('testResult').textContent = summarizeTestPayload('Manual Mode', manualResult);
-        await loadTestMenu();
-        return;
+      if (!isRobotInManualMode() && !switchingBetweenHeldDirections) {
+        const manualResult = await runTestActionWithPayload('mode-manual', null, false, false);
+        if (!manualResult?.ok) {
+          document.getElementById('testResult').textContent = summarizeTestPayload('Manual Mode', manualResult);
+          await loadTestMenu();
+          return;
+        }
       }
 
       heldDriveAction = actionId;
       updateControllerStatus();
-      const driveResult = await runTestActionWithPayload(actionId, null, false, false);
-      if (!driveResult?.ok) {
+
+      try {
+        await sendDriveVector(actionId);
+      } catch (error) {
         handleDriveRelease(false);
-        document.getElementById('testResult').textContent = summarizeTestPayload(test?.title || actionId, driveResult);
+        document.getElementById('testResult').textContent = `${actionId}: ${error.message}`;
         await loadTestMenu();
         return;
       }
 
       heldDrivePulse = window.setInterval(() => {
-        runTestActionWithPayload(actionId, null, false, false).catch(() => {});
-      }, 650);
+        if (!heldDriveAction) return;
+        sendDriveVector(heldDriveAction).catch(() => {});
+      }, HOLD_DRIVE_REPEAT_MS);
     }
 
     function handleDriveRelease(sendStop = true) {
@@ -2207,7 +2270,9 @@
       updateControllerStatus();
 
       if (sendStop && wasHolding) {
-        runControllerAction('drive-stop');
+        sendDriveVector('drive-stop').catch(() => {
+          runControllerAction('drive-stop');
+        });
       }
     }
 

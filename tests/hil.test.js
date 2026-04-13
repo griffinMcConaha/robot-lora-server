@@ -95,9 +95,12 @@ async function getJson(url) {
   return { res, json: text ? JSON.parse(text) : null };
 }
 
-function createMockBaseStation() {
+function createMockBaseStation(port = BASE_PORT, options = {}) {
   const commands = [];
   const sockets = new Set();
+  const getStatus = typeof options.getStatus === 'function'
+    ? options.getStatus
+    : (() => ({ ok: true, queue_depth: 0 }));
   const server = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/command') {
       const chunks = [];
@@ -113,7 +116,13 @@ function createMockBaseStation() {
 
     if (req.method === 'GET' && req.url === '/status') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, queue_depth: 0 }));
+      res.end(JSON.stringify(getStatus()));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/last_lora') {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(typeof options.getLastLoRa === 'function' ? options.getLastLoRa() : '');
       return;
     }
 
@@ -131,7 +140,7 @@ function createMockBaseStation() {
   return {
     commands,
     async start() {
-      await new Promise((resolve) => server.listen(BASE_PORT, '127.0.0.1', resolve));
+      await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
     },
     async stop() {
       if (!server.listening) return;
@@ -223,16 +232,16 @@ test('Comprehensive /command acceptance for app/server virtual commands', async 
     await waitForHealthy(SERVER_URL);
 
     const commandMatrix = [
-      { body: 'MANUAL', expected: 'MANUAL' },
-      { body: 'PAUSE', expected: 'PAUSE' },
-      { body: 'AUTO', expected: 'AUTO' },
-      { body: 'ESTOP', expected: 'ESTOP' },
-      { body: 'RESET', expected: 'RESET' },
-      { body: 'FORWARD', expected: 'FORWARD' },
-      { body: 'BACKWARD', expected: 'BACKWARD' },
-      { body: 'LEFT', expected: 'LEFT' },
-      { body: 'RIGHT', expected: 'RIGHT' },
-      { body: 'STOP', expected: 'STOP' },
+      { body: 'MANUAL', expected: 'M' },
+      { body: 'PAUSE', expected: 'P' },
+      { body: 'AUTO', expected: 'A' },
+      { body: 'ESTOP', expected: 'E' },
+      { body: 'RESET', expected: 'X' },
+      { body: 'FORWARD', expected: 'F' },
+      { body: 'BACKWARD', expected: 'B' },
+      { body: 'LEFT', expected: 'L' },
+      { body: 'RIGHT', expected: 'R' },
+      { body: 'STOP', expected: 'S' },
       { body: 'D:100,0', expected: 'D:100,0' },
       { body: 'D:-100,0', expected: 'D:-100,0' },
       { body: 'D:0,100', expected: 'D:0,100' },
@@ -263,6 +272,67 @@ test('Comprehensive /command acceptance for app/server virtual commands', async 
         label: 'base command D:72,-31',
       });
     }
+
+    {
+      const first = await postJson(`${SERVER_URL}/command`, {
+        cmd: 'DRIVE',
+        drive: 40,
+        turn: 10,
+        seq: 101,
+      });
+      assert.equal(first.res.status, 200, `expected 200 for JSON DRIVE seq 101, got ${first.res.status}: ${first.text}`);
+
+      const second = await postJson(`${SERVER_URL}/command`, {
+        cmd: 'DRIVE',
+        drive: 40,
+        turn: 10,
+        seq: 102,
+      });
+      assert.equal(second.res.status, 200, `expected 200 for JSON DRIVE seq 102, got ${second.res.status}: ${second.text}`);
+
+      await waitForCondition(() => base.commands.filter((command) => command === 'D:40,10,S:101').length >= 1, {
+        timeoutMs: 600,
+        intervalMs: 20,
+        label: 'base command D:40,10,S:101',
+      });
+      await waitForCondition(() => base.commands.filter((command) => command === 'D:40,10,S:102').length >= 1, {
+        timeoutMs: 600,
+        intervalMs: 20,
+        label: 'base command D:40,10,S:102',
+      });
+    }
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Command dispatch fails over to alternate base station candidates', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-failover-'));
+  const failoverPort = BASE_PORT + 1;
+  const failoverUrl = `http://127.0.0.1:${failoverPort}`;
+  const base = createMockBaseStation(failoverPort);
+  await base.start();
+
+  const server = startServer(dataDir, {
+    BASE_STATION_URL: 'http://127.0.0.1:19999',
+    BASE_STATION_CANDIDATES: failoverUrl,
+    BASE_STATUS_REFRESH_INTERVAL_MS: '100',
+    COMMAND_RATE_LIMIT_PER_WINDOW: '200000',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    const { res, text } = await postText(`${SERVER_URL}/command`, 'FORWARD');
+    assert.equal(res.status, 200, `expected 200 for failover FORWARD, got ${res.status}: ${text}`);
+
+    await waitForCondition(() => base.commands.includes('F'), {
+      timeoutMs: 1000,
+      intervalMs: 20,
+      label: 'failover base command F',
+    });
   } finally {
     await server.stop();
     await base.stop();
@@ -343,7 +413,7 @@ test('Phase E supervision summary and Phase F fail-safe scenarios', async () => 
     {
       const { res } = await postJson(`${SERVER_URL}/api/mission/start`, {});
       assert.equal(res.status, 200);
-      assert.ok(base.commands.includes('AUTO'));
+      assert.ok(base.commands.includes('A'));
     }
 
     {
@@ -448,13 +518,13 @@ test('P0 telemetry stale fail-safe issues ESTOP and aborts mission', async () =>
     {
       const { res } = await postJson(`${SERVER_URL}/api/mission/start`, {});
       assert.equal(res.status, 200);
-      assert.ok(base.commands.includes('AUTO'));
+      assert.ok(base.commands.includes('A'));
     }
 
-    await waitForCondition(() => base.commands.includes('ESTOP'), {
+    await waitForCondition(() => base.commands.includes('E'), {
       timeoutMs: 800,
       intervalMs: 25,
-      label: 'ESTOP command',
+      label: 'E command',
     });
 
     {
@@ -524,19 +594,19 @@ test('RESET stays usable during telemetry outage and clears failsafe after recov
     {
       const { res } = await postJson(`${SERVER_URL}/api/mission/start`, {});
       assert.equal(res.status, 200);
-      assert.ok(base.commands.includes('AUTO'));
+      assert.ok(base.commands.includes('A'));
     }
 
-    await waitForCondition(() => base.commands.includes('ESTOP'), {
+    await waitForCondition(() => base.commands.includes('E'), {
       timeoutMs: 800,
       intervalMs: 25,
-      label: 'ESTOP command before recovery reset',
+      label: 'E command before recovery reset',
     });
 
     {
       const { res, text } = await postText(`${SERVER_URL}/command`, 'RESET');
       assert.ok([200, 202].includes(res.status), `expected RESET to be forwarded during telemetry outage, got ${res.status}: ${text}`);
-      assert.ok(base.commands.includes('RESET'));
+      assert.ok(base.commands.includes('X'));
     }
 
     {
@@ -631,10 +701,10 @@ test('P0 geofence fail-safe issues ESTOP and aborts mission when robot exits bou
       assert.equal(res.status, 200);
     }
 
-    await waitForCondition(() => base.commands.includes('ESTOP'), {
+    await waitForCondition(() => base.commands.includes('E'), {
       timeoutMs: 600,
       intervalMs: 25,
-      label: 'geofence ESTOP command',
+      label: 'geofence E command',
     });
 
     {

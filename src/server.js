@@ -1226,7 +1226,10 @@ function enqueueRemoteCommand({ commandId, cmd, source = 'remote-bridge' }) {
   if (isMotionWireCommand(cmd) || isModeWireCommand(cmd)) {
     for (let index = remoteCommandQueue.length - 1; index >= 0; index -= 1) {
       const entry = remoteCommandQueue[index];
-      if (!entry?.deliveryAcked && isMotionWireCommand(entry.cmd)) {
+      const normalizedQueued = normalizeRemoteQueueCommand(entry?.cmd);
+      const isPreemptibleMode = isModeWireCommand(entry?.cmd)
+        && ![CMD.ESTOP, CMD.RESET].includes(normalizedQueued);
+      if (!entry?.deliveryAcked && (isMotionWireCommand(entry.cmd) || isPreemptibleMode)) {
         remoteCommandQueue.splice(index, 1);
       }
     }
@@ -4330,6 +4333,7 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
     if (typeof parsedBody === 'object' && parsedBody !== null) {
       driveValue = coerceFiniteNumber(parsedBody.throttle, parsedBody.drive);
       turnValue = coerceFiniteNumber(parsedBody.turn, parsedBody.steer);
+      driveSeq = coerceFiniteNumber(parsedBody.seq, parsedBody.sequence);
     }
 
     if (typeof rawCmd === 'string') {
@@ -4444,7 +4448,9 @@ app.post(API.BASE_STATION_STATUS, requireBoard, rateLimitTelemetry, async (req, 
   metrics.remoteBaseStationAccepted += 1;
   metrics.remoteBaseStationLastAt = normalized.receivedAt;
   state.remoteBaseStation = normalized;
-  state.baseStation = normalized;
+  if (!normalizeLatLonPoint(state.baseStation, null) && !normalizeLatLonPoint(state.homePoint, null)) {
+    state.baseStation = normalized;
+  }
 
   if (typeof normalized.lastCmdId === 'string' && normalized.lastCmdId.trim()) {
     const trackedStatus = normalizeRemoteTrackedStatus(normalized.lastCmdStatus);

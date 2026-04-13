@@ -316,6 +316,16 @@ function _candidateUrls() {
   return Array.from(new Set(urls));
 }
 
+function _discoverySourceForUrl(url) {
+  if (_mdnsServices.has(url)) {
+    return 'mdns';
+  }
+  if (url === DEFAULT_BASE_STATION_URL) {
+    return 'default';
+  }
+  return 'configured';
+}
+
 // ---------------------------------------------------------------------------
 // Low-level HTTP helper
 // ---------------------------------------------------------------------------
@@ -421,6 +431,74 @@ async function _get(path, baseUrl = _selectedBaseStationUrl) {
   });
 }
 
+async function _postWithFailover(path, body, extraHeaders = {}) {
+  const attemptedUrls = [];
+  let lastResult = { ok: false, status: null, body: '', error: 'No base station candidates available' };
+
+  for (const candidateUrl of _candidateUrls()) {
+    attemptedUrls.push(candidateUrl);
+    const result = await _post(path, body, extraHeaders, candidateUrl);
+    lastResult = result;
+    if (!result.ok) {
+      continue;
+    }
+
+    _setSelectedBaseStationUrl(candidateUrl);
+    _baseStationSnapshot = {
+      ..._baseStationSnapshot,
+      selectedUrl: candidateUrl,
+      attemptedUrls,
+      discoverySource: _discoverySourceForUrl(candidateUrl),
+      statusError: null,
+      refreshedAt: new Date().toISOString(),
+    };
+    return {
+      ...result,
+      baseUrl: candidateUrl,
+      attemptedUrls,
+    };
+  }
+
+  return {
+    ...lastResult,
+    attemptedUrls,
+  };
+}
+
+async function _getWithFailover(path) {
+  const attemptedUrls = [];
+  let lastResult = { ok: false, status: null, body: '', error: 'No base station candidates available' };
+
+  for (const candidateUrl of _candidateUrls()) {
+    attemptedUrls.push(candidateUrl);
+    const result = await _get(path, candidateUrl);
+    lastResult = result;
+    if (!result.ok) {
+      continue;
+    }
+
+    _setSelectedBaseStationUrl(candidateUrl);
+    _baseStationSnapshot = {
+      ..._baseStationSnapshot,
+      selectedUrl: candidateUrl,
+      attemptedUrls,
+      discoverySource: _discoverySourceForUrl(candidateUrl),
+      statusError: null,
+      refreshedAt: new Date().toISOString(),
+    };
+    return {
+      ...result,
+      baseUrl: candidateUrl,
+      attemptedUrls,
+    };
+  }
+
+  return {
+    ...lastResult,
+    attemptedUrls,
+  };
+}
+
 function _applyBaseStatusSnapshot(payload, meta = {}) {
   if (!payload || typeof payload !== 'object') {
     _baseStationSnapshot = {
@@ -495,9 +573,7 @@ async function _readBaseStatus() {
     }
 
     _setSelectedBaseStationUrl(candidateUrl);
-    const discoverySource = _mdnsServices.has(candidateUrl)
-      ? 'mdns'
-      : (candidateUrl === DEFAULT_BASE_STATION_URL ? 'default' : 'configured');
+    const discoverySource = _discoverySourceForUrl(candidateUrl);
     return {
       ok: true,
       status: result.status ?? null,
@@ -638,7 +714,7 @@ function _expectedAckForCommand(cmd) {
 }
 
 async function _readLastLoRa() {
-  const result = await _get('/last_lora', _selectedBaseStationUrl);
+  const result = await _getWithFailover('/last_lora');
   if (!result.ok) return { ok: false, error: result.error ?? `HTTP ${result.status}` };
   const frame = _unwrapAckFrame(result.body);
   if (frame?.raw) {
@@ -739,7 +815,7 @@ const QUEUE_FULL_RETRY_MS  = 120;
  */
 async function _postWithRetry(path, body, extraHeaders = {}) {
   for (let attempt = 0; attempt <= QUEUE_FULL_RETRY_MAX; attempt++) {
-    const r = await _post(path, body, extraHeaders, _selectedBaseStationUrl);
+    const r = await _postWithFailover(path, body, extraHeaders);
     if (r.ok) return r;
     const isQueueFull = r.status === 503 && r.body === 'queue_full';
     const isTransient =
