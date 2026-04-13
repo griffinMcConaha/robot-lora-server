@@ -317,6 +317,22 @@ function normalizeCommand(raw) {
   return aliases[token] ?? token;
 }
 
+function compactWireCommandForCmd(cmd) {
+  switch (cmd) {
+    case CMD.FORWARD: return 'F';
+    case CMD.BACKWARD: return 'B';
+    case CMD.LEFT: return 'L';
+    case CMD.RIGHT: return 'R';
+    case CMD.STOP: return 'S';
+    case CMD.AUTO: return 'A';
+    case CMD.MANUAL: return 'M';
+    case CMD.PAUSE: return 'P';
+    case CMD.ESTOP: return 'E';
+    case CMD.RESET: return 'X';
+    default: return cmd;
+  }
+}
+
 function currentMissionState() {
   return mission.publicMission()?.state ?? MISSION_STATE.IDLE;
 }
@@ -2478,7 +2494,7 @@ async function dispatchCommand(cmd, options = {}) {
     source = 'api.command',
     waitForAck = false,
     waitForState = false,
-    wireCommand = cmd,
+    wireCommand = null,
   } = options;
   const commandId = createCommandId();
   const shouldWaitForAck = waitForAck;
@@ -2486,7 +2502,7 @@ async function dispatchCommand(cmd, options = {}) {
   const shouldWaitForState = explicitlyWaitForState || commandRequiresStrictConfirmation(cmd);
   const commandText = typeof wireCommand === 'string' && wireCommand.trim()
     ? wireCommand.trim().toUpperCase()
-    : cmd;
+    : compactWireCommandForCmd(cmd);
 
   const decision = arbitrateCommand(cmd);
   if (!decision.ok) {
@@ -3524,6 +3540,13 @@ async function runTestMenuAction(actionId, input = {}) {
 function parseIncomingTelemetry(payload) {
   let body = parseMaybeJson(payload) ?? {};
 
+  if (typeof payload === 'string') {
+    const compact = parseCompactTelemetryFrame(payload);
+    if (compact) {
+      return compact;
+    }
+  }
+
   // Base station wraps last LoRa RX into a string field: {"last_lora":"<json>"}
   // Unwrap and re-parse so we treat it like direct telemetry.
   if (typeof body?.last_lora === 'string' && body.last_lora.trim().startsWith('{')) {
@@ -3648,6 +3671,118 @@ function parseIncomingTelemetry(payload) {
       source: String(body.source ?? 'lora-manual'),
       stateName: 'MANUAL',
       raw: body,
+    };
+  }
+
+  return null;
+}
+
+function parseCompactTelemetryFrame(raw) {
+  if (typeof raw !== 'string') return null;
+  const frame = raw.trim();
+  if (!frame) return null;
+
+  if (frame.startsWith('F:')) {
+    const parts = frame.slice(2).split(',').map((part) => part.trim()).filter(Boolean);
+    const faultCandidate = parts[0] ?? '';
+    const actionCandidate = parts[1] ?? '';
+    const faultCode = Object.values(FAULT_CODE).includes(faultCandidate)
+      ? faultCandidate
+      : FAULT_CODE.GENERIC;
+    const faultAction = Object.values(FAULT_ACTION).includes(actionCandidate)
+      ? actionCandidate
+      : FAULT_ACTION.LOG_ONLY;
+    return {
+      robot: null,
+      isFault: true,
+      fault: faultCode,
+      action: faultAction,
+      source: 'compact-fault',
+      raw: { frame },
+    };
+  }
+
+  if (frame.startsWith('M:')) {
+    const parts = frame.slice(2).split(',').map((part) => part.trim());
+    if (parts.length < 7) return null;
+    const heading = coerceFiniteNumber(parts[0], state.robot?.heading, 0) ?? 0;
+    const motorM1 = coerceFiniteNumber(parts[1], 0) ?? 0;
+    const motorM2 = coerceFiniteNumber(parts[2], 0) ?? 0;
+    const approxSpeed = Math.abs((motorM1 + motorM2) / 2) / 100;
+    const prevLat = Number(state.robot?.lat);
+    const prevLon = Number(state.robot?.lon);
+    const prevGpsFix = Boolean(state.robot?.gpsFix ?? false);
+    const prevGpsHdop = Number(state.robot?.gpsHdop ?? 0);
+    const prevGpsSat = Number(state.robot?.gpsSat ?? 0);
+
+    return {
+      robot: {
+        lat: Number.isFinite(prevLat) ? prevLat : 0,
+        lon: Number.isFinite(prevLon) ? prevLon : 0,
+        heading,
+        speed: approxSpeed,
+        gpsFix: prevGpsFix,
+        gpsHdop: Number.isFinite(prevGpsHdop) ? prevGpsHdop : 0,
+        gpsSat: Number.isFinite(prevGpsSat) ? prevGpsSat : 0,
+        sensors: {
+          imuOk: coerceFiniteNumber(parts[3], 1) === 1,
+          gpsOk: coerceFiniteNumber(parts[4], prevGpsFix ? 1 : 0) === 1,
+          loraOk: coerceFiniteNumber(parts[5], 1) === 1,
+          degraded: coerceFiniteNumber(parts[6], 0) === 1,
+        },
+      },
+      source: 'compact-manual',
+      stateName: 'MANUAL',
+      raw: { frame },
+    };
+  }
+
+  if (frame.startsWith('S:') || frame.startsWith('T:')) {
+    const mode = frame.charAt(0);
+    const parts = frame.slice(2).split(',').map((part) => part.trim());
+    const minFields = mode === 'T' ? 10 : 8;
+    if (parts.length < minFields) return null;
+
+    const stateName = parts[0] || null;
+    const lat = coerceFiniteNumber(parts[1]);
+    const lon = coerceFiniteNumber(parts[2]);
+    const heading = coerceFiniteNumber(parts[3], 0) ?? 0;
+    const speed = coerceFiniteNumber(parts[4], 0) ?? 0;
+    const gpsFix = coerceBooleanLike(parts[5], false) ?? false;
+    const gpsHdop = coerceFiniteNumber(parts[6], 0) ?? 0;
+    const gpsSat = coerceFiniteNumber(parts[7], 0) ?? 0;
+
+    if (lat === null || lon === null) return null;
+
+    const robot = {
+      lat,
+      lon,
+      heading,
+      speed,
+      gpsFix,
+      gpsHdop,
+      gpsSat,
+    };
+
+    if (mode === 'T') {
+      const motorM1 = coerceFiniteNumber(parts[8], 0) ?? 0;
+      const motorM2 = coerceFiniteNumber(parts[9], 0) ?? 0;
+      robot.motor = { m1: motorM1, m2: motorM2 };
+      const salt = coerceFiniteNumber(parts[10], null);
+      const brine = coerceFiniteNumber(parts[11], null);
+      if (salt !== null || brine !== null) {
+        robot.disp = {
+          salt: salt ?? 0,
+          brine: brine ?? 0,
+        };
+      }
+    }
+
+    return {
+      robot,
+      source: mode === 'T' ? 'compact-telemetry' : 'compact-state',
+      stateName,
+      raw: { frame },
     };
   }
 
@@ -4041,16 +4176,20 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
 
 app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
   const connection = buildConnectionState();
+  const bridgeStatus = bridge.getStatus();
   res.json({
     battery: 85,
     state: state.robot?.state ?? ROBOT_STATE.IDLE,
     mode: 'SERVER',
+    radio_mode: bridgeStatus.baseStation?.radioMode ?? null,
     last_cmd: state.lastCommand,
     last_cmd_id: state.lastCommandId,
     last_cmd_status: state.lastCommandStatus,
     command_history: state.commandHistory,
     last_fault: state.lastFault ?? null,
     demo: state.demo,
+    base_station_url: bridgeStatus.baseStation?.selectedUrl ?? bridgeStatus.baseStationUrl ?? null,
+    manual_command_url: bridgeStatus.baseStation?.selectedUrl ?? bridgeStatus.baseStationUrl ?? null,
     connectivity: connection.overall,
     robot: state.robot
       ? {
@@ -4078,7 +4217,10 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
     return res.status(400).send('Missing cmd');
   }
 
-  let wireCommand = typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : cmd;
+  const rawWireCommand = typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : '';
+  let wireCommand = rawWireCommand
+    ? (rawWireCommand === cmd ? compactWireCommandForCmd(cmd) : rawWireCommand)
+    : compactWireCommandForCmd(cmd);
   let driveSeq = null;
   if (cmd === CMD.DRIVE) {
     let driveValue = null;

@@ -357,7 +357,7 @@ const LORA_WIRE = Object.freeze({
 
   // Inter-line delay for sequential WP commands (ms)
   // Gives the base station/gateway time to flush each frame.
-  WP_INTERLINE_MS: 120,
+  WP_INTERLINE_MS: 80,
 });
 
 // ---------------------------------------------------------------------------
@@ -394,8 +394,9 @@ const ARBITRATION = Object.freeze({
 // 14. TELEMETRY SCHEMA  (reference / documentation — not runtime-enforced)
 //
 //   Source: STM32 firmware, transmitted over UART5 (115 200 baud) every 10 s.
-//   After gateway framing + base-station passthrough the server receives the
-//   inner JSON verbatim via POST /api/telemetry or base-station's last_lora.
+//   After gateway framing + base-station passthrough the server receives either
+//   JSON or a compact tagged ASCII frame via POST /api/telemetry or the base
+//   station's last_lora relay.
 //
 //   {
 //     "state":   <ROBOT_STATE>,
@@ -412,6 +413,12 @@ const ARBITRATION = Object.freeze({
 //     "fault":  <FAULT_CODE>,
 //     "action": <FAULT_ACTION>
 //   }
+//
+//   Compact tagged ASCII forms accepted by the server:
+//     S:<STATE>,<LAT>,<LON>,<HEAD>,<SPEED>,<FIX>,<HDOP>,<SAT>
+//     T:<STATE>,<LAT>,<LON>,<HEAD>,<SPEED>,<FIX>,<HDOP>,<SAT>,<M1>,<M2>[,<SALT>,<BRINE>]
+//     M:<HEAD>,<M1>,<M2>,<IMU_OK>,<GPS_OK>,<LORA_OK>,<DEGRADED>
+//     F:<FAULT_CODE>,<FAULT_ACTION>
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

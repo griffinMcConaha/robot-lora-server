@@ -62,14 +62,14 @@ const BASE_STATION_MDNS_ENABLED = String(process.env.BASE_STATION_MDNS_ENABLED ?
 const BASE_STATION_MDNS_TYPE = String(process.env.BASE_STATION_MDNS_TYPE ?? 'http').trim() || 'http';
 const BASE_STATION_MDNS_PROTOCOL = String(process.env.BASE_STATION_MDNS_PROTOCOL ?? 'tcp').trim() || 'tcp';
 const BASE_STATION_MDNS_NAMES = _buildMdnsNameList();
-const REQUEST_TIMEOUT_MS = Number(process.env.LORA_REQUEST_TIMEOUT_MS ?? 3000);
+const REQUEST_TIMEOUT_MS = Number(process.env.LORA_REQUEST_TIMEOUT_MS ?? 1500);
 const TRANSIENT_RETRY_MAX = Number(process.env.LORA_TRANSIENT_RETRY_MAX ?? 2);
-const TRANSIENT_RETRY_MS = Number(process.env.LORA_TRANSIENT_RETRY_MS ?? 200);
+const TRANSIENT_RETRY_MS = Number(process.env.LORA_TRANSIENT_RETRY_MS ?? 100);
 const BRIDGE_DEGRADED_FAILURE_THRESHOLD = Number(process.env.BRIDGE_DEGRADED_FAILURE_THRESHOLD ?? 3);
-const ACK_WAIT_TIMEOUT_MS = Number(process.env.LORA_ACK_WAIT_TIMEOUT_MS ?? 5000);
-const ACK_POLL_MS = Number(process.env.LORA_ACK_POLL_MS ?? 60);
+const ACK_WAIT_TIMEOUT_MS = Number(process.env.LORA_ACK_WAIT_TIMEOUT_MS ?? 3500);
+const ACK_POLL_MS = Number(process.env.LORA_ACK_POLL_MS ?? 40);
 const ACK_REQUIRED = String(process.env.LORA_ACK_REQUIRED ?? '0') === '1';
-const BASE_STATUS_REFRESH_INTERVAL_MS = Number(process.env.BASE_STATUS_REFRESH_INTERVAL_MS ?? 500);
+const BASE_STATUS_REFRESH_INTERVAL_MS = Number(process.env.BASE_STATUS_REFRESH_INTERVAL_MS ?? 750);
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -97,6 +97,7 @@ let _baseStationSnapshot = {
   statusVersion: null,
   state: null,
   mode: null,
+  radioMode: null,
   wifiLinkState: null,
   loraLinkState: null,
   queueDepth: null,
@@ -453,6 +454,9 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
     statusVersion: Number.isFinite(Number(payload.status_version)) ? Number(payload.status_version) : _baseStationSnapshot.statusVersion,
     state: typeof payload.state === 'string' ? payload.state : _baseStationSnapshot.state,
     mode: typeof payload.mode === 'string' ? payload.mode : _baseStationSnapshot.mode,
+    radioMode: typeof payload.radio_mode === 'string'
+      ? payload.radio_mode
+      : (typeof payload.radioMode === 'string' ? payload.radioMode : _baseStationSnapshot.radioMode),
     wifiLinkState: typeof payload.wifi_link_state === 'string' ? payload.wifi_link_state : _baseStationSnapshot.wifiLinkState,
     loraLinkState: derivedLoraLinkState,
     queueDepth: Number.isFinite(Number(payload.queue_depth)) ? Number(payload.queue_depth) : _baseStationSnapshot.queueDepth,
@@ -722,7 +726,7 @@ async function _waitForAck(expectedAck, options = {}) {
 // The base station now returns 503 with body 'queue_full' instead of silently
 // dropping commands.  We back off and retry so no WP frame is lost.
 const QUEUE_FULL_RETRY_MAX = 6;
-const QUEUE_FULL_RETRY_MS  = 250;
+const QUEUE_FULL_RETRY_MS  = 120;
 
 /**
  * Like _post() but retries up to QUEUE_FULL_RETRY_MAX times when the base
@@ -962,6 +966,7 @@ function getStatus() {
       statusVersion: _baseStationSnapshot.statusVersion,
       state: _baseStationSnapshot.state,
       mode: _baseStationSnapshot.mode,
+      radioMode: _baseStationSnapshot.radioMode,
       wifiLinkState: _baseStationSnapshot.wifiLinkState,
       loraLinkState: _baseStationSnapshot.loraLinkState,
       queueDepth: _baseStationSnapshot.queueDepth,
