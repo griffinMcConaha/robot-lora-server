@@ -209,6 +209,67 @@ function startServer(dataDir, envOverrides = {}) {
   };
 }
 
+test('Comprehensive /command acceptance for app/server virtual commands', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-command-matrix-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    COMMAND_RATE_LIMIT_PER_WINDOW: '200000',
+    DRIVE_DUPLICATE_SUPPRESS_MS: '0',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    const commandMatrix = [
+      { body: 'MANUAL', expected: 'MANUAL' },
+      { body: 'PAUSE', expected: 'PAUSE' },
+      { body: 'AUTO', expected: 'AUTO' },
+      { body: 'ESTOP', expected: 'ESTOP' },
+      { body: 'RESET', expected: 'RESET' },
+      { body: 'FORWARD', expected: 'FORWARD' },
+      { body: 'BACKWARD', expected: 'BACKWARD' },
+      { body: 'LEFT', expected: 'LEFT' },
+      { body: 'RIGHT', expected: 'RIGHT' },
+      { body: 'STOP', expected: 'STOP' },
+      { body: 'D:100,0', expected: 'D:100,0' },
+      { body: 'D:-100,0', expected: 'D:-100,0' },
+      { body: 'D:0,100', expected: 'D:0,100' },
+      { body: 'D:0,-100', expected: 'D:0,-100' },
+      { body: 'DRIVE,THROTTLE:35,TURN:-20', expected: 'D:35,-20' },
+    ];
+
+    for (const item of commandMatrix) {
+      const { res, text } = await postText(`${SERVER_URL}/command`, item.body);
+      assert.equal(res.status, 200, `expected 200 for ${item.body}, got ${res.status}: ${text}`);
+      await waitForCondition(() => base.commands.includes(item.expected), {
+        timeoutMs: 600,
+        intervalMs: 20,
+        label: `base command ${item.expected}`,
+      });
+    }
+
+    {
+      const { res, text } = await postJson(`${SERVER_URL}/command`, {
+        cmd: 'DRIVE',
+        throttle: 72,
+        turn: -31,
+      });
+      assert.equal(res.status, 200, `expected 200 for JSON DRIVE, got ${res.status}: ${text}`);
+      await waitForCondition(() => base.commands.includes('D:72,-31'), {
+        timeoutMs: 600,
+        intervalMs: 20,
+        label: 'base command D:72,-31',
+      });
+    }
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('Phase E supervision summary and Phase F fail-safe scenarios', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-'));
   const base = createMockBaseStation();

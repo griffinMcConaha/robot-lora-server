@@ -100,8 +100,11 @@ const REMOTE_BASE_STATION_STALE_MS = Number(process.env.REMOTE_BASE_STATION_STAL
 const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? Math.max(LORA_WIRE.MAX_WAYPOINTS + 8, 1024));
 const REMOTE_COMMAND_STALE_MS = Number(process.env.REMOTE_COMMAND_STALE_MS ?? 300000);
 const REMOTE_COMMAND_ACK_RETENTION_MS = Number(process.env.REMOTE_COMMAND_ACK_RETENTION_MS ?? 15000);
+const REMOTE_COMMAND_LEASE_RETRY_MS = Number(process.env.REMOTE_COMMAND_LEASE_RETRY_MS ?? 180);
+const REMOTE_COMMAND_MAX_MOTION_LEASES = Number(process.env.REMOTE_COMMAND_MAX_MOTION_LEASES ?? 12);
+const REMOTE_COMMAND_MAX_MOTION_LEASE_AGE_MS = Number(process.env.REMOTE_COMMAND_MAX_MOTION_LEASE_AGE_MS ?? 3000);
 const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 120);
-const DRIVE_DUPLICATE_SUPPRESS_MS = Number(process.env.DRIVE_DUPLICATE_SUPPRESS_MS ?? 120);
+const DRIVE_DUPLICATE_SUPPRESS_MS = Number(process.env.DRIVE_DUPLICATE_SUPPRESS_MS ?? 35);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -299,7 +302,7 @@ function normalizeCommand(raw) {
   if (typeof raw !== 'string') return null;
   // Strip optional CMD: prefix (STM32 LoRa protocol uses CMD:AUTO, CMD:MANUAL, etc.)
   let token = raw.trim().toUpperCase();
-  if (/^D\s*:\s*-?\d+\s*,\s*-?\d+$/.test(token)) return CMD.DRIVE;
+  if (/^D\s*:\s*-?\d+\s*,\s*-?\d+(\s*,\s*S\s*:\s*\d+)?$/.test(token)) return CMD.DRIVE;
   if (token.startsWith('CMD:')) token = token.slice(4).trim();
   // Strip SALT/BRINE params (e.g. AUTO,SALT:25,BRINE:75 -> AUTO)
   const commaIdx = token.indexOf(',');
@@ -1097,6 +1100,21 @@ function pruneRemoteCommandQueue(now = Date.now()) {
       continue;
     }
 
+    if (!entry?.deliveryAcked && isMotionWireCommand(entry?.cmd)) {
+      const leaseCount = Number(entry?.leaseCount ?? 0);
+      if (leaseCount >= REMOTE_COMMAND_MAX_MOTION_LEASES && ageMs >= REMOTE_COMMAND_MAX_MOTION_LEASE_AGE_MS) {
+        updateCommandTracking(entry.commandId, {
+          cmd: entry.cmd,
+          source: entry.source ?? 'remote-bridge',
+          status: COMMAND_STATUS.TIMED_OUT,
+          error: 'Remote motion command lease limit reached without ACK',
+          detail: { stage: COMMAND_TRANSPORT_STAGE.TIMED_OUT, ageMs, leaseCount },
+        });
+        remoteCommandQueue.splice(index, 1);
+        continue;
+      }
+    }
+
     if (entry?.deliveryAcked && ackAgeMs > REMOTE_COMMAND_ACK_RETENTION_MS) {
       remoteCommandQueue.splice(index, 1);
     }
@@ -1229,7 +1247,15 @@ function queueRemoteWaypointPush(points, source = 'remote-bridge') {
 
 function peekRemoteCommandForBoard(now = Date.now()) {
   pruneRemoteCommandQueue(now);
-  return remoteCommandQueue.find((entry) => !entry.deliveryAcked) ?? null;
+  const pending = remoteCommandQueue.find((entry) => !entry.deliveryAcked) ?? null;
+  if (!pending) return null;
+
+  const lastLeaseAt = Number(pending.lastLeaseAt ?? 0);
+  if (lastLeaseAt > 0 && (now - lastLeaseAt) < REMOTE_COMMAND_LEASE_RETRY_MS) {
+    return null;
+  }
+
+  return pending;
 }
 
 function acknowledgeRemoteCommand(commandId, payload = {}) {
@@ -4053,6 +4079,7 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
   }
 
   let wireCommand = typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : cmd;
+  let driveSeq = null;
   if (cmd === CMD.DRIVE) {
     let driveValue = null;
     let turnValue = null;
@@ -4063,10 +4090,11 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
     }
 
     if (typeof rawCmd === 'string') {
-      const compactMatch = rawCmd.trim().toUpperCase().match(/^D\s*:\s*(-?\d+)\s*,\s*(-?\d+)$/);
+      const compactMatch = rawCmd.trim().toUpperCase().match(/^D\s*:\s*(-?\d+)\s*,\s*(-?\d+)(?:\s*,\s*S\s*:\s*(\d+))?$/);
       if (compactMatch) {
         driveValue = coerceFiniteNumber(driveValue, compactMatch[1]);
         turnValue = coerceFiniteNumber(turnValue, compactMatch[2]);
+        driveSeq = coerceFiniteNumber(driveSeq, compactMatch[3]);
       }
 
       const driveMatch = rawCmd.trim().toUpperCase().match(/(?:THROTTLE|DRIVE)\s*:\s*(-?\d+)/);
@@ -4077,12 +4105,17 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
 
     const drive = clampNumber(Math.round(coerceFiniteNumber(driveValue, 0)), -100, 100);
     const turn = clampNumber(Math.round(coerceFiniteNumber(turnValue, 0)), -100, 100);
-    wireCommand = `D:${drive},${turn}`;
+    const normalizedSeq = Number.isFinite(Number(driveSeq))
+      ? Math.max(0, Math.floor(Number(driveSeq)))
+      : null;
+    wireCommand = normalizedSeq == null ? `D:${drive},${turn}` : `D:${drive},${turn},S:${normalizedSeq}`;
   }
 
   if (cmd === CMD.DRIVE) {
     const now = Date.now();
-    if (lastDriveWireCommand === wireCommand && (now - lastDriveWireAt) < DRIVE_DUPLICATE_SUPPRESS_MS) {
+    const seqMatch = wireCommand.match(/,S:(\d+)$/);
+    const hasSeqTag = Boolean(seqMatch);
+    if (!hasSeqTag && lastDriveWireCommand === wireCommand && (now - lastDriveWireAt) < DRIVE_DUPLICATE_SUPPRESS_MS) {
       return res.type('text/plain').send('OK');
     }
     lastDriveWireCommand = wireCommand;
@@ -4252,6 +4285,8 @@ const handleBaseStationCommandAck = (req, res) => {
 app.post(API.BASE_STATION_COMMAND_ACK, requireBoard, handleBaseStationCommandAck);
 app.post('/api/base-station/command/ack', requireBoard, handleBaseStationCommandAck);
 app.post('/api/base-station/ack', requireBoard, handleBaseStationCommandAck);
+app.post('/api/base-station/commandAck', requireBoard, handleBaseStationCommandAck);
+app.post('/api/base-station/cmd-ack', requireBoard, handleBaseStationCommandAck);
 
 app.get(API.STATE, requireAppOrBoard, (_req, res) => {
   res.json({ ok: true, state: publicState() });
