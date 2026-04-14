@@ -269,6 +269,7 @@ function findCoveragePath(map, options = {}) {
   const requestedSweepDirection = typeof options.sweepDirection === 'string'
     ? options.sweepDirection.trim().toLowerCase()
     : 'auto';
+  const preferMinTurns = options.preferMinTurns !== false;
 
   const rowStep = Math.max(1, Math.round(swathWidthM / map.cellSizeM));
   const laneStep = rowStep;
@@ -278,7 +279,9 @@ function findCoveragePath(map, options = {}) {
 
   const axisUEastComponent = Math.abs(Number(map?.axisU?.x ?? 1));
   const axisVEastComponent = Math.abs(Number(map?.axisV?.x ?? 0));
-  const sweepByRows = axisUEastComponent >= axisVEastComponent;
+  const byMinTurns = map.height <= map.width;
+  const byEastWestAlignment = axisUEastComponent >= axisVEastComponent;
+  const sweepByRows = preferMinTurns ? byMinTurns : byEastWestAlignment;
 
   let rowStart = 0;
   let rowLimit = map.height;
@@ -412,6 +415,7 @@ function findCoveragePath(map, options = {}) {
       swathWidthM,
       rowStep,
       sweepByRows,
+      preferMinTurns,
       sweepDirection: requestedSweepDirection,
       pointCount: visitNodes.length,
     },

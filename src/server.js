@@ -2673,7 +2673,7 @@ function configureActiveArea(baseStation, boundary, cellSizeM, homePoint = null)
   return { stats, cellPlan, homePoint: capturedHomePoint };
 }
 
-function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWidthM, saltPct, brinePct, homePoint = null, returnToBase = false, sweepDirection = 'auto' }) {
+function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWidthM, saltPct, brinePct, homePoint = null, returnToBase = false, sweepDirection = 'auto', preferMinTurns = true }) {
   const normalizedStart = normalizeLatLonPoint(startPoint, null);
   state.homePoint = normalizeLatLonPoint(homePoint, null)
     ?? normalizeLatLonPoint(state.homePoint, null)
@@ -2687,6 +2687,7 @@ function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWi
         startLatLon: normalizedStart ?? startPoint,
         goalLatLon: goalPoint ?? null,
         sweepDirection,
+        preferMinTurns,
       })
     : findPath(state.coverage, normalizedStart ?? startPoint, goalPoint);
 
@@ -2733,11 +2734,13 @@ function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWi
     salt: saltPct,
     brine: brinePct,
   }));
-  const arrowSpacingM = mode === 'coverage' ? Math.max(2.4, Number(coverageWidthM ?? 0.5) * 5.2) : 6;
+  const arrowSpacingM = mode === 'coverage'
+    ? Math.max(1.8, Number(coverageWidthM ?? 0.5) * 3.8)
+    : 5;
   state.lastArrows = buildCoverageArrows(state.lastPath, {
     spacingM: arrowSpacingM,
-    minArrowSeparationM: Math.max(1.2, arrowSpacingM * 0.45),
-    initialOffsetM: Math.min(0.5, arrowSpacingM * 0.2),
+    minArrowSeparationM: Math.max(0.7, arrowSpacingM * 0.32),
+    initialOffsetM: Math.min(0.35, arrowSpacingM * 0.16),
   });
 
   publish(WS_EVENT.PATH_UPDATED, {
@@ -2781,6 +2784,7 @@ function planCoveragePathForCurrentArea({ startPoint, goalPoint, coverageWidthM,
     homePoint,
     returnToBase,
     sweepDirection,
+    preferMinTurns: true,
   });
 }
 
@@ -5048,6 +5052,7 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
   const sweepDirection = ['auto', 'lefttoright', 'righttoleft'].includes(requestedSweepDirection)
     ? requestedSweepDirection
     : 'auto';
+  const preferMinTurns = req.body?.preferMinTurns !== false;
   const requestedMode = typeof req.body?.mode === 'string' ? req.body.mode.trim().toLowerCase() : null;
   const coverageWidthM = Number.isFinite(Number(req.body?.coverageWidthM)) && Number(req.body?.coverageWidthM) > 0
     ? Number(req.body.coverageWidthM)
@@ -5096,6 +5101,7 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     homePoint,
     returnToBase,
     sweepDirection,
+    preferMinTurns,
   });
 
   if (!path.ok) {
