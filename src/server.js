@@ -1719,6 +1719,13 @@ function isIpv4Host(hostname) {
 }
 
 function resolveManualCommandUrl(bridgeStatus) {
+  const gatewayManualUrl = typeof bridgeStatus?.baseStation?.gatewayManualUrl === 'string'
+    ? bridgeStatus.baseStation.gatewayManualUrl.trim()
+    : '';
+  if (gatewayManualUrl) {
+    return gatewayManualUrl;
+  }
+
   const selectedUrl = bridgeStatus?.baseStation?.selectedUrl ?? bridgeStatus?.baseStationUrl ?? null;
   const discoverySource = String(bridgeStatus?.baseStation?.discoverySource ?? '').toLowerCase();
   const mdnsServices = Array.isArray(bridgeStatus?.baseStation?.mdnsServices)
