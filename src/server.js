@@ -4757,7 +4757,7 @@ app.get(API.MISSION_SCHEDULE, requireAppOrBoard, (_req, res) => {
   return res.json({ ok: true, automation: getAutomationSnapshot() });
 });
 
-app.post(API.MISSION_SCHEDULE, requireApp, (req, res) => {
+app.post(API.MISSION_SCHEDULE, requireApp, async (req, res) => {
   const rawAt = Number(req.body?.at ?? req.body?.scheduledRunAt ?? 0);
   const atMs = rawAt > 1e12 ? rawAt : rawAt * 1000;
   const label = typeof req.body?.label === 'string' ? req.body.label : '';
@@ -4776,11 +4776,30 @@ app.post(API.MISSION_SCHEDULE, requireApp, (req, res) => {
     return res.status(409).json({ ok: false, error: 'Automatic autonomy is blocked while the path uses 0% salt and 0% brine.' });
   }
 
+  let waypointPrepNote = null;
+  const bridgeStatus = bridge.getStatus();
+  if (bridgeStatus.wpPushState !== 'committed') {
+    const pushed = await pushPathWaypoints(null, 'mission.schedule.arm');
+    if (!pushed.ok) {
+      return res.status(pushed.status ?? 409).json({ ok: false, error: pushed.error ?? 'Failed to pre-stage waypoints for the scheduled run.' });
+    }
+    waypointPrepNote = pushed.queuedRemote
+      ? 'armed; waypoints queued for remote staging'
+      : 'armed; waypoints pre-staged';
+  }
+
   const automation = armAutomationSchedule({ atMs, label, notify });
+  if (waypointPrepNote) {
+    state.automation = {
+      ...state.automation,
+      lastResult: waypointPrepNote,
+      lastError: null,
+    };
+  }
   scheduleRuntimeStateSave('mission.schedule.armed', { immediate: true });
   publishSupervision();
   publishOperator();
-  return res.json({ ok: true, automation });
+  return res.json({ ok: true, automation: getAutomationSnapshot() });
 });
 
 app.post(API.MISSION_SCHEDULE_CANCEL, requireApp, (_req, res) => {
