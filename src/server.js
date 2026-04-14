@@ -3284,10 +3284,19 @@ function buildTestMenu() {
       group: 'Dispersion',
     },
     {
+      id: 'vibration-on',
+      title: 'Vibration ON',
+      kind: 'dispersion',
+      description: 'Toggle the vibration motor on for individual bench testing.',
+      caution: 'caution',
+      shortcut: 'Y',
+      group: 'Dispersion',
+    },
+    {
       id: 'all-on',
       title: 'All Outputs On',
       kind: 'dispersion',
-      description: 'Enable salt, brine, agitator, thrower, and relay outputs together.',
+      description: 'Enable salt, brine, agitator, thrower, relay, and vibration outputs together.',
       caution: 'danger',
       shortcut: 'U',
       group: 'Dispersion',
@@ -3296,7 +3305,7 @@ function buildTestMenu() {
       id: 'safe-off',
       title: 'Safe Outputs Off',
       kind: 'dispersion',
-      description: 'Send the safe-off sequence to stop outputs and relays.',
+      description: 'Send the safe-off sequence to stop outputs, relay, and vibration.',
       caution: 'safe',
       shortcut: 'Q',
       group: 'Dispersion',
@@ -3582,12 +3591,16 @@ async function runTestMenuAction(actionId, input = {}) {
       const result = await bridge.sendCommand('RELAY ON', { waitForAck: false });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'RELAY ON' } };
     }
+    case 'vibration-on': {
+      const result = await bridge.sendCommand('VIBRATION ON', { waitForAck: false });
+      return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'VIBRATION ON' } };
+    }
     case 'all-on': {
       const result = await bridge.sendCommand('ALLON', { waitForAck: false });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'ALLON' } };
     }
     case 'safe-off': {
-      const commands = ['PCT:0', 'AGITATOR OFF', 'THROWER OFF', 'RELAY OFF'];
+      const commands = ['PCT:0', 'AGITATOR OFF', 'THROWER OFF', 'RELAY OFF', 'VIBRATION OFF'];
       const steps = [];
       for (const command of commands) {
         const result = await bridge.sendCommand(command, { waitForAck: false });
