@@ -44,7 +44,7 @@
 
 'use strict';
 
-const http  = require('http');
+const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -226,12 +226,18 @@ function _hostMatchesMdnsNames(host) {
   });
 }
 
+function _matchesAnyMdnsHost(values) {
+  return values.some(_hostMatchesMdnsNames);
+}
+
 function _serviceMatchesMdns(service) {
   if (!service || typeof service !== 'object') return false;
-  if (_hostMatchesMdnsNames(service.host)) return true;
-  if (_hostMatchesMdnsNames(service.name)) return true;
-  if (Array.isArray(service.addresses) && service.addresses.some(_hostMatchesMdnsNames)) return true;
-  return false;
+  const candidates = [
+    service.host,
+    service.name,
+    ...(Array.isArray(service.addresses) ? service.addresses : []),
+  ];
+  return _matchesAnyMdnsHost(candidates);
 }
 
 function _serviceToBaseUrls(service) {
