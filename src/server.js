@@ -2879,8 +2879,9 @@ async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge') {
   return { ok: true, status: result.status ?? 200, sent: result.sent, points, queuedRemote: Boolean(result.queuedRemote) };
 }
 
-async function startMissionAction(source = 'mission.start') {
-  const demoCheck = assertHardwareAllowed('Mission start');
+async function startMissionAction(source = 'mission.start', options = {}) {
+  const { allowWhenDemo = false, allowWeakGps = false } = options;
+  const demoCheck = assertHardwareAllowed('Mission start', { allowWhenDemo });
   if (!demoCheck.ok) return demoCheck;
   if (currentMissionState() !== MISSION_STATE.CONFIGURING) {
     return { ok: false, status: 409, error: 'Mission must be CONFIGURING before start' };
@@ -2889,7 +2890,7 @@ async function startMissionAction(source = 'mission.start') {
     return { ok: false, status: 409, error: 'Mission start blocked: path has 0% salt and 0% brine' };
   }
   const gpsStatus = getRobotGpsStatus();
-  if (state.robot && !gpsStatus.ready) {
+  if (state.robot && !gpsStatus.ready && !allowWeakGps) {
     return { ok: false, status: 409, error: `Mission start blocked: ${gpsStatus.reason}` };
   }
 
@@ -4313,6 +4314,27 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
       meta: path.meta ?? null,
     },
   });
+});
+
+app.post(API.DEMO_RUN, requireApp, async (req, res) => {
+  if (!state.demo?.enabled) {
+    return res.status(409).json({ ok: false, error: 'Demo mode is not active' });
+  }
+
+  const allowWeakGps = req.body?.allowWeakGps !== false;
+
+  try {
+    const result = await startMissionAction('demo-mode.run', {
+      allowWhenDemo: true,
+      allowWeakGps,
+    });
+    if (!result.ok) {
+      return res.status(result.status ?? 500).json({ ok: false, error: result.error });
+    }
+    return res.json({ ok: true, mission: result.mission, allowWeakGps });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
 });
 
 app.get(API.STATUS, requireAppOrBoard, (_req, res) => {

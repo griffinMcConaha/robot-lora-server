@@ -70,6 +70,18 @@ const ACK_WAIT_TIMEOUT_MS = Number(process.env.LORA_ACK_WAIT_TIMEOUT_MS ?? 3500)
 const ACK_POLL_MS = Number(process.env.LORA_ACK_POLL_MS ?? 40);
 const ACK_REQUIRED = String(process.env.LORA_ACK_REQUIRED ?? '0') === '1';
 const BASE_STATUS_REFRESH_INTERVAL_MS = Number(process.env.BASE_STATUS_REFRESH_INTERVAL_MS ?? 750);
+const WP_INTERLINE_MS = Math.max(
+  10,
+  Number(process.env.LORA_WP_INTERLINE_MS ?? 35),
+);
+const WP_BATCH_SIZE = Math.max(
+  1,
+  Math.min(5, Number(process.env.LORA_WP_BATCH_SIZE ?? 2)),
+);
+const WP_BATCH_MAX_CHARS = Math.max(
+  80,
+  Number(process.env.LORA_WP_BATCH_MAX_CHARS ?? 130),
+);
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -691,6 +703,20 @@ function _parseAckDetails(text) {
     return details;
   }
 
+  if (ack.startsWith(`${LORA_WIRE.WP_ACK_BATCH}:`)) {
+    details.category = 'waypoint_batch';
+    details.source = 'robot';
+    details.command = LORA_WIRE.WP_BATCH;
+    const parts = ack.split(':');
+    if (parts.length >= 4) {
+      const idx = Number(parts[2]);
+      const count = Number(parts[3]);
+      details.waypointIndex = Number.isFinite(idx) ? idx : null;
+      details.waypointCount = Number.isFinite(count) ? count : null;
+    }
+    return details;
+  }
+
   if (ack.startsWith(`${LORA_WIRE.WP_ACK_LOAD}:`)) {
     details.category = 'waypoint_load';
     details.source = 'robot';
@@ -924,7 +950,7 @@ async function sendCommand(cmd, options = {}) {
  *
  * Sequence sent to base station POST /command:
  *   WPCLEAR
- *   WP:0:<lat>,<lon>,<salt>,<brine>   (LORA_WIRE.WP_INTERLINE_MS delay between each)
+ *   WPB:0:<lat>,<lon>,<salt>,<brine>[;...]   (WP_INTERLINE_MS delay between each batch)
  *   …
  *   WPLOAD:<count>
  *
@@ -956,6 +982,7 @@ async function pushWaypoints(points) {
   _wpPushState = ARBITRATION.WP_PENDING;
   _wpPushError = null;
   const baselineClear = await _readLastLoRa();
+  let lastAckRaw = baselineClear.ok ? baselineClear.frame?.raw ?? null : null;
 
   // 1. WPCLEAR
   {
@@ -963,43 +990,67 @@ async function pushWaypoints(points) {
     _recordResult(r);
     if (!r.ok) return _wpFail(0, r.error ?? `WPCLEAR HTTP ${r.status}`);
     const ack = await _waitForAck(LORA_WIRE.WP_ACK_CLEAR, {
-      baselineRaw: baselineClear.ok ? baselineClear.frame?.raw ?? null : null,
+      baselineRaw: lastAckRaw,
       wrappedOnly: true,
     });
     if (!ack.ok) return _wpFail(0, ack.error);
+    if (ack.raw) {
+      lastAckRaw = ack.raw;
+    }
   }
-  await _sleep(LORA_WIRE.WP_INTERLINE_MS);
+  await _sleep(WP_INTERLINE_MS);
 
-  // 2. WP:<idx>:<lat>,<lon>,<salt>,<brine>
-  for (let i = 0; i < points.length; i++) {
-    const p     = points[i];
-    const salt  = Math.round(p.salt);
-    const brine = Math.round(p.brine);
-    const line  = `${LORA_WIRE.WP_ADD}:${i}:${p.lat.toFixed(6)},${p.lon.toFixed(6)},${salt},${brine}`;
-    const baseline = await _readLastLoRa();
-    const r     = await _postWithRetry('/command', line);
+  // 2. WPB:<start_idx>:<lat>,<lon>,<salt>,<brine>[;...]
+  for (let i = 0; i < points.length;) {
+    const startIdx = i;
+    const entries = [];
+
+    while (i < points.length && entries.length < WP_BATCH_SIZE) {
+      const p = points[i];
+      const salt = Math.round(p.salt);
+      const brine = Math.round(p.brine);
+      const entry = `${p.lat.toFixed(6)},${p.lon.toFixed(6)},${salt},${brine}`;
+      const candidateEntries = entries.length ? `${entries.join(';')};${entry}` : entry;
+      const candidateLine = `${LORA_WIRE.WP_BATCH}:${startIdx}:${candidateEntries}`;
+
+      if (entries.length > 0 && candidateLine.length > WP_BATCH_MAX_CHARS) {
+        break;
+      }
+
+      entries.push(entry);
+      i++;
+    }
+
+    const batchCount = entries.length;
+    const line = `${LORA_WIRE.WP_BATCH}:${startIdx}:${entries.join(';')}`;
+    const r = await _postWithRetry('/command', line);
     _recordResult(r);
-    if (!r.ok) return _wpFail(i, r.error ?? `WP:${i} HTTP ${r.status}`);
-    const ack = await _waitForAck(`${LORA_WIRE.WP_ACK_ADD}:${i}`, {
-      baselineRaw: baseline.ok ? baseline.frame?.raw ?? null : null,
+    if (!r.ok) return _wpFail(startIdx, r.error ?? `WPB:${startIdx} HTTP ${r.status}`);
+    const ack = await _waitForAck(`${LORA_WIRE.WP_ACK_BATCH}:${startIdx}:${batchCount}`, {
+      baselineRaw: lastAckRaw,
       wrappedOnly: true,
     });
-    if (!ack.ok) return _wpFail(i, ack.error);
-    if (i < points.length - 1) await _sleep(LORA_WIRE.WP_INTERLINE_MS);
+    if (!ack.ok) return _wpFail(startIdx, ack.error);
+    if (ack.raw) {
+      lastAckRaw = ack.raw;
+    }
+    if (i < points.length) await _sleep(WP_INTERLINE_MS);
   }
-  await _sleep(LORA_WIRE.WP_INTERLINE_MS);
+  await _sleep(WP_INTERLINE_MS);
 
   // 3. WPLOAD:<count>
   {
-    const baseline = await _readLastLoRa();
     const r = await _postWithRetry('/command', `${LORA_WIRE.WP_LOAD}:${points.length}`);
     _recordResult(r);
     if (!r.ok) return _wpFail(points.length, r.error ?? `WPLOAD HTTP ${r.status}`);
     const ack = await _waitForAck(`${LORA_WIRE.WP_ACK_LOAD}:${points.length}`, {
-      baselineRaw: baseline.ok ? baseline.frame?.raw ?? null : null,
+      baselineRaw: lastAckRaw,
       wrappedOnly: true,
     });
     if (!ack.ok) return _wpFail(points.length, ack.error);
+    if (ack.raw) {
+      lastAckRaw = ack.raw;
+    }
   }
 
   _wpPushState = ARBITRATION.WP_COMMITTED;
@@ -1042,6 +1093,9 @@ function getStatus() {
     requestTimeoutMs: REQUEST_TIMEOUT_MS,
     ackWaitTimeoutMs: ACK_WAIT_TIMEOUT_MS,
     ackPollMs: ACK_POLL_MS,
+    wpInterlineMs: WP_INTERLINE_MS,
+    wpBatchSize: WP_BATCH_SIZE,
+    wpBatchMaxChars: WP_BATCH_MAX_CHARS,
     baseStation: {
       statusOk: _baseStationSnapshot.statusOk,
       statusCode: _baseStationSnapshot.statusCode,

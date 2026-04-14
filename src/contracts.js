@@ -314,6 +314,7 @@ const API = Object.freeze({
   DEMO_MODE:        '/api/demo-mode',            // GET/POST
   DEMO_SPOT:        '/api/demo-mode/spot',       // POST
   DEMO_PATH:        '/api/demo-mode/path',       // POST
+  DEMO_RUN:         '/api/demo-mode/run',        // POST
   TEST_MENU:        '/api/test-menu',            // GET
   TEST_RUN:         '/api/test-menu/run',        // POST
 });
@@ -349,15 +350,17 @@ const LORA_WIRE = Object.freeze({
   // Waypoint injection protocol
   WP_CLEAR:   'WPCLEAR',          // clear staged waypoints
   WP_ADD:     'WP',               // WP:<idx>:<lat>,<lon>,<salt%>,<brine%>
+  WP_BATCH:   'WPB',              // WPB:<start_idx>:<lat>,<lon>,<salt>,<brine>[;...]
   WP_LOAD:    'WPLOAD',           // WPLOAD:<count>  — commit + arm auto mode
   WP_ACK_CLEAR: 'ACK:WPCLEAR',
   WP_ACK_ADD:   'ACK:WP',         // prefix; full frame: ACK:WP:<idx>
+  WP_ACK_BATCH: 'ACK:WPB',        // prefix; full frame: ACK:WPB:<start_idx>:<count>
   WP_ACK_LOAD:  'ACK:WPLOAD',     // prefix; full frame: ACK:WPLOAD:<count>
   MAX_WAYPOINTS: 50,              // matches firmware MAX_WAYPOINTS
 
   // Inter-line delay for sequential WP commands (ms)
-  // Gives the base station/gateway time to flush each frame.
-  WP_INTERLINE_MS: 80,
+  // Tuned for faster commit while still giving gateway/base-station queue headroom.
+  WP_INTERLINE_MS: 35,
 });
 
 // ---------------------------------------------------------------------------
