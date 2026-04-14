@@ -14,7 +14,7 @@ const {
   gridCellPolygon,
 } = require('./coverage');
 const { latLonToLocal, localToLatLon } = require('./geo');
-const { findPath, findCoveragePath } = require('./pathing');
+const { findPath, findCoveragePath, buildCoverageArrows } = require('./pathing');
 const {
   createOperatorState,
   telemetryAgeMs: supervisionTelemetryAgeMs,
@@ -166,6 +166,7 @@ const state = {
   remoteBaseStation: null,
   trail: [],
   lastPath: [],
+  lastArrows: [],
   lastCommand: null,
   lastCommandId: null,
   lastCommandStatus: null,
@@ -559,6 +560,7 @@ function buildRuntimeSnapshot(reason = 'unspecified') {
         ? cloneJsonSafe(state.trail.slice(-Math.max(1, RUNTIME_STATE_TRAIL_LIMIT)), [])
         : [],
       lastPath: cloneJsonSafe(state.lastPath, []),
+      lastArrows: cloneJsonSafe(state.lastArrows, []),
       commandHistory: Array.isArray(state.commandHistory)
         ? cloneJsonSafe(state.commandHistory.slice(0, Math.max(1, COMMAND_HISTORY_LIMIT)), [])
         : [],
@@ -635,6 +637,7 @@ function restoreRuntimeState() {
   state.robot = cloneJsonSafe(saved?.robot, null);
   state.trail = Array.isArray(saved?.trail) ? cloneJsonSafe(saved.trail, []) : [];
   state.lastPath = Array.isArray(saved?.lastPath) ? cloneJsonSafe(saved.lastPath, []) : [];
+  state.lastArrows = Array.isArray(saved?.lastArrows) ? cloneJsonSafe(saved.lastArrows, []) : [];
   state.commandHistory = Array.isArray(saved?.commandHistory) ? cloneJsonSafe(saved.commandHistory, []) : [];
   state.lastFault = cloneJsonSafe(saved?.lastFault, null);
   state.safety = {
@@ -2639,6 +2642,7 @@ function configureActiveArea(baseStation, boundary, cellSizeM, homePoint = null)
   state.robot = null;
   state.trail = [];
   state.lastPath = [];
+  state.lastArrows = [];
   bridge.resetWpState();
   resetOperatorState();
 
@@ -2669,7 +2673,7 @@ function configureActiveArea(baseStation, boundary, cellSizeM, homePoint = null)
   return { stats, cellPlan, homePoint: capturedHomePoint };
 }
 
-function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWidthM, saltPct, brinePct, homePoint = null, returnToBase = false }) {
+function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWidthM, saltPct, brinePct, homePoint = null, returnToBase = false, sweepDirection = 'auto' }) {
   const normalizedStart = normalizeLatLonPoint(startPoint, null);
   state.homePoint = normalizeLatLonPoint(homePoint, null)
     ?? normalizeLatLonPoint(state.homePoint, null)
@@ -2682,11 +2686,13 @@ function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWi
         swathWidthM: coverageWidthM,
         startLatLon: normalizedStart ?? startPoint,
         goalLatLon: goalPoint ?? null,
+        sweepDirection,
       })
     : findPath(state.coverage, normalizedStart ?? startPoint, goalPoint);
 
   if (!basePath.ok) {
     state.lastPath = [];
+    state.lastArrows = [];
     return basePath;
   }
 
@@ -2727,11 +2733,14 @@ function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWi
     salt: saltPct,
     brine: brinePct,
   }));
+  const arrowSpacingM = mode === 'coverage' ? Math.max(6, Number(coverageWidthM ?? 0.5) * 16) : 10;
+  state.lastArrows = buildCoverageArrows(state.lastPath, { spacingM: arrowSpacingM });
 
   publish(WS_EVENT.PATH_UPDATED, {
     mode,
     coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
     points: state.lastPath,
+    arrows: state.lastArrows,
     meta,
   });
   db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
@@ -2741,6 +2750,7 @@ function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWi
     brinePct,
     coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
     returnToBase: Boolean(meta.returnToBase),
+    arrowCount: state.lastArrows.length,
   });
   scheduleRuntimeStateSave('path.planned', { immediate: true });
   publishSupervision();
@@ -2748,11 +2758,15 @@ function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWi
   return {
     ...basePath,
     points: state.lastPath,
-    meta,
+    meta: {
+      ...meta,
+      arrowCount: state.lastArrows.length,
+      sweepDirection: mode === 'coverage' ? sweepDirection : null,
+    },
   };
 }
 
-function planCoveragePathForCurrentArea({ startPoint, goalPoint, coverageWidthM, saltPct, brinePct, homePoint = null, returnToBase = true }) {
+function planCoveragePathForCurrentArea({ startPoint, goalPoint, coverageWidthM, saltPct, brinePct, homePoint = null, returnToBase = true, sweepDirection = 'auto' }) {
   return buildMissionPath({
     mode: 'coverage',
     startPoint,
@@ -2762,6 +2776,7 @@ function planCoveragePathForCurrentArea({ startPoint, goalPoint, coverageWidthM,
     brinePct,
     homePoint,
     returnToBase,
+    sweepDirection,
   });
 }
 
@@ -4414,6 +4429,7 @@ function publicState() {
         }
       : null,
     lastPath: state.lastPath,
+    lastArrows: state.lastArrows,
     lastCommandId: state.lastCommandId,
     lastCommandStatus: state.lastCommandStatus,
     commandHistory: state.commandHistory,
@@ -5022,6 +5038,12 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
   }
 
   const { goal, start, saltPct, brinePct, homePoint = null } = req.body ?? {};
+  const requestedSweepDirection = typeof req.body?.sweepDirection === 'string'
+    ? req.body.sweepDirection.trim().toLowerCase()
+    : 'auto';
+  const sweepDirection = ['auto', 'lefttoright', 'righttoleft'].includes(requestedSweepDirection)
+    ? requestedSweepDirection
+    : 'auto';
   const requestedMode = typeof req.body?.mode === 'string' ? req.body.mode.trim().toLowerCase() : null;
   const coverageWidthM = Number.isFinite(Number(req.body?.coverageWidthM)) && Number(req.body?.coverageWidthM) > 0
     ? Number(req.body.coverageWidthM)
@@ -5069,10 +5091,12 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     brinePct: normalizedBrine,
     homePoint,
     returnToBase,
+    sweepDirection,
   });
 
   if (!path.ok) {
     state.lastPath = [];
+    state.lastArrows = [];
     return res.status(400).json({ ok: false, error: path.reason });
   }
 
@@ -5080,9 +5104,11 @@ app.post(API.PATH_PLAN, requireApp, (req, res) => {
     ok: true,
     mode,
     coverageWidthM: mode === 'coverage' ? coverageWidthM : null,
+    sweepDirection: mode === 'coverage' ? sweepDirection : null,
     returnToBase,
     homePoint: cloneJsonSafe(state.homePoint, null),
     points: state.lastPath,
+    arrows: state.lastArrows,
     meta: path.meta ?? null,
   });
 });

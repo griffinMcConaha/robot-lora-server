@@ -126,6 +126,98 @@ function headingDeg(from, to) {
   return (angle + 360) % 360;
 }
 
+function haversineDistanceMeters(a, b) {
+  const earthRadiusM = 6371000;
+  const lat1 = a.lat * (Math.PI / 180);
+  const lat2 = b.lat * (Math.PI / 180);
+  const dLat = (b.lat - a.lat) * (Math.PI / 180);
+  const dLon = (b.lon - a.lon) * (Math.PI / 180);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLon = Math.sin(dLon / 2);
+  const aCalc = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLon * sinLon;
+  const c = 2 * Math.atan2(Math.sqrt(aCalc), Math.sqrt(1 - aCalc));
+  return earthRadiusM * c;
+}
+
+function quantizeHeadingDeg(value) {
+  const normalized = ((Number(value) % 360) + 360) % 360;
+  return Math.round(normalized / 5) * 5;
+}
+
+function buildCoverageArrows(points = [], options = {}) {
+  if (!Array.isArray(points) || points.length < 2) return [];
+
+  const spacingM = Number.isFinite(Number(options.spacingM)) && Number(options.spacingM) > 0
+    ? Number(options.spacingM)
+    : 8;
+  const initialOffsetM = Number.isFinite(Number(options.initialOffsetM)) && Number(options.initialOffsetM) >= 0
+    ? Number(options.initialOffsetM)
+    : Math.min(0.8, spacingM * 0.2);
+  const minArrowSeparationM = Number.isFinite(Number(options.minArrowSeparationM)) && Number(options.minArrowSeparationM) > 0
+    ? Number(options.minArrowSeparationM)
+    : Math.max(3.2, spacingM * 0.55);
+
+  const segments = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const from = points[i];
+    const to = points[i + 1];
+    if (!from || !to) continue;
+    if (!Number.isFinite(from.lat) || !Number.isFinite(from.lon) || !Number.isFinite(to.lat) || !Number.isFinite(to.lon)) continue;
+    const lenM = haversineDistanceMeters(from, to);
+    if (!Number.isFinite(lenM) || lenM <= 0.01) continue;
+    segments.push({ from, to, lenM });
+  }
+
+  if (!segments.length) return [];
+
+  const totalLenM = segments.reduce((sum, segment) => sum + segment.lenM, 0);
+  let segmentIndex = 0;
+  let segmentStartDistM = 0;
+  const arrows = [];
+
+  for (let targetDistM = initialOffsetM; targetDistM < totalLenM; targetDistM += spacingM) {
+    while (
+      segmentIndex < segments.length - 1
+      && (segmentStartDistM + segments[segmentIndex].lenM) < targetDistM
+    ) {
+      segmentStartDistM += segments[segmentIndex].lenM;
+      segmentIndex += 1;
+    }
+
+    const segment = segments[segmentIndex];
+    const distIntoSegmentM = Math.max(0, targetDistM - segmentStartDistM);
+    const t = Math.max(0, Math.min(1, distIntoSegmentM / segment.lenM));
+    const heading = Number.isFinite(segment.from.headingDeg)
+      ? segment.from.headingDeg
+      : headingDeg(segment.from, segment.to);
+
+    const nextArrow = {
+      lat: segment.from.lat + ((segment.to.lat - segment.from.lat) * t),
+      lon: segment.from.lon + ((segment.to.lon - segment.from.lon) * t),
+      headingDeg: quantizeHeadingDeg(heading),
+    };
+
+    const touchesExisting = arrows.some((existing) => haversineDistanceMeters(existing, nextArrow) < minArrowSeparationM);
+    if (touchesExisting) continue;
+    arrows.push(nextArrow);
+  }
+
+  if (!arrows.length) {
+    const from = segments[0].from;
+    const to = segments[0].to;
+    const heading = Number.isFinite(from.headingDeg)
+      ? from.headingDeg
+      : headingDeg(from, to);
+    arrows.push({
+      lat: (from.lat + to.lat) * 0.5,
+      lon: (from.lon + to.lon) * 0.5,
+      headingDeg: quantizeHeadingDeg(heading),
+    });
+  }
+
+  return arrows;
+}
+
 function withHeadings(points) {
   return points.map((point, index) => {
     const next = points[index + 1] ?? null;
@@ -174,6 +266,9 @@ function findCoveragePath(map, options = {}) {
     : map.cellSizeM;
   const startLatLon = options.startLatLon ?? null;
   const goalLatLon = options.goalLatLon ?? null;
+  const requestedSweepDirection = typeof options.sweepDirection === 'string'
+    ? options.sweepDirection.trim().toLowerCase()
+    : 'auto';
 
   const rowStep = Math.max(1, Math.round(swathWidthM / map.cellSizeM));
   const visitNodes = [];
@@ -200,6 +295,12 @@ function findCoveragePath(map, options = {}) {
       rowIncrement = rowDirection > 0 ? rowStep : -rowStep;
       forward = snappedGoal.col >= snappedStart.col;
     }
+  }
+
+  if (requestedSweepDirection === 'lefttoright') {
+    forward = true;
+  } else if (requestedSweepDirection === 'righttoleft') {
+    forward = false;
   }
 
   for (let row = rowStart; row !== rowLimit; row += rowIncrement) {
@@ -250,6 +351,7 @@ function findCoveragePath(map, options = {}) {
     meta: {
       swathWidthM,
       rowStep,
+      sweepDirection: requestedSweepDirection,
       pointCount: visitNodes.length,
     },
   };
@@ -258,4 +360,5 @@ function findCoveragePath(map, options = {}) {
 module.exports = {
   findPath,
   findCoveragePath,
+  buildCoverageArrows,
 };
