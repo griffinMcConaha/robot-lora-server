@@ -730,7 +730,31 @@ function _parseAckDetails(text) {
 }
 
 function _expectedAckForCommand(cmd) {
-  switch (cmd) {
+  const normalized = String(cmd ?? '').trim().toUpperCase();
+
+  if (normalized.startsWith('CMD:')) {
+    const payload = normalized.slice(4);
+    if (payload.startsWith('AUTO')) return 'ACK:STATE:AUTO';
+    if (payload.startsWith('MANUAL')) return 'ACK:STATE:MANUAL';
+    if (payload.startsWith('PAUSE')) return 'ACK:STATE:PAUSE';
+    if (payload.startsWith('ESTOP')) return 'ACK:STATE:ESTOP';
+    if (payload.startsWith('RESET')) return 'ACK:STATE:PAUSE';
+  }
+
+  if (normalized.startsWith('TEST SALT')) return 'ACK:CMD:TEST_SALT';
+  if (normalized.startsWith('TEST BRINE')) return 'ACK:CMD:TEST_BRINE';
+  if (normalized === 'AGITATOR ON') return 'ACK:CMD:AGITATOR_ON';
+  if (normalized === 'AGITATOR OFF') return 'ACK:CMD:AGITATOR_OFF';
+  if (normalized === 'THROWER ON') return 'ACK:CMD:THROWER_ON';
+  if (normalized === 'THROWER OFF') return 'ACK:CMD:THROWER_OFF';
+  if (normalized === 'RELAY ON') return 'ACK:CMD:RELAY_ON';
+  if (normalized === 'RELAY OFF') return 'ACK:CMD:RELAY_OFF';
+  if (normalized === 'VIBRATION ON') return 'ACK:CMD:VIBRATION_ON';
+  if (normalized === 'VIBRATION OFF') return 'ACK:CMD:VIBRATION_OFF';
+  if (normalized === 'ALLON' || normalized === 'FULLON') return 'ACK:CMD:ALLON';
+  if (normalized === 'STOP') return 'ACK:CMD:STOP';
+
+  switch (normalized) {
     case 'AUTO':
       return 'ACK:STATE:AUTO';
     case 'MANUAL':
@@ -761,7 +785,13 @@ async function _readLastLoRa() {
 }
 
 async function _waitForAck(expectedAck, options = {}) {
-  const { baselineRaw = null, wrappedOnly = true, timeoutMs = ACK_WAIT_TIMEOUT_MS, commandId = null } = options;
+  const {
+    baselineRaw = null,
+    wrappedOnly = true,
+    timeoutMs = ACK_WAIT_TIMEOUT_MS,
+    commandId = null,
+    ackRequired = ACK_REQUIRED,
+  } = options;
   const startedAt = Date.now();
   let lastSeenRaw = baselineRaw;
   let lastSeenAck = null;
@@ -810,7 +840,7 @@ async function _waitForAck(expectedAck, options = {}) {
     await _sleep(ACK_POLL_MS);
   }
 
-  if (!ACK_REQUIRED) {
+  if (!ackRequired) {
     return {
       ok: true,
       ack: expectedAck,
@@ -901,7 +931,7 @@ async function sendCommand(cmd, options = {}) {
     return { ok: false, status: null, body: '', error: 'cmd must be a non-empty string' };
   }
   const cmdStr = cmd.trim().toUpperCase();
-  const { waitForAck = false, commandId = null, commandSource = null } = options;
+  const { waitForAck = false, commandId = null, commandSource = null, ackRequired = ACK_REQUIRED } = options;
   const expectedAck = waitForAck ? _expectedAckForCommand(cmdStr) : null;
   const baseline = expectedAck ? await _readLastLoRa() : null;
   const headers = {};
@@ -927,6 +957,7 @@ async function sendCommand(cmd, options = {}) {
       baselineRaw: baseline?.ok ? baseline.frame?.raw ?? null : null,
       wrappedOnly: true,
       commandId: typeof commandId === 'string' && commandId.trim() ? commandId.trim() : null,
+      ackRequired,
     });
     if (!ack.ok) {
       _lastCmdError = ack.error;

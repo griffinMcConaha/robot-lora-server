@@ -77,6 +77,9 @@ const SAFETY_MONITOR_INTERVAL_MS = Number(process.env.SAFETY_MONITOR_INTERVAL_MS
 const GEOFENCE_FAILSAFE_ENABLED = String(process.env.GEOFENCE_FAILSAFE_ENABLED ?? '1') !== '0';
 const GEOFENCE_FAILSAFE_ACTION = String(process.env.GEOFENCE_FAILSAFE_ACTION ?? CMD.ESTOP).trim().toUpperCase();
 const GEOFENCE_FAILSAFE_COOLDOWN_MS = Number(process.env.GEOFENCE_FAILSAFE_COOLDOWN_MS ?? 5000);
+const GEOFENCE_TOLERANCE_M = Number(process.env.GEOFENCE_TOLERANCE_M ?? 2.0);
+const GEOFENCE_DEMO_TOLERANCE_M = Number(process.env.GEOFENCE_DEMO_TOLERANCE_M ?? 6.0);
+const GEOFENCE_DEMO_SOFT_ACTION = String(process.env.GEOFENCE_DEMO_SOFT_ACTION ?? '1') !== '0';
 const EVENT_RETENTION_DAYS = Number(process.env.EVENT_RETENTION_DAYS ?? 30);
 const EVENT_RETENTION_PRUNE_INTERVAL_MS = Number(process.env.EVENT_RETENTION_PRUNE_INTERVAL_MS ?? 3600000);
 const MAX_INPUT_AREA_CELLS = Number(process.env.MAX_INPUT_AREA_CELLS ?? 60000);
@@ -88,11 +91,19 @@ const COMMAND_RATE_LIMIT_PER_WINDOW = Number(process.env.COMMAND_RATE_LIMIT_PER_
 const TELEMETRY_RATE_LIMIT_PER_WINDOW = Number(process.env.TELEMETRY_RATE_LIMIT_PER_WINDOW ?? 6000);
 const COMMAND_STATE_CONFIRM_TIMEOUT_MS = Number(process.env.COMMAND_STATE_CONFIRM_TIMEOUT_MS ?? 15000);
 const COMMAND_STATE_CONFIRM_POLL_MS = Number(process.env.COMMAND_STATE_CONFIRM_POLL_MS ?? 150);
+const MISSION_AUTO_CONFIRM_TIMEOUT_MS = Number(process.env.MISSION_AUTO_CONFIRM_TIMEOUT_MS ?? 18000);
 const GPS_READY_MIN_SAT = Number(process.env.GPS_READY_MIN_SAT ?? 5);
 const GPS_READY_MAX_HDOP = Number(process.env.GPS_READY_MAX_HDOP ?? 3.0);
 const GPS_FAILSAFE_ENABLED = String(process.env.GPS_FAILSAFE_ENABLED ?? '1') !== '0';
 const GPS_FAILSAFE_ACTION = String(process.env.GPS_FAILSAFE_ACTION ?? CMD.PAUSE).trim().toUpperCase();
 const GPS_FAILSAFE_COOLDOWN_MS = Number(process.env.GPS_FAILSAFE_COOLDOWN_MS ?? 5000);
+const DEMO_MIN_SPOT_DISTANCE_M = Number(process.env.DEMO_MIN_SPOT_DISTANCE_M ?? 0.20);
+const DEMO_MIN_LANE_WIDTH_M = Number(process.env.DEMO_MIN_LANE_WIDTH_M ?? 0.90);
+const DEMO_OBSTACLE_POLICY_ENABLED = String(process.env.DEMO_OBSTACLE_POLICY_ENABLED ?? '1') !== '0';
+const DEMO_OBSTACLE_STOP_CM = Number(process.env.DEMO_OBSTACLE_STOP_CM ?? 70);
+const DEMO_OBSTACLE_SIDESTEP_CM = Number(process.env.DEMO_OBSTACLE_SIDESTEP_CM ?? 120);
+const DEMO_OBSTACLE_COOLDOWN_MS = Number(process.env.DEMO_OBSTACLE_COOLDOWN_MS ?? 1800);
+const DEMO_OBSTACLE_SIDESTEP_MS = Number(process.env.DEMO_OBSTACLE_SIDESTEP_MS ?? 320);
 const RUNTIME_STATE_SAVE_DEBOUNCE_MS = Number(process.env.RUNTIME_STATE_SAVE_DEBOUNCE_MS ?? 750);
 const RUNTIME_STATE_TRAIL_LIMIT = Number(process.env.RUNTIME_STATE_TRAIL_LIMIT ?? 300);
 const COMMAND_HISTORY_LIMIT = Number(process.env.COMMAND_HISTORY_LIMIT ?? 50);
@@ -176,6 +187,29 @@ const state = {
     enabled: false,
     updatedAt: 0,
     source: 'default',
+    config: {
+      laneWidthM: 3.0,
+      cellSizeM: 0.75,
+      coverageWidthM: 0.75,
+      allowWeakGps: true,
+      geofenceToleranceM: GEOFENCE_DEMO_TOLERANCE_M,
+      minSpotDistanceM: DEMO_MIN_SPOT_DISTANCE_M,
+      passes: 1,
+      obstaclePolicyEnabled: DEMO_OBSTACLE_POLICY_ENABLED,
+      obstacleStopCm: DEMO_OBSTACLE_STOP_CM,
+      obstacleSidestepCm: DEMO_OBSTACLE_SIDESTEP_CM,
+      obstacleCooldownMs: DEMO_OBSTACLE_COOLDOWN_MS,
+      obstacleSidestepMs: DEMO_OBSTACLE_SIDESTEP_MS,
+    },
+    obstacle: {
+      active: false,
+      mode: null,
+      side: null,
+      nearestCm: null,
+      at: 0,
+      cooldownUntil: 0,
+      note: null,
+    },
     spots: {
       start: null,
       end: null,
@@ -210,6 +244,7 @@ let lastDriveWireAt = 0;
 let latestWsManualDrive = null;
 let latestWsManualDriveQueuedAt = 0;
 let manualDriveWsDispatchInFlight = false;
+let lastMotorTelemetryLogMs = 0;
 
 const DRIVE_COMMANDS = new Set([
   CMD.FORWARD,
@@ -453,6 +488,19 @@ function mergePlannedSegments(...segments) {
     }
   }
   return merged;
+}
+
+function expandPathWithPasses(points, passes = 1) {
+  const normalizedPasses = Number.isFinite(Number(passes)) ? Math.max(1, Math.min(5, Math.floor(Number(passes)))) : 1;
+  if (!Array.isArray(points) || points.length === 0 || normalizedPasses <= 1) {
+    return Array.isArray(points) ? points : [];
+  }
+
+  let expanded = points.slice();
+  for (let i = 1; i < normalizedPasses; i += 1) {
+    expanded = mergePlannedSegments(expanded, points);
+  }
+  return expanded;
 }
 
 function serializeCoverageRuntime(map) {
@@ -792,6 +840,71 @@ function getDemoSpotStatuses() {
   };
 }
 
+function getDemoConfig() {
+  const current = state.demo?.config ?? {};
+  const laneWidthM = Number(current.laneWidthM ?? 3.0);
+  const cellSizeM = Number(current.cellSizeM ?? 0.75);
+  const coverageWidthM = Number(current.coverageWidthM ?? 0.75);
+  const geofenceToleranceM = Number(current.geofenceToleranceM ?? GEOFENCE_DEMO_TOLERANCE_M);
+  const minSpotDistanceM = Number(current.minSpotDistanceM ?? DEMO_MIN_SPOT_DISTANCE_M);
+  const passes = Number(current.passes ?? 1);
+  const obstacleStopCm = Number(current.obstacleStopCm ?? DEMO_OBSTACLE_STOP_CM);
+  const obstacleSidestepCm = Number(current.obstacleSidestepCm ?? DEMO_OBSTACLE_SIDESTEP_CM);
+  const obstacleCooldownMs = Number(current.obstacleCooldownMs ?? DEMO_OBSTACLE_COOLDOWN_MS);
+  const obstacleSidestepMs = Number(current.obstacleSidestepMs ?? DEMO_OBSTACLE_SIDESTEP_MS);
+
+  return {
+    laneWidthM: Number.isFinite(laneWidthM) && laneWidthM > 0 ? laneWidthM : 3.0,
+    cellSizeM: Number.isFinite(cellSizeM) && cellSizeM > 0 ? cellSizeM : 0.75,
+    coverageWidthM: Number.isFinite(coverageWidthM) && coverageWidthM > 0 ? coverageWidthM : 0.75,
+    allowWeakGps: current.allowWeakGps !== false,
+    geofenceToleranceM: Number.isFinite(geofenceToleranceM) && geofenceToleranceM >= 0 ? geofenceToleranceM : GEOFENCE_DEMO_TOLERANCE_M,
+    minSpotDistanceM: Number.isFinite(minSpotDistanceM) && minSpotDistanceM > 0 ? minSpotDistanceM : DEMO_MIN_SPOT_DISTANCE_M,
+    passes: Number.isFinite(passes) && passes >= 1 ? Math.min(5, Math.floor(passes)) : 1,
+    obstaclePolicyEnabled: current.obstaclePolicyEnabled !== false,
+    obstacleStopCm: Number.isFinite(obstacleStopCm) && obstacleStopCm > 0 ? obstacleStopCm : DEMO_OBSTACLE_STOP_CM,
+    obstacleSidestepCm: Number.isFinite(obstacleSidestepCm) && obstacleSidestepCm > 0 ? obstacleSidestepCm : DEMO_OBSTACLE_SIDESTEP_CM,
+    obstacleCooldownMs: Number.isFinite(obstacleCooldownMs) && obstacleCooldownMs >= 0 ? obstacleCooldownMs : DEMO_OBSTACLE_COOLDOWN_MS,
+    obstacleSidestepMs: Number.isFinite(obstacleSidestepMs) && obstacleSidestepMs > 0 ? obstacleSidestepMs : DEMO_OBSTACLE_SIDESTEP_MS,
+  };
+}
+
+function resolveDemoReadiness() {
+  const missionState = currentMissionState();
+  const gpsStatus = getRobotGpsStatus();
+  const demoStatuses = getDemoSpotStatuses();
+  const hasStart = Boolean(state.demo?.spots?.start);
+  const hasEnd = Boolean(state.demo?.spots?.end);
+  const hasPath = Array.isArray(state.lastPath) && state.lastPath.length > 0;
+  const wpPushState = bridge.getStatus().wpPushState ?? 'none';
+
+  const blockers = [];
+  if (!state.demo?.enabled) blockers.push('Demo mode is not enabled');
+  if (!hasStart) blockers.push('Spot A is not marked');
+  if (!hasEnd) blockers.push('Spot B is not marked');
+  if (hasStart && !demoStatuses.start.ready) blockers.push(demoStatuses.start.reason ?? 'Spot A GPS is not ready');
+  if (hasEnd && !demoStatuses.end.ready) blockers.push(demoStatuses.end.reason ?? 'Spot B GPS is not ready');
+  if (!hasPath) blockers.push('No demo path has been built');
+  if (wpPushState !== 'committed' && hasPath) blockers.push(`Waypoints are ${wpPushState}, not committed`);
+  if (!gpsStatus.ready) blockers.push(gpsStatus.reason ?? 'Robot GPS is not ready');
+  if (missionState !== MISSION_STATE.CONFIGURING && missionState !== MISSION_STATE.PAUSED) {
+    blockers.push(`Mission must be CONFIGURING or PAUSED, currently ${missionState}`);
+  }
+
+  return {
+    missionState,
+    hasStart,
+    hasEnd,
+    hasPath,
+    wpPushState,
+    gpsReady: gpsStatus.ready,
+    gpsReason: gpsStatus.reason,
+    readyToPlan: Boolean(state.demo?.enabled) && hasStart && hasEnd,
+    readyToRun: blockers.length === 0,
+    blockers,
+  };
+}
+
 function resolveTelemetryFailsafeAction() {
   if (TELEMETRY_FAILSAFE_ACTION === CMD.PAUSE) return CMD.PAUSE;
   return CMD.ESTOP;
@@ -802,10 +915,15 @@ function resolveGeofenceFailsafeAction() {
   return CMD.ESTOP;
 }
 
-function isRobotInsideCoverageArea(robotPoint) {
+function isRobotInsideCoverageArea(robotPoint, options = {}) {
   if (!state.coverage || !robotPoint) return true;
   const { row, col } = worldToGrid(state.coverage, robotPoint);
-  const toleranceCells = 1;
+  const demoConfig = getDemoConfig();
+  const configuredToleranceM = Number.isFinite(Number(options.toleranceM))
+    ? Number(options.toleranceM)
+    : (state.demo?.enabled ? demoConfig.geofenceToleranceM : GEOFENCE_TOLERANCE_M);
+  const safeCellSizeM = Math.max(0.01, Number(state.coverage?.cellSizeM ?? 1));
+  const toleranceCells = Math.max(1, Math.ceil(Math.max(0, configuredToleranceM) / safeCellSizeM));
 
   for (let rowOffset = -toleranceCells; rowOffset <= toleranceCells; rowOffset++) {
     for (let colOffset = -toleranceCells; colOffset <= toleranceCells; colOffset++) {
@@ -1806,6 +1924,9 @@ function buildSupervisionSummary() {
   const robotAgeMs = telemetryAgeMs(now);
   const gpsStatus = getRobotGpsStatus();
   const connectivity = buildConnectionState(now);
+  const demoReadiness = resolveDemoReadiness();
+  const demoConfig = getDemoConfig();
+  const loraStatus = bridge.getStatus();
   return {
     mission: mission.publicMission(),
     lora: bridge.getStatus(),
@@ -1815,6 +1936,9 @@ function buildSupervisionSummary() {
           lon: state.robot.lon,
           heading: state.robot.heading,
           speed: state.robot.speed,
+          motor: state.robot.motor ?? null,
+          prox: state.robot.prox ?? null,
+          disp: state.robot.disp ?? null,
           gpsFix: state.robot.gpsFix,
           gpsHdop: state.robot.gpsHdop,
           gpsSat: state.robot.gpsSat,
@@ -1850,8 +1974,18 @@ function buildSupervisionSummary() {
       enabled: Boolean(state.demo?.enabled),
       updatedAt: state.demo?.updatedAt || null,
       source: state.demo?.source ?? 'default',
+      config: demoConfig,
       spots: state.demo?.spots ?? { start: null, end: null },
       spotGpsStatus: getDemoSpotStatuses(),
+      obstacle: state.demo?.obstacle ?? null,
+      readiness: demoReadiness,
+      diagnostics: {
+        missionState: currentMissionState(),
+        wpPushState: loraStatus.wpPushState ?? 'none',
+        loraDegraded: Boolean(loraStatus.degraded),
+        loraLastError: loraStatus.lastCmdError ?? null,
+        commandPathState: connectivity?.commandPath?.state ?? null,
+      },
     },
     automation: getAutomationSnapshot(now),
     connectivity,
@@ -1862,19 +1996,114 @@ function buildSupervisionSummary() {
   };
 }
 
+async function enforceDemoObstaclePolicy(triggerSource = 'telemetry') {
+  if (!state.demo?.enabled) return;
+  const config = getDemoConfig();
+  if (!config.obstaclePolicyEnabled) return;
+  if (!mission.isRunning()) return;
+  if (!state.robot?.prox) return;
+
+  const left = Number(state.robot.prox.left);
+  const right = Number(state.robot.prox.right);
+  const leftValid = Number.isFinite(left) && left > 0;
+  const rightValid = Number.isFinite(right) && right > 0;
+  if (!leftValid && !rightValid) return;
+
+  const nearest = leftValid && rightValid ? Math.min(left, right) : (leftValid ? left : right);
+  const now = Date.now();
+  const cooldownUntil = Number(state.demo?.obstacle?.cooldownUntil ?? 0);
+  if (now < cooldownUntil) return;
+
+  if (nearest <= config.obstacleStopCm) {
+    const stop = await dispatchCommand(CMD.STOP, {
+      syncMission: false,
+      source: `demo.obstacle.stop.${triggerSource}`,
+      waitForAck: false,
+      waitForState: false,
+    });
+    if (stop.ok) {
+      state.demo.obstacle = {
+        active: true,
+        mode: 'stop',
+        side: null,
+        nearestCm: nearest,
+        at: now,
+        cooldownUntil: now + config.obstacleCooldownMs,
+        note: 'Temporary stop triggered by proximity',
+      };
+      scheduleRuntimeStateSave('demo.obstacle.stop');
+      publishSupervision();
+    }
+    return;
+  }
+
+  if (nearest <= config.obstacleSidestepCm) {
+    const sidestepSide = (leftValid && rightValid)
+      ? (left <= right ? 'RIGHT' : 'LEFT')
+      : (leftValid ? 'RIGHT' : 'LEFT');
+    const sidestepCmd = sidestepSide === 'LEFT' ? CMD.LEFT : CMD.RIGHT;
+
+    const move = await dispatchCommand(sidestepCmd, {
+      syncMission: false,
+      source: `demo.obstacle.sidestep.${triggerSource}`,
+      waitForAck: false,
+      waitForState: false,
+    });
+
+    if (move.ok) {
+      await sleep(Math.max(80, config.obstacleSidestepMs));
+      await dispatchCommand(CMD.STOP, {
+        syncMission: false,
+        source: `demo.obstacle.sidestep-stop.${triggerSource}`,
+        waitForAck: false,
+        waitForState: false,
+      });
+
+      state.demo.obstacle = {
+        active: true,
+        mode: 'sidestep',
+        side: sidestepSide,
+        nearestCm: nearest,
+        at: now,
+        cooldownUntil: now + config.obstacleCooldownMs,
+        note: `Temporary ${sidestepSide.toLowerCase()} sidestep triggered by proximity`,
+      };
+      scheduleRuntimeStateSave('demo.obstacle.sidestep');
+      publishSupervision();
+    }
+    return;
+  }
+
+  if (state.demo?.obstacle?.active) {
+    state.demo.obstacle = {
+      active: false,
+      mode: null,
+      side: null,
+      nearestCm: nearest,
+      at: now,
+      cooldownUntil: Number(state.demo?.obstacle?.cooldownUntil ?? 0),
+      note: 'Clear',
+    };
+  }
+}
+
 async function enforceGeofenceFailsafePolicy(triggerSource = 'telemetry') {
   if (!GEOFENCE_FAILSAFE_ENABLED) return;
   if (safetyMonitorInFlight) return;
   if (!mission.isRunning()) return;
   if (!state.robot || !state.coverage) return;
-  if (isRobotInsideCoverageArea(state.robot)) return;
+  const demoConfig = getDemoConfig();
+  const geofenceToleranceM = state.demo?.enabled ? demoConfig.geofenceToleranceM : GEOFENCE_TOLERANCE_M;
+  if (isRobotInsideCoverageArea(state.robot, { toleranceM: geofenceToleranceM })) return;
 
   const now = Date.now();
   if ((now - (state.safety.geofenceFailsafeAt || 0)) < GEOFENCE_FAILSAFE_COOLDOWN_MS) {
     return;
   }
 
-  const action = resolveGeofenceFailsafeAction();
+  const action = (state.demo?.enabled && GEOFENCE_DEMO_SOFT_ACTION)
+    ? CMD.PAUSE
+    : resolveGeofenceFailsafeAction();
   safetyMonitorInFlight = true;
   try {
     const dispatched = await dispatchCommand(action, {
@@ -2272,10 +2501,19 @@ async function waitForRobotState(expectedState, options = {}) {
   };
 }
 
-function setDemoMode(enabled, source = 'operator') {
+function setDemoMode(enabled, source = 'operator', configPatch = null) {
+  const currentConfig = getDemoConfig();
+  const mergedConfig = configPatch && typeof configPatch === 'object'
+    ? {
+        ...currentConfig,
+        ...configPatch,
+      }
+    : currentConfig;
+
   state.demo = {
     ...state.demo,
     enabled: Boolean(enabled),
+    config: mergedConfig,
     updatedAt: Date.now(),
     source,
   };
@@ -2333,7 +2571,7 @@ function markDemoSpot(kind, note = null, source = 'operator') {
   return spot;
 }
 
-function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0) {
+function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0, minSpotDistanceM = DEMO_MIN_SPOT_DISTANCE_M) {
   const start = startSpot?.robot;
   const end = endSpot?.robot;
   if (
@@ -2353,15 +2591,18 @@ function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0) {
   const dx = endLocal.x - startLocal.x;
   const dy = endLocal.y - startLocal.y;
   const length = Math.hypot(dx, dy);
-  if (!Number.isFinite(length) || length < 1.0) {
-    return { ok: false, error: 'Demo spots are too close together to build a demo lane' };
+  if (!Number.isFinite(length) || length < minSpotDistanceM) {
+    return {
+      ok: false,
+      error: `Demo spots are too close together to build a demo lane (minimum ${minSpotDistanceM.toFixed(2)} m)`,
+    };
   }
 
   const dirX = dx / length;
   const dirY = dy / length;
   const perpX = -dirY;
   const perpY = dirX;
-  const halfWidth = Math.max(0.75, laneWidthM / 2);
+  const halfWidth = Math.max(DEMO_MIN_LANE_WIDTH_M / 2, laneWidthM / 2);
   const leadIn = Math.min(1.0, length * 0.1);
   const tailX = dirX * leadIn;
   const tailY = dirY * leadIn;
@@ -2905,9 +3146,23 @@ async function startMissionAction(source = 'mission.start', options = {}) {
     return { ok: false, status: 409, error: 'Mission start requires a committed waypoint set' };
   }
 
-  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: false, waitForState: false });
+  const autoIssuedAt = Date.now();
+  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: true, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
+  }
+
+  const autoConfirmed = await waitForRobotState(ROBOT_STATE.AUTO, {
+    afterTimestampMs: autoIssuedAt,
+    timeoutMs: MISSION_AUTO_CONFIRM_TIMEOUT_MS,
+  });
+  if (!autoConfirmed.ok) {
+    return {
+      ok: false,
+      status: 504,
+      error: `AUTO command not confirmed by robot telemetry (${autoConfirmed.error})`,
+      detail: autoConfirmed,
+    };
   }
 
   const current = mission.start();
@@ -2953,9 +3208,23 @@ async function resumeMissionAction(source = 'mission.resume') {
   if (bridge.getStatus().wpPushState !== 'committed') {
     return { ok: false, status: 409, error: 'Mission resume requires committed waypoints' };
   }
-  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: false, waitForState: false });
+  const autoIssuedAt = Date.now();
+  const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: true, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
+  }
+
+  const autoConfirmed = await waitForRobotState(ROBOT_STATE.AUTO, {
+    afterTimestampMs: autoIssuedAt,
+    timeoutMs: MISSION_AUTO_CONFIRM_TIMEOUT_MS,
+  });
+  if (!autoConfirmed.ok) {
+    return {
+      ok: false,
+      status: 504,
+      error: `AUTO resume command not confirmed by robot telemetry (${autoConfirmed.error})`,
+      detail: autoConfirmed,
+    };
   }
   const current = mission.resume();
   state.automation = {
@@ -3574,38 +3843,38 @@ async function runTestMenuAction(actionId, input = {}) {
       return { ok: result.ok, actionId: resolved.id, result };
     }
     case 'salt-50': {
-      const result = await bridge.sendCommand('TEST SALT 50', { waitForAck: false });
+      const result = await bridge.sendCommand('TEST SALT 50', { waitForAck: true, ackRequired: true });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'TEST SALT 50' } };
     }
     case 'brine-50': {
-      const result = await bridge.sendCommand('TEST BRINE 50', { waitForAck: false });
+      const result = await bridge.sendCommand('TEST BRINE 50', { waitForAck: true, ackRequired: true });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'TEST BRINE 50' } };
     }
     case 'agitator-on': {
-      const result = await bridge.sendCommand('AGITATOR ON', { waitForAck: false });
+      const result = await bridge.sendCommand('AGITATOR ON', { waitForAck: true, ackRequired: true });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'AGITATOR ON' } };
     }
     case 'thrower-on': {
-      const result = await bridge.sendCommand('THROWER ON', { waitForAck: false });
+      const result = await bridge.sendCommand('THROWER ON', { waitForAck: true, ackRequired: true });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'THROWER ON' } };
     }
     case 'relay-on': {
-      const result = await bridge.sendCommand('RELAY ON', { waitForAck: false });
+      const result = await bridge.sendCommand('RELAY ON', { waitForAck: true, ackRequired: true });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'RELAY ON' } };
     }
     case 'vibration-on': {
-      const result = await bridge.sendCommand('VIBRATION ON', { waitForAck: false });
+      const result = await bridge.sendCommand('VIBRATION ON', { waitForAck: true, ackRequired: true });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'VIBRATION ON' } };
     }
     case 'all-on': {
-      const result = await bridge.sendCommand('ALLON', { waitForAck: false });
+      const result = await bridge.sendCommand('ALLON', { waitForAck: true, ackRequired: true });
       return { ok: result.ok, actionId: resolved.id, result: { ...result, command: 'ALLON' } };
     }
     case 'safe-off': {
-      const commands = ['PCT:0', 'AGITATOR OFF', 'THROWER OFF', 'RELAY OFF', 'VIBRATION OFF'];
+      const commands = ['TEST SALT 0', 'TEST BRINE 0', 'AGITATOR OFF', 'THROWER OFF', 'RELAY OFF', 'VIBRATION OFF', 'STOP'];
       const steps = [];
       for (const command of commands) {
-        const result = await bridge.sendCommand(command, { waitForAck: false });
+        const result = await bridge.sendCommand(command, { waitForAck: true, ackRequired: true });
         steps.push({ command, ok: result.ok, status: result.status ?? null, error: result.error ?? null });
         if (!result.ok) {
           return { ok: false, actionId: resolved.id, result: { steps, failedCommand: command } };
@@ -3623,7 +3892,7 @@ async function runTestMenuAction(actionId, input = {}) {
       ];
       const steps = [];
       for (const command of commands) {
-        const result = await bridge.sendCommand(command, { waitForAck: false });
+        const result = await bridge.sendCommand(command, { waitForAck: true, ackRequired: true });
         steps.push({ command, ok: result.ok, status: result.status ?? null, error: result.error ?? null });
         if (!result.ok) {
           return { ok: false, actionId: resolved.id, result: { steps, failedCommand: command } };
@@ -3642,7 +3911,7 @@ async function runTestMenuAction(actionId, input = {}) {
         };
       }
       const command = mixText.toUpperCase().startsWith('CMD:') ? mixText : `CMD:${mixText}`;
-      const result = await bridge.sendCommand(command, { waitForAck: false });
+      const result = await bridge.sendCommand(command, { waitForAck: true, ackRequired: true });
       return {
         ok: result.ok,
         actionId: resolved.id,
@@ -3718,12 +3987,19 @@ function parseIncomingTelemetry(payload) {
   const robotLat = coerceFiniteNumber(body?.robot?.lat, body?.robot?.latitude, body?.robot?.gps?.lat, body?.robot?.gps?.latitude);
   const robotLon = coerceFiniteNumber(body?.robot?.lon, body?.robot?.longitude, body?.robot?.gps?.lon, body?.robot?.gps?.longitude);
   if (body?.robot && robotLat !== null && robotLon !== null) {
+    const motorM1 = coerceFiniteNumber(body.robot?.motor?.m1, body.motor?.m1, body.m1, 0) ?? 0;
+    const motorM2 = coerceFiniteNumber(body.robot?.motor?.m2, body.motor?.m2, body.m2, 0) ?? 0;
     return {
       robot: {
         lat: robotLat,
         lon: robotLon,
         heading: coerceFiniteNumber(body.robot.heading, body.heading?.yaw, body.robot.yaw, 0) ?? 0,
         speed: coerceFiniteNumber(body.robot.speed, body.robot.velocity, 0) ?? 0,
+        motor: { m1: motorM1, m2: motorM2 },
+        prox: {
+          left: coerceFiniteNumber(body.robot?.prox?.left, body.prox?.left, body.pl, null),
+          right: coerceFiniteNumber(body.robot?.prox?.right, body.prox?.right, body.pr, null),
+        },
         gpsFix: coerceBooleanLike(body.robot.fix, body.robot.gpsFix, body.gps?.fix, false) ?? false,
         gpsHdop: coerceFiniteNumber(body.robot.hdop, body.robot.gpsHdop, body.gps?.hdop, 0) ?? 0,
         gpsSat: coerceFiniteNumber(body.robot.sat, body.robot.gpsSat, body.gps?.sat, 0) ?? 0,
@@ -3747,6 +4023,11 @@ function parseIncomingTelemetry(payload) {
         lon: gpsLon,
         heading: coerceFiniteNumber(body.heading?.yaw, body.heading, body.yaw, body.h, 0) ?? 0,
         speed: coerceFiniteNumber(body.speed, body.velocity, approxSpeed) ?? approxSpeed,
+        motor: { m1: motorM1, m2: motorM2 },
+        prox: {
+          left: coerceFiniteNumber(body.prox?.left, body.pl, null),
+          right: coerceFiniteNumber(body.prox?.right, body.pr, null),
+        },
         gpsFix: coerceBooleanLike(body.gps?.fix, body.fix, body.gpsFix, false) ?? false,
         gpsHdop: coerceFiniteNumber(body.gps?.hdop, body.hdop, body.gpsHdop, 0) ?? 0,
         gpsSat: coerceFiniteNumber(body.gps?.sat, body.sat, body.gpsSat, 0) ?? 0,
@@ -3770,6 +4051,11 @@ function parseIncomingTelemetry(payload) {
         lon: prevLon,
         heading: coerceFiniteNumber(body.heading?.yaw, body.heading, body.yaw, 0) ?? 0,
         speed: coerceFiniteNumber(body.speed, body.velocity, approxSpeed) ?? approxSpeed,
+        motor: { m1: motorM1, m2: motorM2 },
+        prox: {
+          left: coerceFiniteNumber(body.prox?.left, body.pl, null),
+          right: coerceFiniteNumber(body.prox?.right, body.pr, null),
+        },
         gpsFix: coerceBooleanLike(body.gps?.fix, body.fix, state.robot?.gpsFix, false) ?? false,
         gpsHdop: coerceFiniteNumber(body.gps?.hdop, body.hdop, state.robot?.gpsHdop, 0) ?? 0,
         gpsSat: coerceFiniteNumber(body.gps?.sat, body.sat, state.robot?.gpsSat, 0) ?? 0,
@@ -3801,6 +4087,11 @@ function parseIncomingTelemetry(payload) {
         lon: Number.isFinite(prevLon) ? prevLon : 0,
         heading: Number(body.h ?? state.robot?.heading ?? 0),
         speed: Number(body.speed ?? approxSpeed),
+        motor: { m1: motorM1, m2: motorM2 },
+        prox: {
+          left: coerceFiniteNumber(body.pl, body.prox?.left, null),
+          right: coerceFiniteNumber(body.pr, body.prox?.right, null),
+        },
         gpsFix: prevGpsFix,
         gpsHdop: Number.isFinite(prevGpsHdop) ? prevGpsHdop : 0,
         gpsSat: Number.isFinite(prevGpsSat) ? prevGpsSat : 0,
@@ -3970,6 +4261,9 @@ async function ingestParsedTelemetry(parsed) {
     lon: parsed.robot.lon,
     heading: parsed.robot.heading,
     speed: parsed.robot.speed,
+    motor: parsed.robot.motor ?? state.robot?.motor ?? null,
+    prox: parsed.robot.prox ?? state.robot?.prox ?? null,
+    disp: parsed.robot.disp ?? state.robot?.disp ?? null,
     gpsFix: parsed.robot.gpsFix,
     gpsHdop: parsed.robot.gpsHdop,
     gpsSat: parsed.robot.gpsSat,
@@ -3979,6 +4273,13 @@ async function ingestParsedTelemetry(parsed) {
     timestampMs: Date.now(),
     raw: parsed.raw,
   };
+
+  if (state.robot.motor && (Date.now() - lastMotorTelemetryLogMs) >= 5000) {
+    const m1 = Number(state.robot.motor.m1 ?? 0);
+    const m2 = Number(state.robot.motor.m2 ?? 0);
+    console.log(`[telemetry] motor m1=${m1} m2=${m2} state=${state.robot.state ?? 'UNKNOWN'} src=${state.robot.source ?? 'unknown'}`);
+    lastMotorTelemetryLogMs = Date.now();
+  }
 
   clearRecoveredSafetyState({
     telemetryRecovered: true,
@@ -4009,6 +4310,7 @@ async function ingestParsedTelemetry(parsed) {
 
   if (stats) mission.updateCoverage(getCoveragePct(stats));
 
+  await enforceDemoObstaclePolicy('telemetry');
   await enforceGeofenceFailsafePolicy('telemetry');
 
   scheduleRuntimeStateSave('telemetry.update');
@@ -4210,7 +4512,14 @@ app.get(API.SUPERVISION_SUMMARY, requireAppOrBoard, (_req, res) => {
 });
 
 app.get(API.DEMO_MODE, requireAppOrBoard, (_req, res) => {
-  res.json({ ok: true, demo: state.demo });
+  res.json({
+    ok: true,
+    demo: {
+      ...state.demo,
+      config: getDemoConfig(),
+      readiness: resolveDemoReadiness(),
+    },
+  });
 });
 
 app.post(API.DEMO_MODE, requireApp, (req, res) => {
@@ -4218,8 +4527,11 @@ app.post(API.DEMO_MODE, requireApp, (req, res) => {
   const source = typeof req.body?.source === 'string' && req.body.source.trim()
     ? req.body.source.trim()
     : 'app';
-  const demo = setDemoMode(enabled, source);
-  res.json({ ok: true, demo });
+  const config = req.body?.config && typeof req.body.config === 'object'
+    ? req.body.config
+    : null;
+  const demo = setDemoMode(enabled, source, config);
+  res.json({ ok: true, demo: { ...demo, config: getDemoConfig(), readiness: resolveDemoReadiness() } });
 });
 
 app.post(API.DEMO_SPOT, requireApp, (req, res) => {
@@ -4243,7 +4555,10 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
     return res.status(409).json({ ok: false, error: 'Demo mode is not active' });
   }
 
-  const allowWeakGps = req.body?.allowWeakGps === true;
+  const demoConfig = getDemoConfig();
+  const allowWeakGps = req.body?.allowWeakGps !== undefined
+    ? req.body?.allowWeakGps !== false
+    : demoConfig.allowWeakGps;
   const startSpotStatus = getDemoSpotGpsStatus(state.demo?.spots?.start, 'Spot A');
   if (!startSpotStatus.ready && !allowWeakGps) {
     return res.status(409).json({ ok: false, error: `Demo path blocked: ${startSpotStatus.reason}` });
@@ -4255,13 +4570,13 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
 
   const laneWidthM = Number.isFinite(Number(req.body?.laneWidthM)) && Number(req.body.laneWidthM) > 0
     ? Number(req.body.laneWidthM)
-    : 3.0;
+    : demoConfig.laneWidthM;
   const cellSizeM = Number.isFinite(Number(req.body?.cellSizeM)) && Number(req.body.cellSizeM) > 0
     ? Number(req.body.cellSizeM)
-    : 0.75;
+    : demoConfig.cellSizeM;
   const coverageWidthM = Number.isFinite(Number(req.body?.coverageWidthM)) && Number(req.body.coverageWidthM) > 0
     ? Number(req.body.coverageWidthM)
-    : 0.75;
+    : demoConfig.coverageWidthM;
   const saltPct = Number.isFinite(Number(req.body?.saltPct))
     ? Math.max(0, Math.min(100, Math.round(Number(req.body.saltPct))))
     : 100;
@@ -4269,28 +4584,55 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
     ? Math.max(0, Math.min(100, Math.round(Number(req.body.brinePct))))
     : 100;
 
-  const geometry = buildDemoBoundaryFromSpots(state.demo?.spots?.start, state.demo?.spots?.end, laneWidthM);
+  const geometry = buildDemoBoundaryFromSpots(state.demo?.spots?.start, state.demo?.spots?.end, laneWidthM, demoConfig.minSpotDistanceM);
   if (!geometry.ok) {
     return res.status(400).json({ ok: false, error: geometry.error });
   }
 
   const configured = configureActiveArea(geometry.baseStation, geometry.boundary, cellSizeM);
-  const path = planCoveragePathForCurrentArea({
+  const path = buildMissionPath({
+    mode: 'goal',
     startPoint: geometry.start,
     goalPoint: geometry.goal,
-    coverageWidthM,
     saltPct,
     brinePct,
+    homePoint: geometry.baseStation,
+    returnToBase: true,
   });
 
   if (!path.ok) {
     return res.status(400).json({ ok: false, error: path.reason });
   }
 
+  const configuredPasses = Number.isFinite(Number(req.body?.passes))
+    ? Math.max(1, Math.min(5, Math.floor(Number(req.body.passes))))
+    : demoConfig.passes;
+  if (configuredPasses > 1 && Array.isArray(state.lastPath) && state.lastPath.length > 0) {
+    const expanded = expandPathWithPasses(state.lastPath, configuredPasses);
+    state.lastPath = expanded.map((point) => ({
+      ...point,
+      salt: saltPct,
+      brine: brinePct,
+    }));
+    publish(WS_EVENT.PATH_UPDATED, {
+      mode: 'demo-shuttle',
+      coverageWidthM: null,
+      points: state.lastPath,
+      meta: {
+        ...(path.meta ?? {}),
+        passes: configuredPasses,
+      },
+    });
+  }
+
   scheduleRuntimeStateSave('demo-mode.path', { immediate: true });
   res.json({
     ok: true,
-    demo: state.demo,
+    demo: {
+      ...state.demo,
+      config: demoConfig,
+      readiness: resolveDemoReadiness(),
+    },
     warnings: allowWeakGps && (!startSpotStatus.ready || !endSpotStatus.ready)
       ? [
           'Service override used: demo path was built with weak or unavailable GPS quality.',
@@ -4308,8 +4650,9 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
       stats: configured.stats,
     },
     path: {
-      mode: 'coverage',
-      coverageWidthM,
+      mode: 'demo-shuttle',
+      coverageWidthM: null,
+      passes: configuredPasses,
       pointCount: state.lastPath.length,
       points: state.lastPath,
       meta: path.meta ?? null,
@@ -4322,7 +4665,10 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
     return res.status(409).json({ ok: false, error: 'Demo mode is not active' });
   }
 
-  const allowWeakGps = req.body?.allowWeakGps !== false;
+  const demoConfig = getDemoConfig();
+  const allowWeakGps = req.body?.allowWeakGps !== undefined
+    ? req.body?.allowWeakGps !== false
+    : demoConfig.allowWeakGps;
 
   try {
     const result = await startMissionAction('demo-mode.run', {
@@ -4332,9 +4678,9 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
     if (!result.ok) {
       return res.status(result.status ?? 500).json({ ok: false, error: result.error });
     }
-    return res.json({ ok: true, mission: result.mission, allowWeakGps });
+    return res.json({ ok: true, mission: result.mission, allowWeakGps, readiness: resolveDemoReadiness(), lora: bridge.getStatus() });
   } catch (err) {
-    return res.status(400).json({ ok: false, error: err.message });
+    return res.status(400).json({ ok: false, error: err.message, readiness: resolveDemoReadiness(), lora: bridge.getStatus() });
   }
 });
 
