@@ -2821,8 +2821,9 @@ function buildSampleWaypointSet() {
   return null;
 }
 
-async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge') {
-  const demoCheck = assertHardwareAllowed('Waypoint push');
+async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge', options = {}) {
+  const { allowWhenDemo = false } = options;
+  const demoCheck = assertHardwareAllowed('Waypoint push', { allowWhenDemo });
   if (!demoCheck.ok) return demoCheck;
   if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(currentMissionState())) {
     return { ok: false, status: 409, error: 'Waypoint push allowed only while mission is CONFIGURING or PAUSED' };
@@ -2896,7 +2897,7 @@ async function startMissionAction(source = 'mission.start', options = {}) {
 
   const loraStatus = bridge.getStatus();
   if (loraStatus.wpPushState !== 'committed' && state.lastPath && state.lastPath.length > 0) {
-    const pushed = await pushPathWaypoints(null, source);
+    const pushed = await pushPathWaypoints(null, source, { allowWhenDemo });
     if (!pushed.ok) return pushed;
   }
 
