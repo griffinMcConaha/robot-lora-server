@@ -94,8 +94,8 @@ extern "C" {
  *   Wire constraints
  *   ─────────────────
  *   Max LoRa payload  : 150 bytes (GATEWAY.CHUNK_BYTES)
- *   Longest WP line   : "WP:49:41.0762,-81.5140,100,100" ≈ 31 chars  ✓
- *   Max waypoints/mission: LORA_MAX_WAYPOINTS (50)
+ *   Longest WP line   : "WP:119:41.0762,-81.5140,100,100" ≈ 32 chars  ✓
+ *   Max waypoints/mission: LORA_MAX_WAYPOINTS (120)
  *   Inter-line delay  : LORA_WP_INTERLINE_MS (120 ms) — set by lora_bridge.js
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -107,7 +107,7 @@ extern "C" {
 #define LORA_WP_ACK_ADD_PREFIX  "ACK:WP"   /* full form: ACK:WP:<idx>                        */
 #define LORA_WP_ACK_LOAD_PREFIX "ACK:WPLOAD" /* full form: ACK:WPLOAD:<count>                */
 
-#define LORA_MAX_WAYPOINTS      50          /* must match MAX_WAYPOINTS in mission.h          */
+#define LORA_MAX_WAYPOINTS      120         /* must match MAX_WAYPOINTS in mission.h          */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 4.  FIRMWARE PATCHES REQUIRED  (uart_lora.c)

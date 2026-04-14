@@ -3082,6 +3082,14 @@ async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge', optio
   if (!points || !Array.isArray(points) || points.length === 0) {
     return { ok: false, status: 400, error: 'No points provided and no cached path plan' };
   }
+
+  const totalPoints = points.length;
+  const maxLocalWaypoints = Number(LORA_WIRE.MAX_WAYPOINTS) || 50;
+  const truncated = totalPoints > maxLocalWaypoints;
+  if (truncated) {
+    points = points.slice(0, maxLocalWaypoints);
+  }
+
   if (pathHasZeroDispersion(points)) {
     return { ok: false, status: 409, error: 'Waypoint push blocked: path has 0% salt and 0% brine' };
   }
@@ -3102,7 +3110,15 @@ async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge', optio
       scheduleRuntimeStateSave('waypoints.remote_queued', { immediate: true });
       publishSupervision();
       publishOperator();
-      return { ok: true, status: remoteResult.status ?? 202, sent: remoteResult.sent, points, queuedRemote: true };
+      return {
+        ok: true,
+        status: remoteResult.status ?? 202,
+        sent: remoteResult.sent,
+        points,
+        queuedRemote: true,
+        truncated,
+        totalPoints,
+      };
     }
     return remoteResult;
   }
@@ -3118,7 +3134,15 @@ async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge', optio
   scheduleRuntimeStateSave(result.queuedRemote ? 'waypoints.remote_queued' : 'waypoints.committed', { immediate: true });
   publishSupervision();
   publishOperator();
-  return { ok: true, status: result.status ?? 200, sent: result.sent, points, queuedRemote: Boolean(result.queuedRemote) };
+  return {
+    ok: true,
+    status: result.status ?? 200,
+    sent: result.sent,
+    points,
+    queuedRemote: Boolean(result.queuedRemote),
+    truncated,
+    totalPoints,
+  };
 }
 
 async function startMissionAction(source = 'mission.start', options = {}) {
@@ -5172,9 +5196,15 @@ app.post(API.MISSION_SCHEDULE, requireApp, async (req, res) => {
     if (!pushed.ok) {
       return res.status(pushed.status ?? 409).json({ ok: false, error: pushed.error ?? 'Failed to pre-stage waypoints for the scheduled run.' });
     }
-    waypointPrepNote = pushed.queuedRemote
-      ? 'armed; waypoints queued for remote staging'
-      : 'armed; waypoints pre-staged';
+    if (pushed.truncated) {
+      waypointPrepNote = pushed.queuedRemote
+        ? `armed; queued ${pushed.sent}/${pushed.totalPoints} waypoints for remote staging`
+        : `armed; pre-staged ${pushed.sent}/${pushed.totalPoints} waypoints locally`;
+    } else {
+      waypointPrepNote = pushed.queuedRemote
+        ? 'armed; waypoints queued for remote staging'
+        : 'armed; waypoints pre-staged';
+    }
   }
 
   const automation = armAutomationSchedule({ atMs, label, notify });

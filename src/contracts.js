@@ -334,8 +334,8 @@ const API = Object.freeze({
 //
 //   Wire constraints:
 //     - Max payload per LoRa frame: GATEWAY.CHUNK_BYTES (150 bytes)
-//     - WP line max: "WP:49:41.0762,-81.5140,100,100" ≈ 31 chars  ✓
-//     - Max waypoints per mission: MAX_WAYPOINTS (50)
+//     - WP line max: "WP:119:41.0762,-81.5140,100,100" ≈ 32 chars  ✓
+//     - Max waypoints per mission: MAX_WAYPOINTS (120)
 //
 //   ACK from STM32 (sent back over LoRa to base station):
 //     ACK:WPCLEAR
@@ -356,7 +356,7 @@ const LORA_WIRE = Object.freeze({
   WP_ACK_ADD:   'ACK:WP',         // prefix; full frame: ACK:WP:<idx>
   WP_ACK_BATCH: 'ACK:WPB',        // prefix; full frame: ACK:WPB:<start_idx>:<count>
   WP_ACK_LOAD:  'ACK:WPLOAD',     // prefix; full frame: ACK:WPLOAD:<count>
-  MAX_WAYPOINTS: 50,              // matches firmware MAX_WAYPOINTS
+  MAX_WAYPOINTS: 120,             // matches firmware MAX_WAYPOINTS
 
   // Inter-line delay for sequential WP commands (ms)
   // Tuned for faster commit while still giving gateway/base-station queue headroom.
