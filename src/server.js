@@ -2735,7 +2735,7 @@ function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWi
     brine: brinePct,
   }));
   const arrowSpacingM = mode === 'coverage'
-    ? Math.max(1.8, Number(coverageWidthM ?? 0.5) * 3.8)
+    ? Math.max(2.8, Number(coverageWidthM ?? 0.5) * 7.6)
     : 5;
   state.lastArrows = buildCoverageArrows(state.lastPath, {
     spacingM: arrowSpacingM,
