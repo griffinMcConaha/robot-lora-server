@@ -2733,8 +2733,12 @@ function buildMissionPath({ mode = 'coverage', startPoint, goalPoint, coverageWi
     salt: saltPct,
     brine: brinePct,
   }));
-  const arrowSpacingM = mode === 'coverage' ? Math.max(6, Number(coverageWidthM ?? 0.5) * 16) : 10;
-  state.lastArrows = buildCoverageArrows(state.lastPath, { spacingM: arrowSpacingM });
+  const arrowSpacingM = mode === 'coverage' ? Math.max(2.4, Number(coverageWidthM ?? 0.5) * 5.2) : 6;
+  state.lastArrows = buildCoverageArrows(state.lastPath, {
+    spacingM: arrowSpacingM,
+    minArrowSeparationM: Math.max(1.2, arrowSpacingM * 0.45),
+    initialOffsetM: Math.min(0.5, arrowSpacingM * 0.2),
+  });
 
   publish(WS_EVENT.PATH_UPDATED, {
     mode,

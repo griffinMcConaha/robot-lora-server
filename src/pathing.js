@@ -271,13 +271,21 @@ function findCoveragePath(map, options = {}) {
     : 'auto';
 
   const rowStep = Math.max(1, Math.round(swathWidthM / map.cellSizeM));
+  const laneStep = rowStep;
   const visitNodes = [];
   let prevNode = null;
   let forward = true;
 
+  const axisUEastComponent = Math.abs(Number(map?.axisU?.x ?? 1));
+  const axisVEastComponent = Math.abs(Number(map?.axisV?.x ?? 0));
+  const sweepByRows = axisUEastComponent >= axisVEastComponent;
+
   let rowStart = 0;
   let rowLimit = map.height;
-  let rowIncrement = rowStep;
+  let rowIncrement = laneStep;
+  let colStart = 0;
+  let colLimit = map.width;
+  let colIncrement = laneStep;
 
   if (startLatLon && goalLatLon) {
     const startGrid = worldToGrid(map, startLatLon);
@@ -286,57 +294,109 @@ function findCoveragePath(map, options = {}) {
     const snappedGoal = nearestWalkable(map, goalGrid.row, goalGrid.col);
 
     if (snappedStart && snappedGoal) {
-      const topAlignedRow = 0;
-      const bottomAlignedRow = Math.max(0, map.height - 1 - ((map.height - 1) % rowStep));
-      const rowDirection = snappedGoal.row >= snappedStart.row ? 1 : -1;
+      if (sweepByRows) {
+        const topAlignedRow = 0;
+        const bottomAlignedRow = Math.max(0, map.height - 1 - ((map.height - 1) % laneStep));
+        const rowDirection = snappedGoal.row >= snappedStart.row ? 1 : -1;
 
-      rowStart = rowDirection > 0 ? topAlignedRow : bottomAlignedRow;
-      rowLimit = rowDirection > 0 ? map.height : -1;
-      rowIncrement = rowDirection > 0 ? rowStep : -rowStep;
-      forward = snappedGoal.col >= snappedStart.col;
-    }
-  }
-
-  if (requestedSweepDirection === 'lefttoright') {
-    forward = true;
-  } else if (requestedSweepDirection === 'righttoleft') {
-    forward = false;
-  }
-
-  for (let row = rowStart; row !== rowLimit; row += rowIncrement) {
-    const insideCols = [];
-    for (let col = 0; col < map.width; col++) {
-      if (map.cells[row][col].inside) insideCols.push(col);
-    }
-    if (!insideCols.length) continue;
-
-    const runs = splitContiguous(insideCols);
-    const orderedRuns = forward ? runs : runs.slice().reverse();
-
-    for (const run of orderedRuns) {
-      const startCol = forward ? run.start : run.end;
-      const endCol = forward ? run.end : run.start;
-      const step = startCol <= endCol ? 1 : -1;
-      const firstNode = { row, col: startCol };
-
-      if (prevNode) {
-        const connector = findGridPath(map, prevNode, firstNode);
-        if (connector && connector.length > 1) {
-          for (let i = 1; i < connector.length; i++) {
-            visitNodes.push(connector[i]);
-          }
-        }
+        rowStart = rowDirection > 0 ? topAlignedRow : bottomAlignedRow;
+        rowLimit = rowDirection > 0 ? map.height : -1;
+        rowIncrement = rowDirection > 0 ? laneStep : -laneStep;
+        forward = snappedGoal.col >= snappedStart.col;
       } else {
-        visitNodes.push(firstNode);
-      }
+        const leftAlignedCol = 0;
+        const rightAlignedCol = Math.max(0, map.width - 1 - ((map.width - 1) % laneStep));
+        const colDirection = snappedGoal.col >= snappedStart.col ? 1 : -1;
 
-      for (let col = startCol + step; ; col += step) {
-        visitNodes.push({ row, col });
-        if (col === endCol) break;
+        colStart = colDirection > 0 ? leftAlignedCol : rightAlignedCol;
+        colLimit = colDirection > 0 ? map.width : -1;
+        colIncrement = colDirection > 0 ? laneStep : -laneStep;
+        forward = snappedGoal.row >= snappedStart.row;
       }
+    }
+  }
 
-      prevNode = { row, col: endCol };
-      forward = !forward;
+  if (requestedSweepDirection === 'lefttoright' || requestedSweepDirection === 'righttoleft') {
+    const eastAlongRunAxis = sweepByRows
+      ? Number(map?.axisU?.x ?? 1)
+      : Number(map?.axisV?.x ?? 0);
+    const forwardForLeftToRight = eastAlongRunAxis >= 0;
+    forward = requestedSweepDirection === 'lefttoright' ? forwardForLeftToRight : !forwardForLeftToRight;
+  }
+
+  if (sweepByRows) {
+    for (let row = rowStart; row !== rowLimit; row += rowIncrement) {
+      const insideCols = [];
+      for (let col = 0; col < map.width; col++) {
+        if (map.cells[row][col].inside) insideCols.push(col);
+      }
+      if (!insideCols.length) continue;
+
+      const runs = splitContiguous(insideCols);
+      const orderedRuns = forward ? runs : runs.slice().reverse();
+
+      for (const run of orderedRuns) {
+        const startCol = forward ? run.start : run.end;
+        const endCol = forward ? run.end : run.start;
+        const step = startCol <= endCol ? 1 : -1;
+        const firstNode = { row, col: startCol };
+
+        if (prevNode) {
+          const connector = findGridPath(map, prevNode, firstNode);
+          if (connector && connector.length > 1) {
+            for (let i = 1; i < connector.length; i++) {
+              visitNodes.push(connector[i]);
+            }
+          }
+        } else {
+          visitNodes.push(firstNode);
+        }
+
+        for (let col = startCol + step; ; col += step) {
+          visitNodes.push({ row, col });
+          if (col === endCol) break;
+        }
+
+        prevNode = { row, col: endCol };
+        forward = !forward;
+      }
+    }
+  } else {
+    for (let col = colStart; col !== colLimit; col += colIncrement) {
+      const insideRows = [];
+      for (let row = 0; row < map.height; row++) {
+        if (map.cells[row][col].inside) insideRows.push(row);
+      }
+      if (!insideRows.length) continue;
+
+      const runs = splitContiguous(insideRows);
+      const orderedRuns = forward ? runs : runs.slice().reverse();
+
+      for (const run of orderedRuns) {
+        const startRow = forward ? run.start : run.end;
+        const endRow = forward ? run.end : run.start;
+        const step = startRow <= endRow ? 1 : -1;
+        const firstNode = { row: startRow, col };
+
+        if (prevNode) {
+          const connector = findGridPath(map, prevNode, firstNode);
+          if (connector && connector.length > 1) {
+            for (let i = 1; i < connector.length; i++) {
+              visitNodes.push(connector[i]);
+            }
+          }
+        } else {
+          visitNodes.push(firstNode);
+        }
+
+        for (let row = startRow + step; ; row += step) {
+          visitNodes.push({ row, col });
+          if (row === endRow) break;
+        }
+
+        prevNode = { row: endRow, col };
+        forward = !forward;
+      }
     }
   }
 
@@ -351,6 +411,7 @@ function findCoveragePath(map, options = {}) {
     meta: {
       swathWidthM,
       rowStep,
+      sweepByRows,
       sweepDirection: requestedSweepDirection,
       pointCount: visitNodes.length,
     },
