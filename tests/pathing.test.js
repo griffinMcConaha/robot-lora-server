@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 
 const { buildCoverageMap, gridCellPolygon } = require('../src/coverage');
 const { latLonToLocal } = require('../src/geo');
-const { findCoveragePath, findPath } = require('../src/pathing');
+const { findCoveragePath, findPath, fitWaypointsToLimit } = require('../src/pathing');
 
 function createRectBoundary(origin, widthM, heightM) {
   const latPerM = 1 / 111320;
@@ -105,4 +105,20 @@ test('coverage path succeeds for rotated rectangles and keeps coverage cells ali
 
    assert.ok(normalizedAngle > 10 && normalizedAngle < 80, `expected rotated cell edge, got ${edgeAngleDeg.toFixed(2)}°`);
    assert.ok(result.points.some((point) => point.headingDeg !== 0 && point.headingDeg !== 90 && point.headingDeg !== 180 && point.headingDeg !== 270));
+});
+
+test('fitWaypointsToLimit preserves the full route span when reducing oversized paths', () => {
+  const points = Array.from({ length: 360 }, (_value, index) => ({
+    lat: 41 + (index * 0.000001),
+    lon: -81.5 + ((index % 15) * 0.000001),
+    salt: index % 100,
+    brine: 100 - (index % 100),
+  }));
+
+  const fitted = fitWaypointsToLimit(points, 120);
+
+  assert.equal(fitted.length, 120);
+  assert.deepEqual(fitted[0], points[0]);
+  assert.deepEqual(fitted[fitted.length - 1], points[points.length - 1]);
+  assert.ok(fitted[60].lat > points[150].lat, 'expected sampled path to retain later mission points');
 });

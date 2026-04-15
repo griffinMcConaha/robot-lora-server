@@ -14,7 +14,7 @@ const {
   gridCellPolygon,
 } = require('./coverage');
 const { latLonToLocal, localToLatLon } = require('./geo');
-const { findPath, findCoveragePath, buildCoverageArrows } = require('./pathing');
+const { findPath, findCoveragePath, buildCoverageArrows, fitWaypointsToLimit } = require('./pathing');
 const {
   createOperatorState,
   telemetryAgeMs: supervisionTelemetryAgeMs,
@@ -317,6 +317,8 @@ function parseMaybeJson(value) {
 
 function coerceFiniteNumber(...values) {
   for (const value of values) {
+    if (value == null) continue;
+    if (typeof value === 'string' && !value.trim()) continue;
     const number = Number(value);
     if (Number.isFinite(number)) {
       return number;
@@ -879,16 +881,26 @@ function resolveDemoReadiness() {
   const hasStart = Boolean(state.demo?.spots?.start);
   const hasEnd = Boolean(state.demo?.spots?.end);
   const hasPath = Array.isArray(state.lastPath) && state.lastPath.length > 0;
-  const wpPushState = bridge.getStatus().wpPushState ?? 'none';
+  const bridgeStatus = bridge.getStatus();
+  const wpPushState = bridgeStatus.wpPushState ?? 'none';
+  const localBaseStationReachable = bridgeStatus.baseStation?.statusOk === true;
+  const remoteFallback = getRemoteCommandFallbackReadiness();
+  const commandTransportReady = localBaseStationReachable || remoteFallback.ok;
+  const remoteWaypointCommitted = isRemoteWaypointPushLikelyCommitted();
 
   const blockers = [];
   if (!state.demo?.enabled) blockers.push('Demo mode is not enabled');
+  if (!commandTransportReady) {
+    blockers.push(`No command transport available: ${remoteFallback.reason ?? 'base station unreachable'}`);
+  }
   if (!hasStart) blockers.push('Spot A is not marked');
   if (!hasEnd) blockers.push('Spot B is not marked');
   if (hasStart && !demoStatuses.start.ready) blockers.push(demoStatuses.start.reason ?? 'Spot A GPS is not ready');
   if (hasEnd && !demoStatuses.end.ready) blockers.push(demoStatuses.end.reason ?? 'Spot B GPS is not ready');
   if (!hasPath) blockers.push('No demo path has been built');
-  if (wpPushState !== 'committed' && hasPath) blockers.push(`Waypoints are ${wpPushState}, not committed`);
+  if (wpPushState !== 'committed' && hasPath && !remoteWaypointCommitted.ok) {
+    blockers.push(`Waypoints are ${wpPushState}, not committed`);
+  }
   if (!gpsStatus.ready) blockers.push(gpsStatus.reason ?? 'Robot GPS is not ready');
   if (missionState !== MISSION_STATE.CONFIGURING && missionState !== MISSION_STATE.PAUSED) {
     blockers.push(`Mission must be CONFIGURING or PAUSED, currently ${missionState}`);
@@ -1169,12 +1181,33 @@ function isRemoteBaseStationFresh(now = Date.now()) {
 }
 
 function isRemoteCommandFallbackReady(now = Date.now()) {
-  if (!isRemoteBaseStationFresh(now)) {
-    return false;
+  return getRemoteCommandFallbackReadiness(now).ok;
+}
+
+function getRemoteCommandFallbackReadiness(now = Date.now()) {
+  const diagnostics = buildRemoteBaseStationDiagnostics(now);
+  if (!diagnostics.present) {
+    return { ok: false, reason: 'No remote base-station status received yet', diagnostics };
+  }
+  if (!diagnostics.fresh) {
+    return {
+      ok: false,
+      reason: `Remote base-station status is stale (${diagnostics.ageMs ?? 'unknown'}ms old)`,
+      diagnostics,
+    };
   }
 
-  const wifiState = String(state.remoteBaseStation?.wifiLinkState ?? '').trim().toLowerCase();
-  return !wifiState || ['online', 'connected'].includes(wifiState);
+  const wifiToken = String(diagnostics.wifiLinkState ?? '').trim().toLowerCase();
+  const wifiReady = !wifiToken || ['online', 'connected', 'ready', 'up', 'ok'].includes(wifiToken);
+  if (!wifiReady) {
+    return {
+      ok: false,
+      reason: `Remote bridge Wi-Fi link is ${diagnostics.wifiLinkState ?? 'not-ready'}`,
+      diagnostics,
+    };
+  }
+
+  return { ok: true, reason: null, diagnostics };
 }
 
 function normalizeRemoteBaseStationStatus(payload) {
@@ -1247,12 +1280,37 @@ function buildRemoteBaseStationDiagnostics(now = Date.now()) {
 function normalizeRemoteTrackedStatus(rawStatus) {
   const token = String(rawStatus ?? '').trim().toLowerCase();
   if (!token) return null;
-  if (['applied', 'complete', 'completed'].includes(token)) return COMMAND_STATUS.APPLIED;
-  if (['acknowledged', 'ack', 'acked'].includes(token)) return COMMAND_STATUS.ACKNOWLEDGED;
+  if (['applied', 'complete', 'completed', 'done', 'ok', 'success'].includes(token)) return COMMAND_STATUS.APPLIED;
+  if (['acknowledged', 'ack', 'acked', 'accepted'].includes(token)) return COMMAND_STATUS.ACKNOWLEDGED;
   if (['forwarded', 'sent'].includes(token)) return COMMAND_STATUS.FORWARDED;
   if (['queued', 'pending', 'retry', 'retrying'].includes(token)) return COMMAND_STATUS.QUEUED;
   if (['failed', 'error'].includes(token)) return COMMAND_STATUS.FAILED;
   return null;
+}
+
+function isRemoteWaypointPushLikelyCommitted(now = Date.now()) {
+  const fallback = getRemoteCommandFallbackReadiness(now);
+  if (!fallback.ok) {
+    return { ok: false, reason: fallback.reason };
+  }
+
+  const remote = state.remoteBaseStation ?? null;
+  const lastCmd = String(remote?.lastCmd ?? '').trim().toUpperCase();
+  const lastStatus = normalizeRemoteTrackedStatus(remote?.lastCmdStatus);
+  const queueDepth = Number.isFinite(Number(remote?.queueDepth)) ? Number(remote.queueDepth) : null;
+
+  const sawWpLoad = lastCmd.startsWith(`${LORA_WIRE.WP_LOAD}:`);
+  const statusAccepted = lastStatus === COMMAND_STATUS.ACKNOWLEDGED || lastStatus === COMMAND_STATUS.APPLIED;
+  const queueDrained = queueDepth == null || queueDepth <= 0;
+
+  if (sawWpLoad && statusAccepted && queueDrained) {
+    return { ok: true, reason: null };
+  }
+
+  return {
+    ok: false,
+    reason: 'Remote waypoint push is not fully acknowledged yet',
+  };
 }
 
 function transportStageForStatus(status) {
@@ -2456,6 +2514,10 @@ function commandRequiresStrictConfirmation(cmd) {
   return [CMD.PAUSE, CMD.ESTOP, CMD.RESET].includes(cmd);
 }
 
+function shouldRequireLiveStateConfirmation(now = Date.now()) {
+  return Boolean(state.robot?.timestampMs) && !isTelemetryStale(now);
+}
+
 function expectedRobotStateForCommand(cmd) {
   switch (cmd) {
     case CMD.AUTO:
@@ -2891,7 +2953,7 @@ async function dispatchCommand(cmd, options = {}) {
   const commandId = createCommandId();
   const shouldWaitForAck = waitForAck;
   const explicitlyWaitForState = waitForState;
-  const shouldWaitForState = explicitlyWaitForState || commandRequiresStrictConfirmation(cmd);
+  const shouldWaitForState = explicitlyWaitForState;
   const commandText = typeof wireCommand === 'string' && wireCommand.trim()
     ? wireCommand.trim().toUpperCase()
     : compactWireCommandForCmd(cmd);
@@ -2915,7 +2977,8 @@ async function dispatchCommand(cmd, options = {}) {
     status: COMMAND_STATUS.QUEUED,
   });
 
-  const remoteFallbackReady = isRemoteCommandFallbackReady() && !bridge.getStatus().baseStation?.statusOk;
+  const remoteFallback = getRemoteCommandFallbackReadiness();
+  const remoteFallbackReady = remoteFallback.ok && !bridge.getStatus().baseStation?.statusOk;
   if (remoteFallbackReady) {
     return queueDispatchedRemoteCommand({ commandId, cmd, wireCommand: commandText, source, syncMission });
   }
@@ -2963,23 +3026,31 @@ async function dispatchCommand(cmd, options = {}) {
       };
     }
 
-    const remoteFallbackReadyAfterFailure = isRemoteCommandFallbackReady() && !bridge.getStatus().baseStation?.statusOk;
+    const remoteFallbackAfterFailure = getRemoteCommandFallbackReadiness();
+    const remoteFallbackReadyAfterFailure = remoteFallbackAfterFailure.ok && !bridge.getStatus().baseStation?.statusOk;
     if (remoteFallbackReadyAfterFailure) {
       return queueDispatchedRemoteCommand({ commandId, cmd, wireCommand: commandText, source, syncMission });
     }
+
+    const fallbackHint = !bridge.getStatus().baseStation?.statusOk
+      ? (remoteFallbackAfterFailure.reason ?? remoteFallback.reason)
+      : null;
+    const enrichedError = fallbackHint
+      ? `${result.error ?? `Base station command failed (${result.status ?? 'no status'})`} | remote fallback unavailable: ${fallbackHint}`
+      : (result.error ?? `Base station command failed (${result.status ?? 'no status'})`);
 
     metrics.commandsFailed += 1;
     updateCommandTracking(commandId, {
       cmd,
       source,
       status: COMMAND_STATUS.FAILED,
-      error: result.error ?? `Base station command failed (${result.status ?? 'no status'})`,
+      error: enrichedError,
       detail: result,
     });
     return {
       ok: false,
       status: 502,
-      error: result.error ?? `Base station command failed (${result.status ?? 'no status'})`,
+      error: enrichedError,
       detail: result,
     };
   }
@@ -3110,7 +3181,7 @@ async function pushPathWaypoints(rawPoints = null, source = 'lora_bridge', optio
   const maxLocalWaypoints = Number(LORA_WIRE.MAX_WAYPOINTS) || 50;
   const truncated = totalPoints > maxLocalWaypoints;
   if (truncated) {
-    points = points.slice(0, maxLocalWaypoints);
+    points = fitWaypointsToLimit(points, maxLocalWaypoints);
   }
 
   if (pathHasZeroDispersion(points)) {
@@ -3190,26 +3261,32 @@ async function startMissionAction(source = 'mission.start', options = {}) {
   }
 
   if (bridge.getStatus().wpPushState !== 'committed') {
-    return { ok: false, status: 409, error: 'Mission start requires a committed waypoint set' };
+    const remoteWaypointCommitted = isRemoteWaypointPushLikelyCommitted();
+    if (!remoteWaypointCommitted.ok) {
+      return {
+        ok: false,
+        status: 409,
+        error: `Mission start requires a committed waypoint set (${remoteWaypointCommitted.reason})`,
+      };
+    }
   }
 
   const autoIssuedAt = Date.now();
+  const shouldConfirmAuto = shouldRequireLiveStateConfirmation(autoIssuedAt);
   const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: true, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
 
-  const autoConfirmed = await waitForRobotState(ROBOT_STATE.AUTO, {
-    afterTimestampMs: autoIssuedAt,
-    timeoutMs: MISSION_AUTO_CONFIRM_TIMEOUT_MS,
-  });
-  if (!autoConfirmed.ok) {
-    return {
-      ok: false,
-      status: 504,
-      error: `AUTO command not confirmed by robot telemetry (${autoConfirmed.error})`,
-      detail: autoConfirmed,
-    };
+  let autoConfirmationWarning = null;
+  if (shouldConfirmAuto) {
+    const autoConfirmed = await waitForRobotState(ROBOT_STATE.AUTO, {
+      afterTimestampMs: autoIssuedAt,
+      timeoutMs: Math.min(MISSION_AUTO_CONFIRM_TIMEOUT_MS, 2500),
+    });
+    if (!autoConfirmed.ok) {
+      autoConfirmationWarning = `AUTO command not confirmed yet (${autoConfirmed.error})`;
+    }
   }
 
   const current = mission.start();
@@ -3225,7 +3302,7 @@ async function startMissionAction(source = 'mission.start', options = {}) {
   scheduleRuntimeStateSave('mission.start', { immediate: true });
   publishSupervision();
   publishOperator();
-  return { ok: true, status: 200, mission: current };
+  return { ok: true, status: 200, mission: current, warning: autoConfirmationWarning };
 }
 
 async function pauseMissionAction(reason = null, source = 'mission.pause') {
@@ -3242,36 +3319,43 @@ async function pauseMissionAction(reason = null, source = 'mission.pause') {
   return { ok: true, status: 200, mission: current };
 }
 
-async function resumeMissionAction(source = 'mission.resume') {
-  const demoCheck = assertHardwareAllowed('Mission resume');
+async function resumeMissionAction(source = 'mission.resume', options = {}) {
+  const { allowWhenDemo = false, allowWeakGps = false } = options;
+  const demoCheck = assertHardwareAllowed('Mission resume', { allowWhenDemo });
   if (!demoCheck.ok) return demoCheck;
   if (currentMissionState() !== MISSION_STATE.PAUSED) {
     return { ok: false, status: 409, error: 'Mission must be PAUSED before resume' };
   }
   const gpsStatus = getRobotGpsStatus();
-  if (state.robot && !gpsStatus.ready) {
+  if (state.robot && !gpsStatus.ready && !allowWeakGps) {
     return { ok: false, status: 409, error: `Mission resume blocked: ${gpsStatus.reason}` };
   }
   if (bridge.getStatus().wpPushState !== 'committed') {
-    return { ok: false, status: 409, error: 'Mission resume requires committed waypoints' };
+    const remoteWaypointCommitted = isRemoteWaypointPushLikelyCommitted();
+    if (!remoteWaypointCommitted.ok) {
+      return {
+        ok: false,
+        status: 409,
+        error: `Mission resume requires committed waypoints (${remoteWaypointCommitted.reason})`,
+      };
+    }
   }
   const autoIssuedAt = Date.now();
+  const shouldConfirmAuto = shouldRequireLiveStateConfirmation(autoIssuedAt);
   const dispatched = await dispatchCommand(CMD.AUTO, { syncMission: false, source, waitForAck: true, waitForState: false });
   if (!dispatched.ok) {
     return { ok: false, status: dispatched.status ?? 500, error: dispatched.error };
   }
 
-  const autoConfirmed = await waitForRobotState(ROBOT_STATE.AUTO, {
-    afterTimestampMs: autoIssuedAt,
-    timeoutMs: MISSION_AUTO_CONFIRM_TIMEOUT_MS,
-  });
-  if (!autoConfirmed.ok) {
-    return {
-      ok: false,
-      status: 504,
-      error: `AUTO resume command not confirmed by robot telemetry (${autoConfirmed.error})`,
-      detail: autoConfirmed,
-    };
+  let autoConfirmationWarning = null;
+  if (shouldConfirmAuto) {
+    const autoConfirmed = await waitForRobotState(ROBOT_STATE.AUTO, {
+      afterTimestampMs: autoIssuedAt,
+      timeoutMs: Math.min(MISSION_AUTO_CONFIRM_TIMEOUT_MS, 2500),
+    });
+    if (!autoConfirmed.ok) {
+      autoConfirmationWarning = `AUTO resume command not confirmed yet (${autoConfirmed.error})`;
+    }
   }
   const current = mission.resume();
   state.automation = {
@@ -3286,7 +3370,7 @@ async function resumeMissionAction(source = 'mission.resume') {
   scheduleRuntimeStateSave('mission.resume', { immediate: true });
   publishSupervision();
   publishOperator();
-  return { ok: true, status: 200, mission: current };
+  return { ok: true, status: 200, mission: current, warning: autoConfirmationWarning };
 }
 
 async function completeMissionAction(source = 'mission.complete') {
@@ -4719,10 +4803,16 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
     : demoConfig.allowWeakGps;
 
   try {
-    const result = await startMissionAction('demo-mode.run', {
-      allowWhenDemo: true,
-      allowWeakGps,
-    });
+    const missionState = currentMissionState();
+    const result = missionState === MISSION_STATE.PAUSED
+      ? await resumeMissionAction('demo-mode.run', {
+          allowWhenDemo: true,
+          allowWeakGps,
+        })
+      : await startMissionAction('demo-mode.run', {
+          allowWhenDemo: true,
+          allowWeakGps,
+        });
     if (!result.ok) {
       return res.status(result.status ?? 500).json({ ok: false, error: result.error });
     }
@@ -4765,6 +4855,7 @@ app.get(API.STATUS, requireAppOrBoard, (_req, res) => {
 
 app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
   const parsedBody = parseMaybeJson(req.body);
+  const expectsJson = typeof parsedBody === 'object' && parsedBody !== null;
   const rawCmd =
     (typeof parsedBody === 'object' && parsedBody !== null && typeof parsedBody.cmd === 'string' && parsedBody.cmd) ||
     (typeof parsedBody === 'string' && parsedBody) ||
@@ -4773,7 +4864,9 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
 
   const cmd = normalizeCommand(rawCmd);
   if (!cmd) {
-    return res.status(400).send('Missing cmd');
+    return expectsJson
+      ? res.status(400).json({ ok: false, error: 'Missing cmd' })
+      : res.status(400).type('text/plain').send('Missing cmd');
   }
 
   const rawWireCommand = typeof rawCmd === 'string' ? rawCmd.trim().toUpperCase() : '';
@@ -4807,9 +4900,11 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
 
     const drive = clampNumber(Math.round(coerceFiniteNumber(driveValue, 0)), -100, 100);
     const turn = clampNumber(Math.round(coerceFiniteNumber(turnValue, 0)), -100, 100);
-    const normalizedSeq = Number.isFinite(Number(driveSeq))
-      ? Math.max(0, Math.floor(Number(driveSeq)))
-      : null;
+    const normalizedSeq = driveSeq == null || (typeof driveSeq === 'string' && !driveSeq.trim())
+      ? null
+      : (Number.isFinite(Number(driveSeq))
+        ? Math.max(0, Math.floor(Number(driveSeq)))
+        : null);
     wireCommand = normalizedSeq == null ? `D:${drive},${turn}` : `D:${drive},${turn},S:${normalizedSeq}`;
   }
 
@@ -4830,10 +4925,14 @@ app.post(API.COMMAND, requireApp, rateLimitCommand, async (req, res) => {
     waitForState: false,
   });
   if (!dispatched.ok) {
-    return res.status(dispatched.status ?? 500).type('text/plain').send(dispatched.error);
+    return expectsJson
+      ? res.status(dispatched.status ?? 500).json({ ok: false, error: dispatched.error })
+      : res.status(dispatched.status ?? 500).type('text/plain').send(dispatched.error);
   }
 
-  return res.type('text/plain').send('OK');
+  return expectsJson
+    ? res.json({ ok: true, cmd, wireCommand, commandId: dispatched.commandId ?? null, warning: dispatched.warning ?? null })
+    : res.type('text/plain').send('OK');
 });
 
 app.get(API.ROOT, (_req, res) => {
@@ -4974,8 +5073,17 @@ const handleBaseStationCommandAck = (req, res) => {
     return res.status(400).json({ ok: false, error: 'commandId is required' });
   }
 
+  const rawStatus = typeof req.body?.status === 'string' ? req.body.status.trim() : '';
+  if (rawStatus && !normalizeRemoteTrackedStatus(rawStatus)) {
+    return res.status(400).json({
+      ok: false,
+      error: `Unsupported ack status: ${rawStatus}`,
+      allowed: ['queued', 'retry', 'forwarded', 'sent', 'ack', 'acknowledged', 'applied', 'complete', 'failed'],
+    });
+  }
+
   const ack = acknowledgeRemoteCommand(commandId, {
-    status: req.body?.status,
+    status: rawStatus || req.body?.status,
     error: req.body?.error,
   });
 
@@ -5234,8 +5342,8 @@ app.post(API.MISSION_SCHEDULE, requireApp, async (req, res) => {
     }
     if (pushed.truncated) {
       waypointPrepNote = pushed.queuedRemote
-        ? `armed; queued ${pushed.sent}/${pushed.totalPoints} waypoints for remote staging`
-        : `armed; pre-staged ${pushed.sent}/${pushed.totalPoints} waypoints locally`;
+        ? `armed; simplified route to ${pushed.sent}/${pushed.totalPoints} hardware waypoints for remote staging`
+        : `armed; simplified route to ${pushed.sent}/${pushed.totalPoints} hardware waypoints locally`;
     } else {
       waypointPrepNote = pushed.queuedRemote
         ? 'armed; waypoints queued for remote staging'

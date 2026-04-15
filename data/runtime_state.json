@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "savedAt": 1775977834298,
+  "savedAt": 1776279208228,
   "reason": "startup.reconciled",
   "state": {
     "baseStation": {
@@ -43,7 +43,134 @@
     "robot": null,
     "trail": [],
     "lastPath": [],
-    "commandHistory": [],
+    "lastArrows": [],
+    "commandHistory": [
+      {
+        "commandId": "cmd_1776278739887_w5tx3r",
+        "cmd": "RESET",
+        "source": "api.command",
+        "status": "sent",
+        "error": null,
+        "bridgeAckSource": null,
+        "transport": {
+          "stage": "base_station_forwarded",
+          "backendStatus": "sent",
+          "baseStationSeen": false,
+          "baseStationCommandId": null,
+          "baseStationCommandStatus": null,
+          "ackCategory": null,
+          "ackSource": null,
+          "robotAckState": null,
+          "waypointIndex": null,
+          "waypointCount": null,
+          "loRaAcked": false,
+          "robotApplied": false
+        },
+        "detail": null,
+        "at": 1776278739887,
+        "updatedAt": 1776278739887
+      },
+      {
+        "commandId": "cmd_1776278739879_hg60gb",
+        "cmd": "ESTOP",
+        "source": "api.command",
+        "status": "sent",
+        "error": null,
+        "bridgeAckSource": null,
+        "transport": {
+          "stage": "base_station_forwarded",
+          "backendStatus": "sent",
+          "baseStationSeen": false,
+          "baseStationCommandId": null,
+          "baseStationCommandStatus": null,
+          "ackCategory": null,
+          "ackSource": null,
+          "robotAckState": null,
+          "waypointIndex": null,
+          "waypointCount": null,
+          "loRaAcked": false,
+          "robotApplied": false
+        },
+        "detail": null,
+        "at": 1776278739880,
+        "updatedAt": 1776278739880
+      },
+      {
+        "commandId": "cmd_1776278739872_rddm5x",
+        "cmd": "AUTO",
+        "source": "api.command",
+        "status": "sent",
+        "error": null,
+        "bridgeAckSource": null,
+        "transport": {
+          "stage": "base_station_forwarded",
+          "backendStatus": "sent",
+          "baseStationSeen": false,
+          "baseStationCommandId": null,
+          "baseStationCommandStatus": null,
+          "ackCategory": null,
+          "ackSource": null,
+          "robotAckState": null,
+          "waypointIndex": null,
+          "waypointCount": null,
+          "loRaAcked": false,
+          "robotApplied": false
+        },
+        "detail": null,
+        "at": 1776278739873,
+        "updatedAt": 1776278739873
+      },
+      {
+        "commandId": "cmd_1776278739866_ix5rph",
+        "cmd": "PAUSE",
+        "source": "api.command",
+        "status": "sent",
+        "error": null,
+        "bridgeAckSource": null,
+        "transport": {
+          "stage": "base_station_forwarded",
+          "backendStatus": "sent",
+          "baseStationSeen": false,
+          "baseStationCommandId": null,
+          "baseStationCommandStatus": null,
+          "ackCategory": null,
+          "ackSource": null,
+          "robotAckState": null,
+          "waypointIndex": null,
+          "waypointCount": null,
+          "loRaAcked": false,
+          "robotApplied": false
+        },
+        "detail": null,
+        "at": 1776278739867,
+        "updatedAt": 1776278739867
+      },
+      {
+        "commandId": "cmd_1776278739855_a6268l",
+        "cmd": "MANUAL",
+        "source": "api.command",
+        "status": "sent",
+        "error": null,
+        "bridgeAckSource": null,
+        "transport": {
+          "stage": "base_station_forwarded",
+          "backendStatus": "sent",
+          "baseStationSeen": false,
+          "baseStationCommandId": null,
+          "baseStationCommandStatus": null,
+          "ackCategory": null,
+          "ackSource": null,
+          "robotAckState": null,
+          "waypointIndex": null,
+          "waypointCount": null,
+          "loRaAcked": false,
+          "robotApplied": false
+        },
+        "detail": null,
+        "at": 1776278739857,
+        "updatedAt": 1776278739857
+      }
+    ],
     "lastFault": null,
     "safety": {
       "telemetryFailsafeAt": 0,
@@ -60,6 +187,29 @@
       "enabled": false,
       "updatedAt": 0,
       "source": "default",
+      "config": {
+        "laneWidthM": 3,
+        "cellSizeM": 0.75,
+        "coverageWidthM": 0.75,
+        "allowWeakGps": true,
+        "geofenceToleranceM": 6,
+        "minSpotDistanceM": 0.2,
+        "passes": 1,
+        "obstaclePolicyEnabled": true,
+        "obstacleStopCm": 70,
+        "obstacleSidestepCm": 120,
+        "obstacleCooldownMs": 1800,
+        "obstacleSidestepMs": 320
+      },
+      "obstacle": {
+        "active": false,
+        "mode": null,
+        "side": null,
+        "nearestCm": null,
+        "at": 0,
+        "cooldownUntil": 0,
+        "note": null
+      },
       "spots": {
         "start": null,
         "end": null
@@ -75,13 +225,14 @@
       "lastResult": null,
       "lastError": null
     },
-    "operator": {t
+    "operator": {
       "workflowAcks": {},
       "notes": []
     },
     "bridge": {
-      "baseStationUrl": "http://192.168.4.1",
+      "baseStationUrl": "http://127.0.0.1:19181",
       "baseStationCandidates": [
+        "http://127.0.0.1:19181",
         "http://192.168.4.1",
         "http://base-station.local"
       ],
@@ -89,34 +240,38 @@
       "wpPushCount": 0,
       "wpPushAt": null,
       "wpPushError": null,
-      "lastCmd": null,
-      "lastCmdAt": null,
+      "lastCmd": "X",
+      "lastCmdAt": "2026-04-15T18:45:39.887Z",
       "lastCmdError": null,
-      "lastSuccessAt": null,
+      "lastSuccessAt": "2026-04-15T18:45:39.887Z",
       "lastErrorAt": null,
       "consecutiveFailures": 0,
       "degraded": false,
       "degradedSince": null,
-      "requestTimeoutMs": 3000,
-      "ackWaitTimeoutMs": 5000,
-      "ackPollMs": 120,
+      "requestTimeoutMs": 1500,
+      "ackWaitTimeoutMs": 3500,
+      "ackPollMs": 40,
+      "wpInterlineMs": 35,
+      "wpBatchSize": 2,
+      "wpBatchMaxChars": 130,
       "baseStation": {
-        "statusOk": false,
-        "statusCode": null,
+        "statusOk": true,
+        "statusCode": 200,
         "statusError": null,
         "statusVersion": null,
         "state": null,
         "mode": null,
+        "radioMode": null,
         "wifiLinkState": null,
         "loraLinkState": null,
-        "queueDepth": null,
+        "queueDepth": 0,
         "lastCmdId": null,
         "lastCmdStatus": null,
         "ackCount": null,
         "lastAck": null,
         "lastAckParsed": null,
         "lastLoRa": null,
-        "discoverySource": "configured",
+        "discoverySource": "default",
         "mdnsEnabled": true,
         "mdnsNames": [
           "base-station",
@@ -127,40 +282,42 @@
           "salt-robot-base.local"
         ],
         "mdnsServices": [],
-        "refreshedAt": null,
-        "selectedUrl": "http://192.168.4.1",
-        "attemptedUrls": []
+        "refreshedAt": "2026-04-15T18:45:39.887Z",
+        "selectedUrl": "http://127.0.0.1:19181",
+        "attemptedUrls": [
+          "http://127.0.0.1:19181"
+        ]
       }
     },
     "mission": {
-      "id": 5,
+      "id": 4,
       "state": "CONFIGURING",
-      "startedAt": 1773699656428,
+      "startedAt": 1773548116731,
       "endedAt": null,
       "coveragePct": 0,
       "faultCount": 0,
-      "cmdCount": 0,
+      "cmdCount": 11,
       "notes": "",
       "baseStation": {
-        "lat": 41.07530884188187,
-        "lon": -81.5141786634922
+        "lat": 41.075304039693016,
+        "lon": -81.51424001902342
       },
       "boundary": [
         {
-          "lat": 41.07530884188187,
-          "lon": -81.5141786634922
+          "lat": 41.075304039693016,
+          "lon": -81.51424001902342
         },
         {
-          "lat": 41.07530884188187,
-          "lon": -81.51371899992228
+          "lat": 41.075304039693016,
+          "lon": -81.51354532688856
         },
         {
-          "lat": 41.075253743062355,
-          "lon": -81.51371899992228
+          "lat": 41.07525146833944,
+          "lon": -81.51354532688856
         },
         {
-          "lat": 41.075253743062355,
-          "lon": -81.5141786634922
+          "lat": 41.07525146833944,
+          "lon": -81.51424001902342
         }
       ],
       "cellSizeM": 2

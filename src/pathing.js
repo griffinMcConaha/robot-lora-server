@@ -228,6 +228,28 @@ function withHeadings(points) {
   });
 }
 
+function fitWaypointsToLimit(points = [], maxWaypoints = Infinity) {
+  if (!Array.isArray(points)) return [];
+
+  const limit = Math.floor(Number(maxWaypoints));
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+  if (points.length <= limit) {
+    return points.map((point) => ({ ...point }));
+  }
+
+  const lastIndex = points.length - 1;
+  const fitted = [];
+
+  for (let slot = 0; slot < limit; slot++) {
+    const index = slot === limit - 1
+      ? lastIndex
+      : Math.floor((slot * lastIndex) / (limit - 1));
+    fitted.push({ ...points[index] });
+  }
+
+  return fitted;
+}
+
 function findPath(map, startLatLon, goalLatLon) {
   let start = worldToGrid(map, startLatLon);
   let goal = worldToGrid(map, goalLatLon);
@@ -281,7 +303,11 @@ function findCoveragePath(map, options = {}) {
   const axisVEastComponent = Math.abs(Number(map?.axisV?.x ?? 0));
   const byMinTurns = map.height <= map.width;
   const byEastWestAlignment = axisUEastComponent >= axisVEastComponent;
-  const sweepByRows = preferMinTurns ? byMinTurns : byEastWestAlignment;
+  const hasExplicitSweepDirection = requestedSweepDirection === 'lefttoright' || requestedSweepDirection === 'righttoleft';
+  const hasCornerIntent = Boolean(startLatLon && goalLatLon);
+  const sweepByRows = (hasExplicitSweepDirection || hasCornerIntent)
+    ? byEastWestAlignment
+    : (preferMinTurns ? byMinTurns : byEastWestAlignment);
 
   let rowStart = 0;
   let rowLimit = map.height;
@@ -426,4 +452,5 @@ module.exports = {
   findPath,
   findCoveragePath,
   buildCoverageArrows,
+  fitWaypointsToLimit,
 };
