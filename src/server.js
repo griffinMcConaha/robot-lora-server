@@ -2690,6 +2690,66 @@ function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0, minSpo
   };
 }
 
+function interpolateLocalPoint(a, b, t) {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+  };
+}
+
+function buildIndoorDemoSnakePath(geometry, options = {}) {
+  if (!geometry?.ok) {
+    return { ok: false, reason: geometry?.error, points: [] };
+  }
+
+  const boundary = geometry.boundary;
+  const origin = { lat: geometry.baseStation.lat, lon: geometry.baseStation.lon };
+
+  const topLeft = latLonToLocal(boundary[0], origin);
+  const topRight = latLonToLocal(boundary[1], origin);
+  const bottomRight = latLonToLocal(boundary[2], origin);
+  const bottomLeft = latLonToLocal(boundary[3], origin);
+
+  const widthM = Math.hypot(bottomLeft.x - topLeft.x, bottomLeft.y - topLeft.y);
+  const requestedSpacing = Number.isFinite(Number(options.coverageWidthM)) && Number(options.coverageWidthM) > 0
+    ? Number(options.coverageWidthM)
+    : 0.75;
+
+  const laneSpacingM = Math.max(0.35, Math.min(widthM, requestedSpacing));
+  const laneCount = Math.max(2, Math.floor(widthM / laneSpacingM) + 1);
+
+  const rawPoints = [];
+  for (let i = 0; i < laneCount; i++) {
+    const t = laneCount === 1 ? 0.5 : i / (laneCount - 1);
+
+    const laneStart = interpolateLocalPoint(topLeft, bottomLeft, t);
+    const laneEnd = interpolateLocalPoint(topRight, bottomRight, t);
+
+    if (i % 2 === 0) {
+      rawPoints.push(localToLatLon(laneStart, origin));
+      rawPoints.push(localToLatLon(laneEnd, origin));
+    } else {
+      rawPoints.push(localToLatLon(laneEnd, origin));
+      rawPoints.push(localToLatLon(laneStart, origin));
+    }
+  }
+
+  const fittedPoints = fitWaypointsToLimit(rawPoints, Math.min(LORA_WIRE.MAX_WAYPOINTS, 48));
+
+  return {
+    ok: true,
+    points: fittedPoints,
+    meta: {
+      mode: 'demo-indoor-snake',
+      laneSpacingM,
+      laneCount,
+      pointCount: fittedPoints.length,
+      laneLengthM: geometry.laneLengthM,
+      laneWidthM: geometry.laneWidthM,
+    },
+  };
+}
+
 function configureActiveArea(baseStation, boundary, cellSizeM, homePoint = null) {
   const cellPlan = resolveInputAreaCellSize(boundary, Number(cellSizeM));
   const capturedHomePoint = normalizeLatLonPoint(homePoint, null)
@@ -4691,10 +4751,12 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
   const allowWeakGps = req.body?.allowWeakGps !== undefined
     ? req.body?.allowWeakGps !== false
     : demoConfig.allowWeakGps;
+
   const startSpotStatus = getDemoSpotGpsStatus(state.demo?.spots?.start, 'Spot A');
   if (!startSpotStatus.ready && !allowWeakGps) {
     return res.status(409).json({ ok: false, error: `Demo path blocked: ${startSpotStatus.reason}` });
   }
+
   const endSpotStatus = getDemoSpotGpsStatus(state.demo?.spots?.end, 'Spot B');
   if (!endSpotStatus.ready && !allowWeakGps) {
     return res.status(409).json({ ok: false, error: `Demo path blocked: ${endSpotStatus.reason}` });
@@ -4703,72 +4765,104 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
   const laneWidthM = Number.isFinite(Number(req.body?.laneWidthM)) && Number(req.body.laneWidthM) > 0
     ? Number(req.body.laneWidthM)
     : demoConfig.laneWidthM;
+
   const cellSizeM = Number.isFinite(Number(req.body?.cellSizeM)) && Number(req.body.cellSizeM) > 0
     ? Number(req.body.cellSizeM)
     : demoConfig.cellSizeM;
+
   const coverageWidthM = Number.isFinite(Number(req.body?.coverageWidthM)) && Number(req.body.coverageWidthM) > 0
     ? Number(req.body.coverageWidthM)
     : demoConfig.coverageWidthM;
-  const saltPct = Number.isFinite(Number(req.body?.saltPct))
-    ? Math.max(0, Math.min(100, Math.round(Number(req.body.saltPct))))
-    : 100;
-  const brinePct = Number.isFinite(Number(req.body?.brinePct))
-    ? Math.max(0, Math.min(100, Math.round(Number(req.body.brinePct))))
-    : 100;
-
-  const geometry = buildDemoBoundaryFromSpots(state.demo?.spots?.start, state.demo?.spots?.end, laneWidthM, demoConfig.minSpotDistanceM);
-  if (!geometry.ok) {
-    return res.status(400).json({ ok: false, error: geometry.error });
-  }
-
-  const configured = configureActiveArea(geometry.baseStation, geometry.boundary, cellSizeM);
-  const path = buildMissionPath({
-    mode: 'goal',
-    startPoint: geometry.start,
-    goalPoint: geometry.goal,
-    saltPct,
-    brinePct,
-    homePoint: geometry.baseStation,
-    returnToBase: true,
-  });
-
-  if (!path.ok) {
-    return res.status(400).json({ ok: false, error: path.reason });
-  }
 
   const configuredPasses = Number.isFinite(Number(req.body?.passes))
     ? Math.max(1, Math.min(5, Math.floor(Number(req.body.passes))))
     : demoConfig.passes;
-  if (configuredPasses > 1 && Array.isArray(state.lastPath) && state.lastPath.length > 0) {
-    const expanded = expandPathWithPasses(state.lastPath, configuredPasses);
-    state.lastPath = expanded.map((point) => ({
-      ...point,
-      salt: saltPct,
-      brine: brinePct,
-    }));
-    publish(WS_EVENT.PATH_UPDATED, {
-      mode: 'demo-shuttle',
-      coverageWidthM: null,
-      points: state.lastPath,
-      meta: {
-        ...(path.meta ?? {}),
-        passes: configuredPasses,
-      },
-    });
+
+  const saltPct = Number.isFinite(Number(req.body?.saltPct))
+    ? Math.max(0, Math.min(100, Math.round(Number(req.body.saltPct))))
+    : 100;
+
+  const brinePct = Number.isFinite(Number(req.body?.brinePct))
+    ? Math.max(0, Math.min(100, Math.round(Number(req.body.brinePct))))
+    : 100;
+
+  const geometry = buildDemoBoundaryFromSpots(
+    state.demo?.spots?.start,
+    state.demo?.spots?.end,
+    laneWidthM,
+    demoConfig.minSpotDistanceM,
+  );
+
+  if (!geometry.ok) {
+    return res.status(400).json({ ok: false, error: geometry.error });
   }
 
+  const cellPlan = resolveInputAreaCellSize(geometry.boundary, Number(cellSizeM));
+
+  state.baseStation = geometry.baseStation;
+  state.homePoint = normalizeLatLonPoint(geometry.baseStation, geometry.baseStation);
+  state.boundary = geometry.boundary;
+  state.coverage = buildCoverageMap(geometry.boundary, cellPlan.effectiveCellSizeM);
+
+  const snake = buildIndoorDemoSnakePath(geometry, {
+    coverageWidthM,
+    passes: configuredPasses,
+  });
+
+  if (!snake.ok) {
+    return res.status(400).json({ ok: false, error: snake.reason });
+  }
+
+  state.homePoint = normalizeLatLonPoint(geometry.baseStation, geometry.baseStation);
+  state.lastPath = snake.points.map((p) => ({
+    ...p,
+    salt: saltPct,
+    brine: brinePct,
+  }));
+
+  state.lastArrows = buildCoverageArrows(state.lastPath, {
+    spacingM: Math.max(1.2, coverageWidthM * 2.2),
+    minArrowSeparationM: Math.max(0.7, coverageWidthM * 1.1),
+    initialOffsetM: Math.min(0.35, Math.max(0.15, coverageWidthM * 0.35)),
+  });
+
+  publish(WS_EVENT.PATH_UPDATED, {
+    mode: 'demo-indoor-snake',
+    coverageWidthM,
+    points: state.lastPath,
+    arrows: state.lastArrows,
+    meta: snake.meta ?? null,
+  });
+
+  db.logEvent(mission.currentId(), EVENT_TYPE.PATH_PLANNED, {
+    mode: 'demo-indoor-snake',
+    pointCount: state.lastPath.length,
+    saltPct,
+    brinePct,
+    coverageWidthM,
+    passes: configuredPasses,
+    allowWeakGps,
+    laneWidthM: geometry.laneWidthM,
+    laneLengthM: geometry.laneLengthM,
+  });
+
   scheduleRuntimeStateSave('demo-mode.path', { immediate: true });
-  res.json({
+  publishSupervision();
+  publishOperator();
+
+  return res.json({
     ok: true,
     demo: {
       ...state.demo,
-      config: demoConfig,
+      config: getDemoConfig(),
       readiness: resolveDemoReadiness(),
     },
     warnings: allowWeakGps && (!startSpotStatus.ready || !endSpotStatus.ready)
       ? [
           'Service override used: demo path was built with weak or unavailable GPS quality.',
-          ...[startSpotStatus, endSpotStatus].filter((status) => !status.ready).map((status) => status.reason),
+          ...[startSpotStatus, endSpotStatus]
+            .filter((status) => !status.ready)
+            .map((status) => status.reason),
         ]
       : [],
     geometry: {
@@ -4778,16 +4872,17 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
       baseStation: geometry.baseStation,
       start: geometry.start,
       goal: geometry.goal,
-      cellSizeM: configured.cellPlan.effectiveCellSizeM,
-      stats: configured.stats,
+      cellSizeM: cellPlan.effectiveCellSizeM,
+      stats: coverageStats(state.coverage),
     },
     path: {
-      mode: 'demo-shuttle',
-      coverageWidthM: null,
+      mode: 'demo-indoor-snake',
+      coverageWidthM,
       passes: configuredPasses,
       pointCount: state.lastPath.length,
       points: state.lastPath,
-      meta: path.meta ?? null,
+      arrows: state.lastArrows,
+      meta: snake.meta ?? null,
     },
   });
 });
@@ -4797,28 +4892,91 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
     return res.status(409).json({ ok: false, error: 'Demo mode is not active' });
   }
 
-  const demoConfig = getDemoConfig();
-  const allowWeakGps = req.body?.allowWeakGps !== undefined
-    ? req.body?.allowWeakGps !== false
-    : demoConfig.allowWeakGps;
+  if (!Array.isArray(state.lastPath) || state.lastPath.length < 2) {
+    return res.status(400).json({ ok: false, error: 'Build path first' });
+  }
+
+  const missionState = currentMissionState();
+  if (![MISSION_STATE.CONFIGURING, MISSION_STATE.PAUSED].includes(missionState)) {
+    return res.status(409).json({
+      ok: false,
+      error: `Demo run requires mission state CONFIGURING or PAUSED, currently ${missionState}`,
+    });
+  }
 
   try {
-    const missionState = currentMissionState();
-    const result = missionState === MISSION_STATE.PAUSED
-      ? await resumeMissionAction('demo-mode.run', {
-          allowWhenDemo: true,
-          allowWeakGps,
-        })
-      : await startMissionAction('demo-mode.run', {
-          allowWhenDemo: true,
-          allowWeakGps,
-        });
-    if (!result.ok) {
-      return res.status(result.status ?? 500).json({ ok: false, error: result.error });
+    const pushed = await pushPathWaypoints(state.lastPath, 'demo-mode.run', { allowWhenDemo: true });
+    if (!pushed.ok) {
+      return res.status(pushed.status ?? 500).json({
+        ok: false,
+        error: pushed.error ?? 'Waypoint push failed',
+        readiness: resolveDemoReadiness(),
+        lora: bridge.getStatus(),
+      });
     }
-    return res.json({ ok: true, mission: result.mission, allowWeakGps, readiness: resolveDemoReadiness(), lora: bridge.getStatus() });
+
+    const demoOn = await bridge.sendCommand('DEMOON', {
+      waitForAck: false,
+      commandSource: 'demo-mode.run',
+    });
+    if (!demoOn.ok) {
+      return res.status(demoOn.status ?? 500).json({
+        ok: false,
+        error: demoOn.error ?? 'Failed to enable indoor demo mode on robot',
+        readiness: resolveDemoReadiness(),
+        lora: bridge.getStatus(),
+      });
+    }
+
+    const auto = await bridge.sendCommand(CMD.AUTO, {
+      waitForAck: false,
+      commandSource: 'demo-mode.run',
+    });
+    if (!auto.ok) {
+      return res.status(auto.status ?? 500).json({
+        ok: false,
+        error: auto.error ?? 'Failed to send AUTO',
+        readiness: resolveDemoReadiness(),
+        lora: bridge.getStatus(),
+      });
+    }
+
+    const current = missionState === MISSION_STATE.PAUSED
+      ? mission.resume()
+      : mission.start();
+
+    state.automation = {
+      ...state.automation,
+      enabled: false,
+      scheduledRunAt: null,
+      label: null,
+      lastTriggeredAt: Date.now(),
+      lastResult: 'demo indoor run started',
+      lastError: null,
+    };
+
+    scheduleRuntimeStateSave('demo-mode.run', { immediate: true });
+    publishSupervision();
+    publishOperator();
+
+    return res.json({
+      ok: true,
+      mission: current,
+      readiness: resolveDemoReadiness(),
+      lora: bridge.getStatus(),
+      path: {
+        mode: 'demo-indoor-snake',
+        pointCount: state.lastPath.length,
+      },
+      commands: ['WPCLEAR/WPLOAD', 'DEMOON', 'AUTO'],
+    });
   } catch (err) {
-    return res.status(400).json({ ok: false, error: err.message, readiness: resolveDemoReadiness(), lora: bridge.getStatus() });
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      readiness: resolveDemoReadiness(),
+      lora: bridge.getStatus(),
+    });
   }
 });
 
