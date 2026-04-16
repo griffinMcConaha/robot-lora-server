@@ -98,6 +98,7 @@ async function getJson(url) {
 function createMockBaseStation(port = BASE_PORT, options = {}) {
   const commands = [];
   const sockets = new Set();
+  let lastLoRa = '';
   const getStatus = typeof options.getStatus === 'function'
     ? options.getStatus
     : (() => ({ ok: true, queue_depth: 0 }));
@@ -108,6 +109,23 @@ function createMockBaseStation(port = BASE_PORT, options = {}) {
       req.on('end', () => {
         const body = Buffer.concat(chunks).toString('utf8');
         commands.push(body);
+
+        const trimmed = body.trim();
+        if (trimmed === 'WPCLEAR') {
+          lastLoRa = 'ACK:WPCLEAR';
+        } else if (trimmed.startsWith('WPB:')) {
+          const parts = trimmed.split(':');
+          const startIdx = parts[1] ?? '0';
+          const batchPayload = parts.slice(2).join(':');
+          const batchCount = batchPayload
+            ? batchPayload.split(';').filter(Boolean).length
+            : 0;
+          lastLoRa = `ACK:WPB:${startIdx}:${batchCount}`;
+        } else if (trimmed.startsWith('WPLOAD:')) {
+          const count = trimmed.split(':')[1] ?? '0';
+          lastLoRa = `ACK:WPLOAD:${count}`;
+        }
+
         res.writeHead(200, { 'content-type': 'text/plain' });
         res.end('OK');
       });
@@ -122,7 +140,7 @@ function createMockBaseStation(port = BASE_PORT, options = {}) {
 
     if (req.method === 'GET' && req.url === '/last_lora') {
       res.writeHead(200, { 'content-type': 'text/plain' });
-      res.end(typeof options.getLastLoRa === 'function' ? options.getLastLoRa() : '');
+      res.end(typeof options.getLastLoRa === 'function' ? options.getLastLoRa() : lastLoRa);
       return;
     }
 
@@ -332,6 +350,100 @@ test('Command dispatch fails over to alternate base station candidates', async (
       timeoutMs: 1000,
       intervalMs: 20,
       label: 'failover base command F',
+    });
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Building a demo path auto-commits its waypoints', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-demo-path-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    TELEMETRY_FAILSAFE_ENABLED: '0',
+    GEOFENCE_FAILSAFE_ENABLED: '0',
+    GPS_READY_MIN_SAT: '1',
+    GPS_READY_MAX_HDOP: '5',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/demo-mode`, {
+        enabled: true,
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'PAUSE',
+        gps: { lat: 41.0, lon: -81.0, fix: 1, sat: 8, hdop: 0.9 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 0.0, pitch: 0.0 },
+        disp: { salt: 20, brine: 30 },
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/demo-mode/spot`, {
+        kind: 'start',
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'PAUSE',
+        gps: { lat: 41.00012, lon: -80.9998, fix: 1, sat: 8, hdop: 0.9 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 10.0, pitch: 0.0 },
+        disp: { salt: 20, brine: 30 },
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/demo-mode/spot`, {
+        kind: 'end',
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res, json, text } = await postJson(`${SERVER_URL}/api/demo-mode/path`, {
+        source: 'test-suite',
+        saltPct: 25,
+        brinePct: 75,
+      });
+      assert.equal(res.status, 200, `expected demo path build to succeed, got ${res.status}: ${text}`);
+      assert.equal(json.ok, true);
+      assert.ok(json.path.pointCount >= 2);
+      assert.equal(json.demo.readiness.wpPushState, 'committed');
+      assert.equal(json.waypointPush?.ok, true);
+    }
+
+    await waitForCondition(() => base.commands.includes('WPCLEAR'), {
+      timeoutMs: 1000,
+      intervalMs: 20,
+      label: 'demo path WPCLEAR',
+    });
+
+    await waitForCondition(() => base.commands.some((command) => command.startsWith('WPLOAD:')), {
+      timeoutMs: 1000,
+      intervalMs: 20,
+      label: 'demo path WPLOAD',
     });
   } finally {
     await server.stop();

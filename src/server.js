@@ -878,6 +878,7 @@ function resolveDemoReadiness() {
   const missionState = currentMissionState();
   const gpsStatus = getRobotGpsStatus();
   const demoStatuses = getDemoSpotStatuses();
+  const demoConfig = getDemoConfig();
   const hasStart = Boolean(state.demo?.spots?.start);
   const hasEnd = Boolean(state.demo?.spots?.end);
   const hasPath = Array.isArray(state.lastPath) && state.lastPath.length > 0;
@@ -895,13 +896,13 @@ function resolveDemoReadiness() {
   }
   if (!hasStart) blockers.push('Spot A is not marked');
   if (!hasEnd) blockers.push('Spot B is not marked');
-  if (hasStart && !demoStatuses.start.ready) blockers.push(demoStatuses.start.reason ?? 'Spot A GPS is not ready');
-  if (hasEnd && !demoStatuses.end.ready) blockers.push(demoStatuses.end.reason ?? 'Spot B GPS is not ready');
+  if (hasStart && !demoStatuses.start.ready && !demoConfig.allowWeakGps) blockers.push(demoStatuses.start.reason ?? 'Spot A GPS is not ready');
+  if (hasEnd && !demoStatuses.end.ready && !demoConfig.allowWeakGps) blockers.push(demoStatuses.end.reason ?? 'Spot B GPS is not ready');
   if (!hasPath) blockers.push('No demo path has been built');
   if (wpPushState !== 'committed' && hasPath && !remoteWaypointCommitted.ok) {
     blockers.push(`Waypoints are ${wpPushState}, not committed`);
   }
-  if (!gpsStatus.ready) blockers.push(gpsStatus.reason ?? 'Robot GPS is not ready');
+  if (!gpsStatus.ready && !demoConfig.allowWeakGps) blockers.push(gpsStatus.reason ?? 'Robot GPS is not ready');
   if (missionState !== MISSION_STATE.CONFIGURING && missionState !== MISSION_STATE.PAUSED) {
     blockers.push(`Mission must be CONFIGURING or PAUSED, currently ${missionState}`);
   }
@@ -914,6 +915,7 @@ function resolveDemoReadiness() {
     wpPushState,
     gpsReady: gpsStatus.ready,
     gpsReason: gpsStatus.reason,
+    allowWeakGps: demoConfig.allowWeakGps,
     readyToPlan: Boolean(state.demo?.enabled) && hasStart && hasEnd,
     readyToRun: blockers.length === 0,
     blockers,
@@ -4742,7 +4744,7 @@ app.post(API.DEMO_SPOT, requireApp, (req, res) => {
   res.json({ ok: true, demo: state.demo, spot });
 });
 
-app.post(API.DEMO_PATH, requireApp, (req, res) => {
+app.post(API.DEMO_PATH, requireApp, async (req, res) => {
   if (!state.demo?.enabled) {
     return res.status(409).json({ ok: false, error: 'Demo mode is not active' });
   }
@@ -4803,6 +4805,41 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
   state.homePoint = normalizeLatLonPoint(geometry.baseStation, geometry.baseStation);
   state.boundary = geometry.boundary;
   state.coverage = buildCoverageMap(geometry.boundary, cellPlan.effectiveCellSizeM);
+  const coverageSummary = coverageStats(state.coverage);
+
+  bridge.resetWpState();
+  if (mission.isActive()) {
+    const activeMissionState = mission.publicMission()?.state;
+    if (activeMissionState === MISSION_STATE.CONFIGURING) {
+      try {
+        mission.reset();
+      } catch (_) {
+        // ignore invalid transition if mission was already cleared
+      }
+    } else {
+      try {
+        mission.abort('demo_path_rebuild', buildFinalMissionStats());
+      } catch (_) {
+        // ignore invalid transition if mission already changed
+      }
+      try {
+        mission.reset();
+      } catch (_) {
+        // ignore invalid transition if mission was already reset
+      }
+    }
+  }
+  mission.configure({
+    baseStation: geometry.baseStation,
+    boundary: geometry.boundary,
+    cellSizeM: cellPlan.effectiveCellSizeM,
+  });
+  publish(WS_EVENT.AREA_UPDATED, {
+    baseStation: geometry.baseStation,
+    boundary: geometry.boundary,
+    homePoint: state.homePoint,
+    stats: coverageSummary,
+  });
 
   const snake = buildIndoorDemoSnakePath(geometry, {
     coverageWidthM,
@@ -4846,6 +4883,20 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
     laneLengthM: geometry.laneLengthM,
   });
 
+  const warnings = allowWeakGps && (!startSpotStatus.ready || !endSpotStatus.ready)
+    ? [
+        'Service override used: demo path was built with weak or unavailable GPS quality.',
+        ...[startSpotStatus, endSpotStatus]
+          .filter((status) => !status.ready)
+          .map((status) => status.reason),
+      ]
+    : [];
+
+  const waypointPush = await pushPathWaypoints(state.lastPath, 'demo-mode.path', { allowWhenDemo: true });
+  if (!waypointPush.ok) {
+    warnings.push(`Path built, but waypoint auto-save did not complete: ${waypointPush.error ?? 'unknown transport error'}`);
+  }
+
   scheduleRuntimeStateSave('demo-mode.path', { immediate: true });
   publishSupervision();
   publishOperator();
@@ -4857,14 +4908,19 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
       config: getDemoConfig(),
       readiness: resolveDemoReadiness(),
     },
-    warnings: allowWeakGps && (!startSpotStatus.ready || !endSpotStatus.ready)
-      ? [
-          'Service override used: demo path was built with weak or unavailable GPS quality.',
-          ...[startSpotStatus, endSpotStatus]
-            .filter((status) => !status.ready)
-            .map((status) => status.reason),
-        ]
-      : [],
+    waypointPush: waypointPush.ok
+      ? {
+          ok: true,
+          sent: waypointPush.sent ?? state.lastPath.length,
+          queuedRemote: Boolean(waypointPush.queuedRemote),
+          truncated: Boolean(waypointPush.truncated),
+          totalPoints: waypointPush.totalPoints ?? state.lastPath.length,
+        }
+      : {
+          ok: false,
+          error: waypointPush.error ?? 'waypoint auto-save failed',
+        },
+    warnings,
     geometry: {
       laneWidthM: geometry.laneWidthM,
       laneLengthM: geometry.laneLengthM,
@@ -4873,7 +4929,7 @@ app.post(API.DEMO_PATH, requireApp, (req, res) => {
       start: geometry.start,
       goal: geometry.goal,
       cellSizeM: cellPlan.effectiveCellSizeM,
-      stats: coverageStats(state.coverage),
+      stats: coverageSummary,
     },
     path: {
       mode: 'demo-indoor-snake',
