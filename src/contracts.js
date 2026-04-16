@@ -349,7 +349,7 @@ const WP_COORD_DECIMALS = Math.max(
   4,
   Math.min(6, Number(process.env.LORA_WP_COORD_DECIMALS ?? 5)),
 );
-const WP_USE_SHORT_ALIASES = String(process.env.LORA_WP_USE_SHORT_ALIASES ?? '1') === '1';
+const WP_USE_SHORT_ALIASES = String(process.env.LORA_WP_USE_SHORT_ALIASES ?? '0') === '1';
 
 function formatWaypointWireCoordinate(value, decimals = WP_COORD_DECIMALS) {
   const num = Number(value);

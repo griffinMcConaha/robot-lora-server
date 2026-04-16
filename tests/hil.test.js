@@ -359,6 +359,74 @@ test('Command dispatch fails over to alternate base station candidates', async (
   }
 });
 
+test('Waypoint push can use a configured direct gateway HTTP endpoint', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-direct-gateway-'));
+  const gatewayPort = BASE_PORT + 2;
+  const gatewayUrl = `http://127.0.0.1:${gatewayPort}`;
+  const gateway = createMockBaseStation(gatewayPort);
+  await gateway.start();
+
+  const server = startServer(dataDir, {
+    BASE_STATION_URL: 'http://127.0.0.1:19999',
+    BASE_STATION_CANDIDATES: 'http://127.0.0.1:19999',
+    GATEWAY_DIRECT_URL: gatewayUrl,
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    await postJson(`${SERVER_URL}/api/demo-mode`, {
+      enabled: true,
+      source: 'test-suite',
+    });
+
+    await postJson(`${SERVER_URL}/api/telemetry`, {
+      state: 'PAUSE',
+      gps: { lat: 41.0, lon: -81.0, fix: 1, sat: 8, hdop: 0.9 },
+      motor: { m1: 0, m2: 0 },
+      heading: { yaw: 0.0, pitch: 0.0 },
+      disp: { salt: 20, brine: 30 },
+      prox: { left: 120, right: 118 },
+    });
+    await postJson(`${SERVER_URL}/api/demo-mode/spot`, { kind: 'start', source: 'test-suite' });
+
+    await postJson(`${SERVER_URL}/api/telemetry`, {
+      state: 'PAUSE',
+      gps: { lat: 41.00012, lon: -80.9998, fix: 1, sat: 8, hdop: 0.9 },
+      motor: { m1: 0, m2: 0 },
+      heading: { yaw: 10.0, pitch: 0.0 },
+      disp: { salt: 20, brine: 30 },
+      prox: { left: 120, right: 118 },
+    });
+    await postJson(`${SERVER_URL}/api/demo-mode/spot`, { kind: 'end', source: 'test-suite' });
+
+    const { res, json, text } = await postJson(`${SERVER_URL}/api/demo-mode/path`, {
+      source: 'test-suite',
+      saltPct: 25,
+      brinePct: 75,
+    });
+
+    assert.equal(res.status, 200, `expected direct gateway demo path build to succeed, got ${res.status}: ${text}`);
+    assert.equal(json?.ok, true);
+    assert.equal(json?.waypointPush?.ok, true);
+
+    await waitForCondition(() => gateway.commands.includes(LORA_WIRE.WP_CLEAR), {
+      timeoutMs: 1000,
+      intervalMs: 20,
+      label: 'direct gateway waypoint clear',
+    });
+    await waitForCondition(() => gateway.commands.some((command) => command.startsWith(`${LORA_WIRE.WP_LOAD}:`)), {
+      timeoutMs: 1000,
+      intervalMs: 20,
+      label: 'direct gateway waypoint load',
+    });
+  } finally {
+    await server.stop();
+    await gateway.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('Building a demo path auto-commits its waypoints', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-demo-path-'));
   const base = createMockBaseStation();

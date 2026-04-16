@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "savedAt": 1776309407976,
+  "savedAt": 1776310945488,
   "reason": "startup.reconciled",
   "state": {
     "baseStation": {
@@ -230,8 +230,11 @@
       "notes": []
     },
     "bridge": {
-      "baseStationUrl": "http://192.168.4.1",
+      "baseStationUrl": "http://172.20.10.2",
       "baseStationCandidates": [
+        "http://172.20.10.2",
+        "http://gateway.local",
+        "http://robot-gateway.local",
         "http://192.168.4.1",
         "http://base-station.local"
       ],
@@ -270,6 +273,7 @@
         "lastAck": null,
         "lastAckParsed": null,
         "lastLoRa": null,
+        "gatewayManualUrl": "http://172.20.10.2",
         "discoverySource": "default",
         "mdnsEnabled": true,
         "mdnsNames": [

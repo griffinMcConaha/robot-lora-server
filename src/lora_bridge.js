@@ -56,7 +56,8 @@ const { DATA_DIR } = require('./runtime_state');
 // Config
 // ---------------------------------------------------------------------------
 const BASE_STATION_PERSIST_PATH = path.join(DATA_DIR, 'base_station.json');
-const DEFAULT_BASE_STATION_URL = _normalizeBaseStationUrl(process.env.BASE_STATION_URL ?? 'http://192.168.4.1');
+const DEFAULT_GATEWAY_DIRECT_URL = _normalizeBaseStationUrl(process.env.GATEWAY_DIRECT_URL ?? process.env.MANUAL_GATEWAY_URL ?? '');
+const DEFAULT_BASE_STATION_URL = _normalizeBaseStationUrl(process.env.BASE_STATION_URL || DEFAULT_GATEWAY_DIRECT_URL || 'http://192.168.4.1');
 const BASE_STATION_CANDIDATES = _buildBaseStationCandidates();
 const BASE_STATION_MDNS_ENABLED = String(process.env.BASE_STATION_MDNS_ENABLED ?? '1') !== '0';
 const BASE_STATION_MDNS_TYPE = String(process.env.BASE_STATION_MDNS_TYPE ?? 'http').trim() || 'http';
@@ -119,6 +120,7 @@ let _baseStationSnapshot = {
   lastAck: null,
   lastAckParsed: null,
   lastLoRa: null,
+  gatewayManualUrl: DEFAULT_GATEWAY_DIRECT_URL || null,
   discoverySource: 'configured',
   mdnsEnabled: BASE_STATION_MDNS_ENABLED,
   mdnsNames: BASE_STATION_MDNS_NAMES,
@@ -134,10 +136,15 @@ function _normalizeBaseStationUrl(value) {
 
 function _buildBaseStationCandidates() {
   const raw = [
+    process.env.GATEWAY_DIRECT_URL,
+    process.env.MANUAL_GATEWAY_URL,
     process.env.BASE_STATION_URL,
     ...(typeof process.env.BASE_STATION_CANDIDATES === 'string'
       ? process.env.BASE_STATION_CANDIDATES.split(',')
       : []),
+    'http://172.20.10.2',
+    'http://gateway.local',
+    'http://robot-gateway.local',
     'http://192.168.4.1',
     'http://base-station.local',
   ];
@@ -337,6 +344,9 @@ function _candidateUrls() {
 function _discoverySourceForUrl(url) {
   if (_mdnsServices.has(url)) {
     return 'mdns';
+  }
+  if (url && (url === DEFAULT_GATEWAY_DIRECT_URL || /\/\/((172\.(1[6-9]|2\d|3[0-1])\.)|gateway|robot-gateway)/i.test(url))) {
+    return 'gateway_direct';
   }
   if (url === DEFAULT_BASE_STATION_URL) {
     return 'default';
@@ -541,6 +551,11 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
   const derivedLoraLinkState = typeof payload.lora_link_state === 'string'
     ? payload.lora_link_state
     : (payloadLastLoRa ? 'rx' : _baseStationSnapshot.loraLinkState);
+  const gatewayManualUrl = typeof payload.gateway_manual_url === 'string'
+    ? _normalizeBaseStationUrl(payload.gateway_manual_url)
+    : ((String(payload.mode ?? '').trim().toLowerCase() === 'manual-gateway' || typeof payload.manualReady === 'boolean')
+      ? (meta.selectedUrl ?? _selectedBaseStationUrl)
+      : (_baseStationSnapshot.gatewayManualUrl || DEFAULT_GATEWAY_DIRECT_URL || null));
 
   _baseStationSnapshot = {
     ..._baseStationSnapshot,
@@ -562,6 +577,7 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
     lastAck: derivedLastAck ?? _baseStationSnapshot.lastAck,
     lastAckParsed: parsedAck ?? _baseStationSnapshot.lastAckParsed,
     lastLoRa: payloadLastLoRa ?? _baseStationSnapshot.lastLoRa,
+    gatewayManualUrl,
     discoverySource: meta.discoverySource ?? _baseStationSnapshot.discoverySource,
     mdnsEnabled: BASE_STATION_MDNS_ENABLED,
     mdnsNames: BASE_STATION_MDNS_NAMES,
@@ -1150,6 +1166,7 @@ function getStatus() {
       lastAck: _baseStationSnapshot.lastAck,
       lastAckParsed: _baseStationSnapshot.lastAckParsed,
       lastLoRa: _baseStationSnapshot.lastLoRa,
+      gatewayManualUrl: _baseStationSnapshot.gatewayManualUrl,
       discoverySource: _baseStationSnapshot.discoverySource,
       mdnsEnabled: _baseStationSnapshot.mdnsEnabled,
       mdnsNames: _baseStationSnapshot.mdnsNames,
