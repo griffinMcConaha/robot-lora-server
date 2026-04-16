@@ -427,6 +427,76 @@ test('Waypoint push can use a configured direct gateway HTTP endpoint', async ()
   }
 });
 
+test('Summary treats acknowledged waypoint load as committed', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-waypoint-ack-summary-'));
+  const base = createMockBaseStation(BASE_PORT, {
+    getStatus: () => ({
+      ok: true,
+      queue_depth: 0,
+      last_cmd_status: 'acknowledged',
+      last_lora: `${LORA_WIRE.WP_ACK_LOAD}:8`,
+    }),
+  });
+  await base.start();
+
+  const server = startServer(dataDir);
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    const { res, json } = await getJson(`${SERVER_URL}/api/supervision/summary`);
+    assert.equal(res.status, 200);
+    assert.equal(json?.summary?.lora?.wpPushState, 'committed');
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Demo path still builds when both demo spots overlap', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-demo-overlap-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    TELEMETRY_FAILSAFE_ENABLED: '0',
+    GEOFENCE_FAILSAFE_ENABLED: '0',
+    GPS_READY_MIN_SAT: '1',
+    GPS_READY_MAX_HDOP: '5',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    await postJson(`${SERVER_URL}/api/demo-mode`, { enabled: true, source: 'test-suite' });
+    await postJson(`${SERVER_URL}/api/telemetry`, {
+      state: 'PAUSE',
+      gps: { lat: 41.0, lon: -81.0, fix: 1, sat: 8, hdop: 0.9 },
+      motor: { m1: 0, m2: 0 },
+      heading: { yaw: 0.0, pitch: 0.0 },
+      disp: { salt: 20, brine: 30 },
+      prox: { left: 120, right: 118 },
+    });
+    await postJson(`${SERVER_URL}/api/demo-mode/spot`, { kind: 'start', source: 'test-suite' });
+    await postJson(`${SERVER_URL}/api/demo-mode/spot`, { kind: 'end', source: 'test-suite' });
+
+    const { res, json, text } = await postJson(`${SERVER_URL}/api/demo-mode/path`, {
+      source: 'test-suite',
+      saltPct: 25,
+      brinePct: 75,
+    });
+
+    assert.equal(res.status, 200, `expected overlapping demo spots to still build, got ${res.status}: ${text}`);
+    assert.equal(json?.ok, true);
+    assert.ok(json?.path?.pointCount >= 2);
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('Building a demo path auto-commits its waypoints', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-demo-path-'));
   const base = createMockBaseStation();
@@ -519,6 +589,86 @@ test('Building a demo path auto-commits its waypoints', async () => {
       const batchCommands = base.commands.filter((command) => command.startsWith(`${LORA_WIRE.WP_BATCH}:`));
       assert.ok(batchCommands.length >= 1, 'expected demo waypoint upload to use batched packets');
       assert.ok(batchCommands.length < 6, `expected compact batching, saw ${batchCommands.length} waypoint packets`);
+    }
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Demo spot marking and path build allow weak indoor GPS when coordinates are present', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-demo-weak-gps-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    TELEMETRY_FAILSAFE_ENABLED: '0',
+    GEOFENCE_FAILSAFE_ENABLED: '0',
+    GPS_READY_MIN_SAT: '1',
+    GPS_READY_MAX_HDOP: '5',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/demo-mode`, {
+        enabled: true,
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'PAUSE',
+        gps: { lat: 41.0, lon: -81.0, fix: 0, sat: 0, hdop: 99 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 0.0, pitch: 0.0 },
+        disp: { salt: 20, brine: 30 },
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res, text } = await postJson(`${SERVER_URL}/api/demo-mode/spot`, {
+        kind: 'start',
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200, `expected weak-GPS Spot A mark to succeed, got ${res.status}: ${text}`);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'PAUSE',
+        gps: { lat: 41.00012, lon: -80.9998, fix: 0, sat: 0, hdop: 99 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 10.0, pitch: 0.0 },
+        disp: { salt: 20, brine: 30 },
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res, text } = await postJson(`${SERVER_URL}/api/demo-mode/spot`, {
+        kind: 'end',
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200, `expected weak-GPS Spot B mark to succeed, got ${res.status}: ${text}`);
+    }
+
+    {
+      const { res, json, text } = await postJson(`${SERVER_URL}/api/demo-mode/path`, {
+        source: 'test-suite',
+        saltPct: 25,
+        brinePct: 75,
+      });
+      assert.equal(res.status, 200, `expected weak-GPS demo path build to succeed, got ${res.status}: ${text}`);
+      assert.equal(json.ok, true);
+      assert.ok(json.path.pointCount >= 2);
     }
   } finally {
     await server.stop();

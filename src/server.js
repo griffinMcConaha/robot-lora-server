@@ -107,6 +107,8 @@ const DEMO_OBSTACLE_COOLDOWN_MS = Number(process.env.DEMO_OBSTACLE_COOLDOWN_MS ?
 const DEMO_OBSTACLE_SIDESTEP_MS = Number(process.env.DEMO_OBSTACLE_SIDESTEP_MS ?? 320);
 const RUNTIME_STATE_SAVE_DEBOUNCE_MS = Number(process.env.RUNTIME_STATE_SAVE_DEBOUNCE_MS ?? 750);
 const RUNTIME_STATE_TRAIL_LIMIT = Number(process.env.RUNTIME_STATE_TRAIL_LIMIT ?? 300);
+const MAX_TELEMETRY_JUMP_METERS = Number(process.env.MAX_TELEMETRY_JUMP_METERS ?? 80);
+const MIN_TRAIL_POINT_SEPARATION_M = Number(process.env.MIN_TRAIL_POINT_SEPARATION_M ?? 1.5);
 const COMMAND_HISTORY_LIMIT = Number(process.env.COMMAND_HISTORY_LIMIT ?? 50);
 const REMOTE_BASE_STATION_STALE_MS = Number(process.env.REMOTE_BASE_STATION_STALE_MS ?? 15000);
 const REMOTE_COMMAND_MAX_QUEUE = Number(process.env.REMOTE_COMMAND_MAX_QUEUE ?? Math.max(LORA_WIRE.MAX_WAYPOINTS + 8, 1024));
@@ -688,6 +690,32 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isFiniteCoordinate(value, min, max) {
+  const num = Number(value);
+  return Number.isFinite(num) && num >= min && num <= max;
+}
+
+function isValidLatLonPoint(point) {
+  return Boolean(point)
+    && isFiniteCoordinate(point.lat, -90, 90)
+    && isFiniteCoordinate(point.lon, -180, 180);
+}
+
+function estimatePointDistanceMeters(a, b) {
+  if (!isValidLatLonPoint(a) || !isValidLatLonPoint(b)) return Number.POSITIVE_INFINITY;
+  const toRadians = (degrees) => (Number(degrees) * Math.PI) / 180;
+  const earthRadiusM = 6371000;
+  const dLat = toRadians(Number(b.lat) - Number(a.lat));
+  const dLon = toRadians(Number(b.lon) - Number(a.lon));
+  const lat1 = toRadians(a.lat);
+  const lat2 = toRadians(b.lat);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLon = Math.sin(dLon / 2);
+  const haversine = (sinLat * sinLat)
+    + Math.cos(lat1) * Math.cos(lat2) * (sinLon * sinLon);
+  return 2 * earthRadiusM * Math.atan2(Math.sqrt(haversine), Math.sqrt(Math.max(0, 1 - haversine)));
+}
+
 function createCommandId() {
   return `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -800,7 +828,9 @@ function resolveGpsFailsafeAction() {
   return CMD.PAUSE;
 }
 
-function getRobotGpsStatus(robot = state.robot) {
+function getRobotGpsStatus(robot = state.robot, options = {}) {
+  const allowWeakGps = options?.allowWeakGps === true;
+
   if (!robot) {
     return { ready: false, reason: 'Robot telemetry is unavailable' };
   }
@@ -809,6 +839,10 @@ function getRobotGpsStatus(robot = state.robot) {
   const lon = Number(robot.lon ?? robot.longitude);
   if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
     return { ready: false, reason: 'Robot GPS position is unavailable' };
+  }
+
+  if (allowWeakGps) {
+    return { ready: true, reason: null };
   }
 
   const ageMs = Number.isFinite(Number(robot.ageMs))
@@ -847,7 +881,8 @@ function getDemoSpotGpsStatus(spot, label) {
   if (!robot) {
     return { ready: false, reason: `${label} has no saved robot telemetry` };
   }
-  const gpsStatus = getRobotGpsStatus(robot);
+  const demoConfig = getDemoConfig();
+  const gpsStatus = getRobotGpsStatus(robot, { allowWeakGps: demoConfig.allowWeakGps });
   if (gpsStatus.ready) {
     return gpsStatus;
   }
@@ -895,9 +930,9 @@ function getDemoConfig() {
 
 function resolveDemoReadiness() {
   const missionState = currentMissionState();
-  const gpsStatus = getRobotGpsStatus();
-  const demoStatuses = getDemoSpotStatuses();
   const demoConfig = getDemoConfig();
+  const gpsStatus = getRobotGpsStatus(state.robot, { allowWeakGps: demoConfig.allowWeakGps });
+  const demoStatuses = getDemoSpotStatuses();
   const hasStart = Boolean(state.demo?.spots?.start);
   const hasEnd = Boolean(state.demo?.spots?.end);
   const hasPath = Array.isArray(state.lastPath) && state.lastPath.length > 0;
@@ -1336,9 +1371,24 @@ function isRemoteWaypointPushLikelyCommitted(now = Date.now()) {
 }
 
 function resolveWaypointPushState(now = Date.now()) {
-  const localState = bridge.getStatus().wpPushState ?? 'none';
+  const bridgeStatus = bridge.getStatus();
+  const localState = bridgeStatus.wpPushState ?? 'none';
   if (localState === 'committed' || localState === 'pending' || localState === 'failed') {
     return localState;
+  }
+
+  const localAck = bridgeStatus.baseStation?.lastAckParsed ?? null;
+  const localLastCmd = String(bridgeStatus.lastCmd ?? bridgeStatus.baseStation?.lastCmd ?? '').trim().toUpperCase();
+  const localLastStatus = normalizeRemoteTrackedStatus(bridgeStatus.baseStation?.lastCmdStatus ?? null);
+  const sawLocalWaypointLoad = localAck?.category === 'waypoint_load'
+    || localLastCmd.startsWith(`${LORA_WIRE.WP_LOAD}:`);
+  const localWaypointAccepted = localLastStatus == null
+    || localLastStatus === COMMAND_STATUS.ACKNOWLEDGED
+    || localLastStatus === COMMAND_STATUS.APPLIED
+    || localLastStatus === COMMAND_STATUS.FORWARDED;
+
+  if (sawLocalWaypointLoad && localWaypointAccepted) {
+    return 'committed';
   }
 
   const remoteFallback = getRemoteCommandFallbackReadiness(now);
@@ -1964,7 +2014,7 @@ function buildConnectionState(now = Date.now()) {
       needed: missionRecoveryNeeded,
       reason: missionRecoveryReason,
       lastPathPoints: hasRecoverablePath ? state.lastPath.length : 0,
-      wpPushState: bridgeStatus.wpPushState ?? null,
+      wpPushState: effectiveWpPushState,
       robotState: state.robot?.state ?? null,
     },
   };
@@ -2065,9 +2115,13 @@ function buildSupervisionSummary() {
   const demoReadiness = resolveDemoReadiness();
   const demoConfig = getDemoConfig();
   const loraStatus = bridge.getStatus();
+  const effectiveWpPushState = resolveWaypointPushState(now);
   return {
     mission: mission.publicMission(),
-    lora: bridge.getStatus(),
+    lora: {
+      ...loraStatus,
+      wpPushState: effectiveWpPushState,
+    },
     robot: state.robot
       ? {
           lat: state.robot.lat,
@@ -2729,15 +2783,48 @@ function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0, minSpo
 
   const origin = { lat: start.lat, lon: start.lon };
   const startLocal = latLonToLocal({ lat: start.lat, lon: start.lon }, origin);
-  const endLocal = latLonToLocal({ lat: end.lat, lon: end.lon }, origin);
-  const dx = endLocal.x - startLocal.x;
-  const dy = endLocal.y - startLocal.y;
-  const length = Math.hypot(dx, dy);
+  let endLocal = latLonToLocal({ lat: end.lat, lon: end.lon }, origin);
+  let dx = endLocal.x - startLocal.x;
+  let dy = endLocal.y - startLocal.y;
+  let length = Math.hypot(dx, dy);
+  let fallbackUsed = false;
+  let fallbackReason = null;
+
   if (!Number.isFinite(length) || length < minSpotDistanceM) {
-    return {
-      ok: false,
-      error: `Demo spots are too close together to build a demo lane (minimum ${minSpotDistanceM.toFixed(2)} m)`,
+    const headingDeg = Number.isFinite(Number(end?.heading))
+      ? Number(end.heading)
+      : (Number.isFinite(Number(start?.heading)) ? Number(start.heading) : null);
+    let dirX = 1;
+    let dirY = 0;
+
+    if (headingDeg !== null) {
+      const headingRad = (headingDeg * Math.PI) / 180;
+      dirX = Math.cos(headingRad);
+      dirY = Math.sin(headingRad);
+    } else {
+      const preservedBaseStation = normalizeLatLonPoint(anchorBaseStation, null);
+      if (preservedBaseStation) {
+        const baseLocal = latLonToLocal(preservedBaseStation, origin);
+        const awayX = startLocal.x - baseLocal.x;
+        const awayY = startLocal.y - baseLocal.y;
+        const awayLen = Math.hypot(awayX, awayY);
+        if (Number.isFinite(awayLen) && awayLen > 0.05) {
+          dirX = awayX / awayLen;
+          dirY = awayY / awayLen;
+        }
+      }
+    }
+
+    const fallbackLengthM = Math.max(minSpotDistanceM, 1.25);
+    endLocal = {
+      x: startLocal.x + dirX * fallbackLengthM,
+      y: startLocal.y + dirY * fallbackLengthM,
     };
+    dx = endLocal.x - startLocal.x;
+    dy = endLocal.y - startLocal.y;
+    length = Math.hypot(dx, dy);
+    fallbackUsed = true;
+    fallbackReason = 'Demo spots overlapped, so a short forward demo lane was generated automatically';
   }
 
   const dirX = dx / length;
@@ -2758,14 +2845,18 @@ function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0, minSpo
 
   const preservedBaseStation = normalizeLatLonPoint(anchorBaseStation, null) ?? { lat: start.lat, lon: start.lon };
 
+  const resolvedGoal = localToLatLon(endLocal, origin);
+
   return {
     ok: true,
     baseStation: { lat: preservedBaseStation.lat, lon: preservedBaseStation.lon },
     start: { lat: start.lat, lon: start.lon },
-    goal: { lat: end.lat, lon: end.lon },
+    goal: { lat: resolvedGoal.lat, lon: resolvedGoal.lon },
     boundary: cornersLocal.map((point) => localToLatLon(point, origin)),
     laneWidthM: halfWidth * 2,
     laneLengthM: length,
+    fallbackUsed,
+    warning: fallbackReason,
   };
 }
 
@@ -3393,13 +3484,13 @@ async function startMissionAction(source = 'mission.start', options = {}) {
     return { ok: false, status: 409, error: `Mission start blocked: ${gpsStatus.reason}` };
   }
 
-  const loraStatus = bridge.getStatus();
-  if (loraStatus.wpPushState !== 'committed' && state.lastPath && state.lastPath.length > 0) {
+  const effectiveWpPushState = resolveWaypointPushState();
+  if ((effectiveWpPushState === 'none' || effectiveWpPushState === 'failed') && state.lastPath && state.lastPath.length > 0) {
     const pushed = await pushPathWaypoints(null, source, { allowWhenDemo });
     if (!pushed.ok) return pushed;
   }
 
-  if (bridge.getStatus().wpPushState !== 'committed') {
+  if (resolveWaypointPushState() !== 'committed') {
     const remoteWaypointCommitted = isRemoteWaypointPushLikelyCommitted();
     if (!remoteWaypointCommitted.ok) {
       return {
@@ -3469,7 +3560,7 @@ async function resumeMissionAction(source = 'mission.resume', options = {}) {
   if (state.robot && !gpsStatus.ready && !allowWeakGps) {
     return { ok: false, status: 409, error: `Mission resume blocked: ${gpsStatus.reason}` };
   }
-  if (bridge.getStatus().wpPushState !== 'committed') {
+  if (resolveWaypointPushState() !== 'committed') {
     const remoteWaypointCommitted = isRemoteWaypointPushLikelyCommitted();
     if (!remoteWaypointCommitted.ok) {
       return {
@@ -4526,9 +4617,17 @@ async function ingestParsedTelemetry(parsed) {
     return { ok: true, fault: parsed.fault, action: parsed.action };
   }
 
+  const previousRobotPoint = isValidLatLonPoint(state.robot)
+    ? { lat: Number(state.robot.lat), lon: Number(state.robot.lon) }
+    : null;
+  const nextRobotPoint = { lat: Number(parsed.robot.lat), lon: Number(parsed.robot.lon) };
+  const positionValid = isValidLatLonPoint(nextRobotPoint);
+  const jumpMeters = previousRobotPoint ? estimatePointDistanceMeters(previousRobotPoint, nextRobotPoint) : 0;
+  const positionAccepted = positionValid && (!previousRobotPoint || jumpMeters <= MAX_TELEMETRY_JUMP_METERS);
+
   state.robot = {
-    lat: parsed.robot.lat,
-    lon: parsed.robot.lon,
+    lat: positionAccepted ? nextRobotPoint.lat : (previousRobotPoint?.lat ?? nextRobotPoint.lat),
+    lon: positionAccepted ? nextRobotPoint.lon : (previousRobotPoint?.lon ?? nextRobotPoint.lon),
     heading: parsed.robot.heading,
     speed: parsed.robot.speed,
     motor: parsed.robot.motor ?? state.robot?.motor ?? null,
@@ -4558,13 +4657,23 @@ async function ingestParsedTelemetry(parsed) {
     faultRecovered: ![ROBOT_STATE.ESTOP, ROBOT_STATE.ERROR].includes(state.robot.state),
   });
 
-  state.trail.push({ lat: state.robot.lat, lon: state.robot.lon, t: state.robot.timestampMs });
-  if (state.trail.length > 5000) {
-    state.trail = state.trail.slice(-5000);
+  if (positionAccepted) {
+    const nextTrailEntry = { lat: state.robot.lat, lon: state.robot.lon, t: state.robot.timestampMs };
+    const lastTrailEntry = Array.isArray(state.trail) && state.trail.length > 0
+      ? state.trail[state.trail.length - 1]
+      : null;
+    const trailSeparationM = lastTrailEntry ? estimatePointDistanceMeters(lastTrailEntry, nextTrailEntry) : Number.POSITIVE_INFINITY;
+
+    if (!lastTrailEntry || trailSeparationM >= MIN_TRAIL_POINT_SEPARATION_M) {
+      state.trail.push(nextTrailEntry);
+      if (state.trail.length > 5000) {
+        state.trail = state.trail.slice(-5000);
+      }
+    }
   }
 
   let stats = null;
-  if (state.coverage) {
+  if (state.coverage && positionAccepted) {
     markCoverage(state.coverage, state.robot, resolveCoverageMarkRadiusM(), state.robot.timestampMs);
     stats = coverageStats(state.coverage);
   }
@@ -4813,7 +4922,11 @@ app.post(API.DEMO_SPOT, requireApp, (req, res) => {
   if (!['start', 'end'].includes(kind)) {
     return res.status(400).json({ ok: false, error: 'kind must be start or end' });
   }
-  const gpsStatus = getRobotGpsStatus();
+  const demoConfig = getDemoConfig();
+  const allowWeakGps = req.body?.allowWeakGps !== undefined
+    ? req.body?.allowWeakGps !== false
+    : demoConfig.allowWeakGps;
+  const gpsStatus = getRobotGpsStatus(state.robot, { allowWeakGps });
   if (!gpsStatus.ready) {
     return res.status(409).json({ ok: false, error: `Cannot mark ${kind === 'start' ? 'Spot A' : 'Spot B'}: ${gpsStatus.reason}` });
   }
