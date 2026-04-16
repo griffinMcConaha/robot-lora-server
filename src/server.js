@@ -4950,10 +4950,27 @@ app.post(API.DEMO_PATH, requireApp, async (req, res) => {
       ]
     : [];
 
-  const waypointPush = await pushPathWaypoints(state.lastPath, 'demo-mode.path', { allowWhenDemo: true });
-  if (!waypointPush.ok) {
-    warnings.push(`Path built, but waypoint auto-save did not complete: ${waypointPush.error ?? 'unknown transport error'}`);
-  }
+  const waypointPush = {
+    ok: true,
+    pending: true,
+    sent: 0,
+    queuedRemote: false,
+    truncated: false,
+    totalPoints: state.lastPath.length,
+  };
+
+  void pushPathWaypoints(state.lastPath, 'demo-mode.path', { allowWhenDemo: true })
+    .then((result) => {
+      if (!result.ok) {
+        console.warn('[DEMO] waypoint auto-save did not complete:', result.error ?? 'unknown transport error');
+      }
+      scheduleRuntimeStateSave(result.queuedRemote ? 'demo-mode.path.remote_queued' : 'demo-mode.path.autosave', { immediate: true });
+      publishSupervision();
+      publishOperator();
+    })
+    .catch((error) => {
+      console.warn('[DEMO] waypoint auto-save crashed:', error?.message ?? error);
+    });
 
   scheduleRuntimeStateSave('demo-mode.path', { immediate: true });
   publishSupervision();
@@ -4969,6 +4986,7 @@ app.post(API.DEMO_PATH, requireApp, async (req, res) => {
     waypointPush: waypointPush.ok
       ? {
           ok: true,
+          pending: true,
           sent: waypointPush.sent ?? state.lastPath.length,
           queuedRemote: Boolean(waypointPush.queuedRemote),
           truncated: Boolean(waypointPush.truncated),
@@ -4976,7 +4994,7 @@ app.post(API.DEMO_PATH, requireApp, async (req, res) => {
         }
       : {
           ok: false,
-          error: waypointPush.error ?? 'waypoint auto-save failed',
+          error: 'waypoint auto-save failed',
         },
     warnings,
     geometry: {
