@@ -804,6 +804,23 @@ function getRobotGpsStatus(robot = state.robot) {
   if (!robot) {
     return { ready: false, reason: 'Robot telemetry is unavailable' };
   }
+
+  const lat = Number(robot.lat ?? robot.latitude);
+  const lon = Number(robot.lon ?? robot.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+    return { ready: false, reason: 'Robot GPS position is unavailable' };
+  }
+
+  const ageMs = Number.isFinite(Number(robot.ageMs))
+    ? Number(robot.ageMs)
+    : (Number.isFinite(Number(robot.timestampMs)) ? Math.max(0, Date.now() - Number(robot.timestampMs)) : null);
+  if (robot.stale === true || (Number.isFinite(ageMs) && ageMs > SUPERVISION_TELEMETRY_STALE_MS)) {
+    return {
+      ready: false,
+      reason: `Robot telemetry is stale${Number.isFinite(ageMs) ? ` (${Math.round(ageMs)} ms old)` : ''}`,
+    };
+  }
+
   if (!robot.gpsFix) {
     return { ready: false, reason: 'Robot GPS fix is not available' };
   }
@@ -2696,7 +2713,7 @@ function markDemoSpot(kind, note = null, source = 'operator') {
   return spot;
 }
 
-function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0, minSpotDistanceM = DEMO_MIN_SPOT_DISTANCE_M) {
+function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0, minSpotDistanceM = DEMO_MIN_SPOT_DISTANCE_M, anchorBaseStation = null) {
   const start = startSpot?.robot;
   const end = endSpot?.robot;
   if (
@@ -2739,9 +2756,11 @@ function buildDemoBoundaryFromSpots(startSpot, endSpot, laneWidthM = 3.0, minSpo
     { x: startLocal.x - tailX - perpX * halfWidth, y: startLocal.y - tailY - perpY * halfWidth },
   ];
 
+  const preservedBaseStation = normalizeLatLonPoint(anchorBaseStation, null) ?? { lat: start.lat, lon: start.lon };
+
   return {
     ok: true,
-    baseStation: { lat: start.lat, lon: start.lon },
+    baseStation: { lat: preservedBaseStation.lat, lon: preservedBaseStation.lon },
     start: { lat: start.lat, lon: start.lon },
     goal: { lat: end.lat, lon: end.lon },
     boundary: cornersLocal.map((point) => localToLatLon(point, origin)),
@@ -4794,6 +4813,10 @@ app.post(API.DEMO_SPOT, requireApp, (req, res) => {
   if (!['start', 'end'].includes(kind)) {
     return res.status(400).json({ ok: false, error: 'kind must be start or end' });
   }
+  const gpsStatus = getRobotGpsStatus();
+  if (!gpsStatus.ready) {
+    return res.status(409).json({ ok: false, error: `Cannot mark ${kind === 'start' ? 'Spot A' : 'Spot B'}: ${gpsStatus.reason}` });
+  }
   const note = typeof req.body?.note === 'string' ? req.body.note : null;
   const source = typeof req.body?.source === 'string' && req.body.source.trim()
     ? req.body.source.trim()
@@ -4851,6 +4874,7 @@ app.post(API.DEMO_PATH, requireApp, async (req, res) => {
     state.demo?.spots?.end,
     laneWidthM,
     demoConfig.minSpotDistanceM,
+    state.baseStation ?? state.homePoint ?? state.remoteBaseStation ?? null,
   );
 
   if (!geometry.ok) {
@@ -4950,27 +4974,30 @@ app.post(API.DEMO_PATH, requireApp, async (req, res) => {
       ]
     : [];
 
-  const waypointPush = {
-    ok: true,
-    pending: true,
-    sent: 0,
-    queuedRemote: false,
-    truncated: false,
-    totalPoints: state.lastPath.length,
-  };
+  const waypointPushPromise = pushPathWaypoints(state.lastPath, 'demo-mode.path', { allowWhenDemo: true })
+    .catch((error) => ({ ok: false, status: 500, error: error?.message ?? String(error ?? 'unknown transport error') }));
 
-  void pushPathWaypoints(state.lastPath, 'demo-mode.path', { allowWhenDemo: true })
-    .then((result) => {
-      if (!result.ok) {
-        console.warn('[DEMO] waypoint auto-save did not complete:', result.error ?? 'unknown transport error');
-      }
-      scheduleRuntimeStateSave(result.queuedRemote ? 'demo-mode.path.remote_queued' : 'demo-mode.path.autosave', { immediate: true });
-      publishSupervision();
-      publishOperator();
-    })
-    .catch((error) => {
-      console.warn('[DEMO] waypoint auto-save crashed:', error?.message ?? error);
-    });
+  const waypointPush = await Promise.race([
+    waypointPushPromise,
+    sleep(4000).then(() => null),
+  ]);
+
+  if (!waypointPush) {
+    waypointPushPromise
+      .then((result) => {
+        if (!result.ok) {
+          console.warn('[DEMO] waypoint auto-save did not complete:', result.error ?? 'unknown transport error');
+        }
+        scheduleRuntimeStateSave(result.queuedRemote ? 'demo-mode.path.remote_queued' : 'demo-mode.path.autosave', { immediate: true });
+        publishSupervision();
+        publishOperator();
+      })
+      .catch((error) => {
+        console.warn('[DEMO] waypoint auto-save crashed:', error?.message ?? error);
+      });
+  } else if (!waypointPush.ok) {
+    warnings.push(`Path built, but waypoint auto-save did not complete: ${waypointPush.error ?? 'unknown transport error'}`);
+  }
 
   scheduleRuntimeStateSave('demo-mode.path', { immediate: true });
   publishSupervision();
@@ -4983,19 +5010,27 @@ app.post(API.DEMO_PATH, requireApp, async (req, res) => {
       config: getDemoConfig(),
       readiness: resolveDemoReadiness(),
     },
-    waypointPush: waypointPush.ok
+    waypointPush: waypointPush && waypointPush.ok
       ? {
           ok: true,
-          pending: true,
           sent: waypointPush.sent ?? state.lastPath.length,
           queuedRemote: Boolean(waypointPush.queuedRemote),
           truncated: Boolean(waypointPush.truncated),
           totalPoints: waypointPush.totalPoints ?? state.lastPath.length,
         }
-      : {
-          ok: false,
-          error: 'waypoint auto-save failed',
-        },
+      : waypointPush
+        ? {
+            ok: false,
+            error: waypointPush.error ?? 'waypoint auto-save failed',
+          }
+        : {
+            ok: true,
+            pending: true,
+            sent: 0,
+            queuedRemote: false,
+            truncated: false,
+            totalPoints: state.lastPath.length,
+          },
     warnings,
     geometry: {
       laneWidthM: geometry.laneWidthM,
