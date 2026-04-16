@@ -345,22 +345,44 @@ const API = Object.freeze({
 //   On firmware side, RESET over LoRa transitions to STATE_PAUSE
 //   (same as console RESET command).
 // ---------------------------------------------------------------------------
+const WP_COORD_DECIMALS = Math.max(
+  4,
+  Math.min(6, Number(process.env.LORA_WP_COORD_DECIMALS ?? 5)),
+);
+const WP_USE_SHORT_ALIASES = String(process.env.LORA_WP_USE_SHORT_ALIASES ?? '1') === '1';
+
+function formatWaypointWireCoordinate(value, decimals = WP_COORD_DECIMALS) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '0';
+
+  let text = num.toFixed(decimals)
+    .replace(/(\.\d*?[1-9])0+$/u, '$1')
+    .replace(/\.0+$/u, '');
+
+  if (text === '-0') return '0';
+  if (text.startsWith('0.') && text.length > 1) return text.slice(1);
+  if (text.startsWith('-0.') && text.length > 2) return `-${text.slice(2)}`;
+  return text;
+}
+
 /** @readonly */
 const LORA_WIRE = Object.freeze({
   // Waypoint injection protocol
-  WP_CLEAR:   'WPCLEAR',          // clear staged waypoints
-  WP_ADD:     'WP',               // WP:<idx>:<lat>,<lon>,<salt%>,<brine%>
-  WP_BATCH:   'WPB',              // WPB:<start_idx>:<lat>,<lon>,<salt>,<brine>[;...]
-  WP_LOAD:    'WPLOAD',           // WPLOAD:<count>  — commit + arm auto mode
+  WP_CLEAR:   WP_USE_SHORT_ALIASES ? 'WC' : 'WPCLEAR',  // clear staged waypoints
+  WP_ADD:     WP_USE_SHORT_ALIASES ? 'W' : 'WP',        // WP:<idx>:<lat>,<lon>,<salt%>,<brine%>
+  WP_BATCH:   WP_USE_SHORT_ALIASES ? 'WB' : 'WPB',      // WPB:<start_idx>:<lat>,<lon>,<salt>,<brine>[;...]
+  WP_LOAD:    WP_USE_SHORT_ALIASES ? 'WL' : 'WPLOAD',   // WPLOAD:<count>  — commit + arm auto mode
   WP_ACK_CLEAR: 'ACK:WPCLEAR',
   WP_ACK_ADD:   'ACK:WP',         // prefix; full frame: ACK:WP:<idx>
   WP_ACK_BATCH: 'ACK:WPB',        // prefix; full frame: ACK:WPB:<start_idx>:<count>
   WP_ACK_LOAD:  'ACK:WPLOAD',     // prefix; full frame: ACK:WPLOAD:<count>
   MAX_WAYPOINTS: 120,             // matches firmware MAX_WAYPOINTS
+  WP_COORD_DECIMALS,
+  WP_USE_SHORT_ALIASES,
 
   // Inter-line delay for sequential WP commands (ms)
-  // Tuned for faster commit while still giving gateway/base-station queue headroom.
-  WP_INTERLINE_MS: 35,
+  // Tuned for faster commit while still keeping batched LoRa packets compact.
+  WP_INTERLINE_MS: 20,
 });
 
 // ---------------------------------------------------------------------------
@@ -462,5 +484,6 @@ module.exports = {
   API,
   SEQ,
   LORA_WIRE,
+  formatWaypointWireCoordinate,
   ARBITRATION,
 };

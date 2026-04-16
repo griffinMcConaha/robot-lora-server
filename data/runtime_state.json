@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "savedAt": 1776279208228,
+  "savedAt": 1776309407976,
   "reason": "startup.reconciled",
   "state": {
     "baseStation": {
@@ -230,9 +230,8 @@
       "notes": []
     },
     "bridge": {
-      "baseStationUrl": "http://127.0.0.1:19181",
+      "baseStationUrl": "http://192.168.4.1",
       "baseStationCandidates": [
-        "http://127.0.0.1:19181",
         "http://192.168.4.1",
         "http://base-station.local"
       ],
@@ -251,9 +250,9 @@
       "requestTimeoutMs": 1500,
       "ackWaitTimeoutMs": 3500,
       "ackPollMs": 40,
-      "wpInterlineMs": 35,
-      "wpBatchSize": 2,
-      "wpBatchMaxChars": 130,
+      "wpInterlineMs": 20,
+      "wpBatchSize": 5,
+      "wpBatchMaxChars": 128,
       "baseStation": {
         "statusOk": true,
         "statusCode": 200,
@@ -296,7 +295,7 @@
       "endedAt": null,
       "coveragePct": 0,
       "faultCount": 0,
-      "cmdCount": 11,
+      "cmdCount": 12,
       "notes": "",
       "baseStation": {
         "lat": 41.075304039693016,

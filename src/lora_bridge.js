@@ -49,7 +49,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { Bonjour } = require('bonjour-service');
-const { LORA_WIRE, ARBITRATION } = require('./contracts');
+const { LORA_WIRE, ARBITRATION, formatWaypointWireCoordinate } = require('./contracts');
 const { DATA_DIR } = require('./runtime_state');
 
 // ---------------------------------------------------------------------------
@@ -72,15 +72,15 @@ const ACK_REQUIRED = String(process.env.LORA_ACK_REQUIRED ?? '0') === '1';
 const BASE_STATUS_REFRESH_INTERVAL_MS = Number(process.env.BASE_STATUS_REFRESH_INTERVAL_MS ?? 750);
 const WP_INTERLINE_MS = Math.max(
   10,
-  Number(process.env.LORA_WP_INTERLINE_MS ?? 35),
+  Number(process.env.LORA_WP_INTERLINE_MS ?? 20),
 );
 const WP_BATCH_SIZE = Math.max(
   1,
-  Math.min(5, Number(process.env.LORA_WP_BATCH_SIZE ?? 2)),
+  Math.min(5, Number(process.env.LORA_WP_BATCH_SIZE ?? 5)),
 );
 const WP_BATCH_MAX_CHARS = Math.max(
-  80,
-  Number(process.env.LORA_WP_BATCH_MAX_CHARS ?? 130),
+  96,
+  Number(process.env.LORA_WP_BATCH_MAX_CHARS ?? 128),
 );
 
 // ---------------------------------------------------------------------------
@@ -1046,7 +1046,7 @@ async function pushWaypoints(points) {
       const p = points[i];
       const salt = Math.round(p.salt);
       const brine = Math.round(p.brine);
-      const entry = `${p.lat.toFixed(6)},${p.lon.toFixed(6)},${salt},${brine}`;
+      const entry = `${formatWaypointWireCoordinate(p.lat, LORA_WIRE.WP_COORD_DECIMALS)},${formatWaypointWireCoordinate(p.lon, LORA_WIRE.WP_COORD_DECIMALS)},${salt},${brine}`;
       const candidateEntries = entries.length ? `${entries.join(';')};${entry}` : entry;
       const candidateLine = `${LORA_WIRE.WP_BATCH}:${startIdx}:${candidateEntries}`;
 
@@ -1196,12 +1196,19 @@ function observeCommand(cmd) {
     return;
   }
 
-  if (normalized.startsWith(`${LORA_WIRE.WP_ADD}:`)) {
+  if (normalized.startsWith(`${LORA_WIRE.WP_ADD}:`) || normalized.startsWith(`${LORA_WIRE.WP_BATCH}:`)) {
     const parts = normalized.split(':');
     const idx = Number(parts[1]);
     _wpPushState = ARBITRATION.WP_PENDING;
     _wpPushError = null;
-    if (Number.isInteger(idx) && idx >= 0) {
+
+    if (normalized.startsWith(`${LORA_WIRE.WP_BATCH}:`)) {
+      const payload = parts.slice(2).join(':');
+      const batchCount = payload ? payload.split(';').filter(Boolean).length : 0;
+      if (Number.isInteger(idx) && idx >= 0 && batchCount > 0) {
+        _wpPushCount = Math.max(_wpPushCount, idx + batchCount);
+      }
+    } else if (Number.isInteger(idx) && idx >= 0) {
       _wpPushCount = Math.max(_wpPushCount, idx + 1);
     }
     return;

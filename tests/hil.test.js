@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+const { LORA_WIRE } = require('../src/contracts');
 
 const SERVER_PORT = 18180;
 const BASE_PORT = 18181;
@@ -111,19 +112,19 @@ function createMockBaseStation(port = BASE_PORT, options = {}) {
         commands.push(body);
 
         const trimmed = body.trim();
-        if (trimmed === 'WPCLEAR') {
-          lastLoRa = 'ACK:WPCLEAR';
-        } else if (trimmed.startsWith('WPB:')) {
+        if (trimmed === LORA_WIRE.WP_CLEAR) {
+          lastLoRa = LORA_WIRE.WP_ACK_CLEAR;
+        } else if (trimmed.startsWith(`${LORA_WIRE.WP_BATCH}:`)) {
           const parts = trimmed.split(':');
           const startIdx = parts[1] ?? '0';
           const batchPayload = parts.slice(2).join(':');
           const batchCount = batchPayload
             ? batchPayload.split(';').filter(Boolean).length
             : 0;
-          lastLoRa = `ACK:WPB:${startIdx}:${batchCount}`;
-        } else if (trimmed.startsWith('WPLOAD:')) {
+          lastLoRa = `${LORA_WIRE.WP_ACK_BATCH}:${startIdx}:${batchCount}`;
+        } else if (trimmed.startsWith(`${LORA_WIRE.WP_LOAD}:`)) {
           const count = trimmed.split(':')[1] ?? '0';
-          lastLoRa = `ACK:WPLOAD:${count}`;
+          lastLoRa = `${LORA_WIRE.WP_ACK_LOAD}:${count}`;
         }
 
         res.writeHead(200, { 'content-type': 'text/plain' });
@@ -434,20 +435,122 @@ test('Building a demo path auto-commits its waypoints', async () => {
       assert.equal(json.waypointPush?.ok, true);
     }
 
-    await waitForCondition(() => base.commands.includes('WPCLEAR'), {
+    await waitForCondition(() => base.commands.includes(LORA_WIRE.WP_CLEAR), {
       timeoutMs: 1000,
       intervalMs: 20,
-      label: 'demo path WPCLEAR',
+      label: 'demo path waypoint clear',
     });
 
-    await waitForCondition(() => base.commands.some((command) => command.startsWith('WPLOAD:')), {
+    await waitForCondition(() => base.commands.some((command) => command.startsWith(`${LORA_WIRE.WP_LOAD}:`)), {
       timeoutMs: 1000,
       intervalMs: 20,
-      label: 'demo path WPLOAD',
+      label: 'demo path waypoint load',
     });
+
+    {
+      const batchCommands = base.commands.filter((command) => command.startsWith(`${LORA_WIRE.WP_BATCH}:`));
+      assert.ok(batchCommands.length >= 1, 'expected demo waypoint upload to use batched packets');
+      assert.ok(batchCommands.length < 6, `expected compact batching, saw ${batchCommands.length} waypoint packets`);
+    }
   } finally {
     await server.stop();
     await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Demo run succeeds through remote bridge queue when local waypoint ACKs are unavailable', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-demo-remote-'));
+  const server = startServer(dataDir, {
+    BASE_STATION_URL: 'http://127.0.0.1:19999',
+    BASE_STATION_CANDIDATES: 'http://127.0.0.1:19999',
+    TELEMETRY_FAILSAFE_ENABLED: '0',
+    GEOFENCE_FAILSAFE_ENABLED: '0',
+    GPS_READY_MIN_SAT: '1',
+    GPS_READY_MAX_HDOP: '5',
+  });
+
+  try {
+    await waitForCondition(async () => {
+      const { res } = await getJson(`${SERVER_URL}/api/supervision/summary`);
+      return res.status === 200;
+    }, {
+      timeoutMs: 5000,
+      intervalMs: 50,
+      label: `server reachability at ${SERVER_URL}`,
+    });
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/base-station/status`, {
+        ok: true,
+        configured: true,
+        wifi_link_state: 'online',
+        lora_link_state: 'online',
+        queue_depth: 0,
+        last_cmd: 'PING',
+        last_cmd_status: 'acknowledged',
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/demo-mode`, {
+        enabled: true,
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'PAUSE',
+        gps: { lat: 41.0, lon: -81.0, fix: 1, sat: 8, hdop: 0.9 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 0.0, pitch: 0.0 },
+        disp: { salt: 20, brine: 30 },
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    await postJson(`${SERVER_URL}/api/demo-mode/spot`, { kind: 'start', source: 'test-suite' });
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'PAUSE',
+        gps: { lat: 41.00012, lon: -80.9998, fix: 1, sat: 8, hdop: 0.9 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 10.0, pitch: 0.0 },
+        disp: { salt: 20, brine: 30 },
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    await postJson(`${SERVER_URL}/api/demo-mode/spot`, { kind: 'end', source: 'test-suite' });
+
+    {
+      const { res, json, text } = await postJson(`${SERVER_URL}/api/demo-mode/path`, {
+        source: 'test-suite',
+        saltPct: 25,
+        brinePct: 75,
+      });
+      assert.equal(res.status, 200, `expected remote demo path build to succeed, got ${res.status}: ${text}`);
+      assert.equal(json.ok, true);
+      assert.equal(json.waypointPush?.ok, true);
+      assert.equal(json.waypointPush?.queuedRemote, true);
+    }
+
+    {
+      const { res, json, text } = await postJson(`${SERVER_URL}/api/demo-mode/run`, {
+        source: 'test-suite',
+        allowWeakGps: true,
+      });
+      assert.equal(res.status, 200, `expected remote demo run to succeed, got ${res.status}: ${text}`);
+      assert.equal(json.ok, true);
+    }
+  } finally {
+    await server.stop();
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });

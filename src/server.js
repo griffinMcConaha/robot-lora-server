@@ -37,6 +37,7 @@ const {
   WS_EVENT,
   API,
   LORA_WIRE,
+  formatWaypointWireCoordinate,
 } = require('./contracts');
 const db      = require('./db');
 const mission = require('./mission');
@@ -425,6 +426,7 @@ function currentMissionState() {
 function isWaypointCommand(cmd) {
   return cmd === LORA_WIRE.WP_CLEAR ||
     cmd.startsWith(`${LORA_WIRE.WP_ADD}:`) ||
+    cmd.startsWith(`${LORA_WIRE.WP_BATCH}:`) ||
     cmd.startsWith(`${LORA_WIRE.WP_LOAD}:`);
 }
 
@@ -883,7 +885,7 @@ function resolveDemoReadiness() {
   const hasEnd = Boolean(state.demo?.spots?.end);
   const hasPath = Array.isArray(state.lastPath) && state.lastPath.length > 0;
   const bridgeStatus = bridge.getStatus();
-  const wpPushState = bridgeStatus.wpPushState ?? 'none';
+  const wpPushState = resolveWaypointPushState();
   const localBaseStationReachable = bridgeStatus.baseStation?.statusOk === true;
   const remoteFallback = getRemoteCommandFallbackReadiness();
   const commandTransportReady = localBaseStationReachable || remoteFallback.ok;
@@ -899,7 +901,8 @@ function resolveDemoReadiness() {
   if (hasStart && !demoStatuses.start.ready && !demoConfig.allowWeakGps) blockers.push(demoStatuses.start.reason ?? 'Spot A GPS is not ready');
   if (hasEnd && !demoStatuses.end.ready && !demoConfig.allowWeakGps) blockers.push(demoStatuses.end.reason ?? 'Spot B GPS is not ready');
   if (!hasPath) blockers.push('No demo path has been built');
-  if (wpPushState !== 'committed' && hasPath && !remoteWaypointCommitted.ok) {
+  const waypointsPrepared = wpPushState === 'committed' || wpPushState === 'remote-queued';
+  if (!waypointsPrepared && hasPath && !remoteWaypointCommitted.ok) {
     blockers.push(`Waypoints are ${wpPushState}, not committed`);
   }
   if (!gpsStatus.ready && !demoConfig.allowWeakGps) blockers.push(gpsStatus.reason ?? 'Robot GPS is not ready');
@@ -1315,6 +1318,33 @@ function isRemoteWaypointPushLikelyCommitted(now = Date.now()) {
   };
 }
 
+function resolveWaypointPushState(now = Date.now()) {
+  const localState = bridge.getStatus().wpPushState ?? 'none';
+  if (localState === 'committed' || localState === 'pending' || localState === 'failed') {
+    return localState;
+  }
+
+  const remoteFallback = getRemoteCommandFallbackReadiness(now);
+  if (!remoteFallback.ok) {
+    return localState;
+  }
+
+  const hasQueuedRemoteWaypoint = remoteCommandQueue.some((entry) => {
+    if (entry?.deliveryAcked) return false;
+    const token = normalizeRemoteQueueCommand(entry?.cmd);
+    return token === LORA_WIRE.WP_CLEAR
+      || token.startsWith(`${LORA_WIRE.WP_ADD}:`)
+      || token.startsWith(`${LORA_WIRE.WP_BATCH}:`)
+      || token.startsWith(`${LORA_WIRE.WP_LOAD}:`);
+  });
+
+  if (hasQueuedRemoteWaypoint) {
+    return 'remote-queued';
+  }
+
+  return isRemoteWaypointPushLikelyCommitted(now).ok ? 'committed' : localState;
+}
+
 function transportStageForStatus(status) {
   switch (status) {
     case COMMAND_STATUS.APPLIED:
@@ -1450,15 +1480,42 @@ function queueRemoteWaypointPush(points, source = 'remote-bridge') {
     return { ok: false, status: 400, error: 'No waypoint set available for remote queue', sent: 0 };
   }
 
-  const commands = [
-    LORA_WIRE.WP_CLEAR,
-    ...points.map((point, index) => {
+  const bridgeStatus = bridge.getStatus();
+  const remoteBatchSize = Number.isFinite(Number(bridgeStatus.wpBatchSize))
+    ? Math.max(1, Math.min(5, Math.floor(Number(bridgeStatus.wpBatchSize))))
+    : 5;
+  const remoteBatchMaxChars = Number.isFinite(Number(bridgeStatus.wpBatchMaxChars))
+    ? Math.max(96, Math.floor(Number(bridgeStatus.wpBatchMaxChars)))
+    : 128;
+
+  const commands = [LORA_WIRE.WP_CLEAR];
+  for (let index = 0; index < points.length;) {
+    const startIdx = index;
+    const entries = [];
+
+    while (index < points.length && entries.length < remoteBatchSize) {
+      const point = points[index];
       const salt = clampNumber(Math.round(Number(point?.salt ?? 0)), 0, 100);
       const brine = clampNumber(Math.round(Number(point?.brine ?? 0)), 0, 100);
-      return `${LORA_WIRE.WP_ADD}:${index}:${Number(point.lat).toFixed(6)},${Number(point.lon).toFixed(6)},${salt},${brine}`;
-    }),
-    `${LORA_WIRE.WP_LOAD}:${points.length}`,
-  ];
+      const entry = `${formatWaypointWireCoordinate(point.lat, LORA_WIRE.WP_COORD_DECIMALS)},${formatWaypointWireCoordinate(point.lon, LORA_WIRE.WP_COORD_DECIMALS)},${salt},${brine}`;
+      const candidateEntries = entries.length ? `${entries.join(';')};${entry}` : entry;
+      const candidateLine = `${LORA_WIRE.WP_BATCH}:${startIdx}:${candidateEntries}`;
+
+      if (entries.length > 0 && candidateLine.length > remoteBatchMaxChars) {
+        break;
+      }
+
+      entries.push(entry);
+      index += 1;
+    }
+
+    if (entries.length <= 1) {
+      commands.push(`${LORA_WIRE.WP_ADD}:${startIdx}:${entries[0]}`);
+    } else {
+      commands.push(`${LORA_WIRE.WP_BATCH}:${startIdx}:${entries.join(';')}`);
+    }
+  }
+  commands.push(`${LORA_WIRE.WP_LOAD}:${points.length}`);
 
   while ((pendingRemoteCommandCount() + commands.length) > REMOTE_COMMAND_MAX_QUEUE && pendingRemoteCommandCount() > 0) {
     remoteCommandQueue.shift();
@@ -1596,7 +1653,7 @@ function buildAllowedActions() {
   const gpsStatus = getRobotGpsStatus();
   return buildSupervisionAllowedActions({
     missionState: currentMissionState(),
-    wpPushState: bridge.getStatus().wpPushState,
+    wpPushState: resolveWaypointPushState(),
     hasCoverage: Boolean(state.coverage),
     hasPath: state.lastPath.length > 0,
     zeroDispersionPath: pathHasZeroDispersion(),
@@ -1612,7 +1669,7 @@ function buildAlerts(now = Date.now()) {
   const connectivity = buildConnectionState(now);
   return buildSupervisionAlerts({
     missionState: currentMissionState(),
-    wpPushState: bridge.getStatus().wpPushState,
+    wpPushState: resolveWaypointPushState(now),
     hasCoverage: Boolean(state.coverage),
     hasPath: state.lastPath.length > 0,
     zeroDispersionPath: pathHasZeroDispersion(),
@@ -1631,7 +1688,7 @@ function buildAlerts(now = Date.now()) {
 function buildOperatorWorkflows() {
   return buildSupervisionWorkflows({
     missionState: currentMissionState(),
-    wpPushState: bridge.getStatus().wpPushState,
+    wpPushState: resolveWaypointPushState(),
     hasArea: Boolean(state.coverage),
     hasPath: state.lastPath.length > 0,
     latestNote: state.operator.notes.at(-1) ?? null,
@@ -1806,13 +1863,14 @@ function buildConnectionState(now = Date.now()) {
       : (baseStation.lastSuccessAt ?? null),
   };
 
+  const effectiveWpPushState = resolveWaypointPushState(now);
   const commandTransportAvailable = localBaseStationReachable || remoteBaseStationFresh;
   const commandPathReady = dbOk && commandTransportAvailable && robotReachable && !telemetryStale;
   const commandPath = {
     state: commandPathReady ? CONNECTION_STATE.READY : (baseStationReachable ? CONNECTION_STATE.DEGRADED : CONNECTION_STATE.OFFLINE),
     ready: commandPathReady,
     transportAvailable: commandTransportAvailable,
-    wpPushState: bridgeStatus.wpPushState,
+    wpPushState: effectiveWpPushState,
     lastCmd: bridgeStatus.lastCmd ?? state.lastCommand ?? null,
     lastCommandId: state.lastCommandId,
     lastCommandStatus: state.lastCommandStatus,
@@ -1833,7 +1891,7 @@ function buildConnectionState(now = Date.now()) {
     [MISSION_STATE.CONFIGURING, MISSION_STATE.RUNNING, MISSION_STATE.PAUSED].includes(missionState) &&
     (
       !robotReachable ||
-      bridgeStatus.wpPushState !== 'committed' ||
+      effectiveWpPushState !== 'committed' ||
       (missionState === MISSION_STATE.RUNNING && robotMode !== 'AUTO') ||
       (missionState === MISSION_STATE.PAUSED && !['PAUSE', 'ERROR', 'ESTOP'].includes(robotMode))
     );
@@ -1841,7 +1899,7 @@ function buildConnectionState(now = Date.now()) {
     ? (
       !robotReachable
         ? 'Robot telemetry must reconnect before the mission can continue'
-        : bridgeStatus.wpPushState !== 'committed'
+        : effectiveWpPushState !== 'committed'
           ? 'The mission path should be re-committed to the robot'
           : missionState === MISSION_STATE.RUNNING
             ? `The backend expected AUTO but the robot reports ${robotMode || 'UNKNOWN'}`
@@ -2044,7 +2102,7 @@ function buildSupervisionSummary() {
       readiness: demoReadiness,
       diagnostics: {
         missionState: currentMissionState(),
-        wpPushState: loraStatus.wpPushState ?? 'none',
+        wpPushState: demoReadiness.wpPushState ?? resolveWaypointPushState(now),
         loraDegraded: Boolean(loraStatus.degraded),
         loraLastError: loraStatus.lastCmdError ?? null,
         commandPathState: connectivity?.commandPath?.state ?? null,
@@ -4971,10 +5029,34 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
       });
     }
 
-    const demoOn = await bridge.sendCommand('DEMOON', {
-      waitForAck: false,
-      commandSource: 'demo-mode.run',
-    });
+    const preferRemoteDemoQueue = getRemoteCommandFallbackReadiness().ok && !bridge.getStatus().baseStation?.statusOk;
+    let demoOn = preferRemoteDemoQueue
+      ? queueDispatchedRemoteCommand({
+          commandId: createCommandId(),
+          cmd: 'DEMOON',
+          wireCommand: 'DEMOON',
+          source: 'demo-mode.run',
+          syncMission: false,
+        })
+      : await bridge.sendCommand('DEMOON', {
+          waitForAck: false,
+          commandId: createCommandId(),
+          commandSource: 'demo-mode.run',
+        });
+
+    if (!demoOn.ok && !preferRemoteDemoQueue) {
+      const remoteFallbackAfterFailure = getRemoteCommandFallbackReadiness();
+      if (remoteFallbackAfterFailure.ok && !bridge.getStatus().baseStation?.statusOk) {
+        demoOn = queueDispatchedRemoteCommand({
+          commandId: createCommandId(),
+          cmd: 'DEMOON',
+          wireCommand: 'DEMOON',
+          source: 'demo-mode.run',
+          syncMission: false,
+        });
+      }
+    }
+
     if (!demoOn.ok) {
       return res.status(demoOn.status ?? 500).json({
         ok: false,
@@ -4984,9 +5066,11 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
       });
     }
 
-    const auto = await bridge.sendCommand(CMD.AUTO, {
+    const auto = await dispatchCommand(CMD.AUTO, {
+      syncMission: false,
+      source: 'demo-mode.run',
       waitForAck: false,
-      commandSource: 'demo-mode.run',
+      waitForState: false,
     });
     if (!auto.ok) {
       return res.status(auto.status ?? 500).json({
