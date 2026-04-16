@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LoRa Anti-Icing Server - Dashboard</title>
+  <title>Robotic Anti-Icing Operations Dashboard</title>
   <style>
     * {
       margin: 0;
@@ -1070,8 +1070,8 @@
 <body>
   <header>
     <div class="header-panel">
-      <h1>🛰️ LoRa Anti-Icing Server</h1>
-      <p class="subtitle">Live dashboard for planning, route control, and system checks.</p>
+      <h1>🛰️ Robotic Anti-Icing Dashboard</h1>
+      <p class="subtitle">Live dashboard for route planning, vehicle control, and system readiness.</p>
       <div class="header-chip-row">
         <span class="header-chip">Mobile app</span>
         <span class="header-chip">Hosted server</span>
@@ -1233,7 +1233,7 @@
               <div class="controller-status-value" id="controllerHeldAction">None</div>
             </div>
           </div>
-          <div id="controllerBanner" class="controller-banner warn">Directional drive will switch the robot into manual mode before sending motion.</div>
+          <div id="controllerBanner" class="controller-banner warn">Drive controls place the robot in manual control before movement.</div>
           <div class="drive-pad">
             <div class="spacer"></div>
             <button id="drive-forward" class="controller-button primary drive-button" onpointerdown="handleDrivePress('drive-forward')" onpointerup="handleDriveRelease()" onpointerleave="handleDriveRelease()" onpointercancel="handleDriveRelease()">Forward</button>
@@ -1258,10 +1258,10 @@
           <div class="controller-action-row">
             <button class="controller-button" onclick="runControllerAction('commit-current-path')">Commit Path</button>
             <button class="controller-button" onclick="runControllerAction('mission-start-test')">Start</button>
-            <button class="controller-button" onclick="runControllerAction('mission-pause-test')">Mission Pause</button>
+            <button class="controller-button" onclick="runControllerAction('mission-pause-test')">Pause Mission</button>
             <button class="controller-button" onclick="runControllerAction('mission-resume-test')">Resume</button>
             <button class="controller-button" onclick="runControllerAction('mission-complete-test')">Complete</button>
-            <button class="controller-button danger" onclick="runControllerAction('mission-abort-test')">Abort</button>
+            <button class="controller-button danger" onclick="runControllerAction('mission-abort-test')">Stop Mission</button>
           </div>
           <div class="controller-notes">
             Hold a drive button to send motion and release to send stop. Emergency and lifecycle buttons use the same server checks as the app.
@@ -1279,7 +1279,7 @@
     </div>
 
     <div class="card grid-3">
-      <div class="card-title">Guided Service Checks</div>
+      <div class="card-title">Operator Tools</div>
       <div class="test-workbench">
         <div class="test-workbench-main">
           <div class="section-card">
@@ -1295,8 +1295,8 @@
           <div class="section-card">
             <div class="section-header">
               <div>
-                <div class="section-title">Subsystem Tests</div>
-                <div class="section-copy">Grouped by system so everything is easy to scan and run only when needed.</div>
+                <div class="section-title">Quick Checks</div>
+                <div class="section-copy">Grouped by system so the most useful actions are easy to find.</div>
               </div>
             </div>
             <div id="testMenu" class="test-groups">
@@ -1328,9 +1328,9 @@
           </div>
           <div class="section-card compact">
             <div class="section-header">
-              <div class="section-title">Test Result</div>
+              <div class="section-title">Action Result</div>
             </div>
-            <div id="testResult" class="test-result">Select a test to run it from the server.</div>
+            <div id="testResult" class="test-result">Select an action to run from the control panel.</div>
           </div>
           <div class="section-card compact stacked-history">
             <div>
@@ -1341,8 +1341,8 @@
             </div>
             <div>
               <div class="history-head">
-                <div class="section-title">Recent Test Runs</div>
-                <button class="test-run-button" style="padding: 8px 12px;" onclick="repeatLastTest()">Repeat Last Test</button>
+                <div class="section-title">Recent Actions</div>
+                <button class="test-run-button" style="padding: 8px 12px;" onclick="repeatLastTest()">Run Again</button>
               </div>
               <div id="testHistory" class="history-list">No test runs yet.</div>
             </div>
