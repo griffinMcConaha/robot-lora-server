@@ -1,10 +1,11 @@
-# Robot LoRa Server (Starter)
+# Robot LoRa Server
 
-This is a starter backend for:
+This backend coordinates the hosted/server-side portion of the robot stack:
 - input area setup (base station + boundary)
 - live telemetry ingestion over LoRa bridge
 - live coverage map updates
 - path planning for app updates
+- mission supervision, operator workflows, and bridge health/status APIs
 
 ## Run
 

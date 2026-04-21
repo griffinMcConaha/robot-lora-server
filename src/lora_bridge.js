@@ -135,6 +135,8 @@ function _normalizeBaseStationUrl(value) {
 }
 
 function _buildBaseStationCandidates() {
+  // Order matters: explicit env vars first, then known fallbacks and discovery-
+  // friendly hostnames. Successful requests promote the chosen URL later.
   const raw = [
     process.env.GATEWAY_DIRECT_URL,
     process.env.MANUAL_GATEWAY_URL,
@@ -329,6 +331,7 @@ function _startMdnsDiscovery() {
 }
 
 function _candidateUrls() {
+  // Deduplicate while preserving priority so we can fail over deterministically.
   const urls = [
     _selectedBaseStationUrl,
     ...Array.from(_mdnsServices.values()).flatMap((service) => service.urls ?? []),
@@ -472,6 +475,8 @@ async function _postWithFailover(path, body, extraHeaders = {}) {
     }
 
     _setSelectedBaseStationUrl(candidateUrl);
+    // Any successful request is evidence that this URL should become the new
+    // preferred endpoint until a later failover proves otherwise.
     _baseStationSnapshot = {
       ..._baseStationSnapshot,
       selectedUrl: candidateUrl,
@@ -546,6 +551,8 @@ function _applyBaseStatusSnapshot(payload, meta = {}) {
 
   const payloadLastLoRa = typeof payload.last_lora === 'string' ? payload.last_lora.trim() : null;
   const payloadLastAck = typeof payload.last_ack === 'string' ? payload.last_ack.trim() : null;
+  // Older firmware/status payloads may only expose last_lora. Derive the ACK
+  // view opportunistically so the rest of the server can use one shape.
   const derivedLastAck = payloadLastAck || (_unwrapAckFrame(payloadLastLoRa)?.ack ? payloadLastLoRa : null);
   const parsedAck = derivedLastAck ? _parseAckDetails(derivedLastAck) : null;
   const derivedLoraLinkState = typeof payload.lora_link_state === 'string'
@@ -654,6 +661,8 @@ function _unwrapAckFrame(text) {
 
   const wrapped = raw.match(/^S:\d+:(?:M|E):(.*)$/);
   if (wrapped) {
+    // Some base stations surface the gateway wrapper, while others expose only
+    // the inner ACK payload. Normalize both cases for the caller.
     const payload = _normalizeFrameText(wrapped[1]);
     return {
       raw,
@@ -829,6 +838,8 @@ async function _waitForAck(expectedAck, options = {}) {
         snapshot.lastCmdId === commandId &&
         snapshot.lastCmdStatus === 'acknowledged'
       ) {
+        // Prefer explicit command-id correlation when the base station provides
+        // it, because repeated commands can otherwise make ACK matching fuzzy.
         return {
           ok: true,
           ack: expectedAck,
@@ -913,6 +924,7 @@ async function _postWithRetry(path, body, extraHeaders = {}) {
     const retryDelayMs = isQueueFull ? QUEUE_FULL_RETRY_MS : TRANSIENT_RETRY_MS;
 
     if (isTransient && r.status == null) {
+      // A fresh /status read helps discovery converge after network changes.
       await _readBaseStatus();
     }
 
@@ -955,6 +967,8 @@ async function sendCommand(cmd, options = {}) {
   const cmdStr = cmd.trim().toUpperCase();
   const { waitForAck = false, commandId = null, commandSource = null, ackRequired = ACK_REQUIRED } = options;
   const expectedAck = waitForAck ? _expectedAckForCommand(cmdStr) : null;
+  // Capture the current last_lora frame so we can distinguish a new ACK from a
+  // stale one that happened to match the same command token.
   const baseline = expectedAck ? await _readLastLoRa() : null;
   const headers = {};
   if (typeof commandId === 'string' && commandId.trim()) {
@@ -1066,6 +1080,8 @@ async function pushWaypoints(points) {
       const candidateEntries = entries.length ? `${entries.join(';')};${entry}` : entry;
       const candidateLine = `${LORA_WIRE.WP_BATCH}:${startIdx}:${candidateEntries}`;
 
+      // Keep each LoRa line under the configured max so a single batch never
+      // exceeds radio payload limits even when coordinates grow in length.
       if (entries.length > 0 && candidateLine.length > WP_BATCH_MAX_CHARS) {
         break;
       }
@@ -1206,6 +1222,8 @@ function observeCommand(cmd) {
   if (!normalized) return;
 
   if (normalized === LORA_WIRE.WP_CLEAR) {
+    // Manual WP commands sent outside pushWaypoints() should still keep the
+    // bridge's local state machine synchronized with the hardware.
     _wpPushState = ARBITRATION.WP_PENDING;
     _wpPushCount = 0;
     _wpPushAt = null;

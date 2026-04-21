@@ -36,6 +36,8 @@ function onTransition(fn) {
 // Helpers
 // ---------------------------------------------------------------------------
 function _assertTransition(from, to) {
+  // Keep transition policy centralized here so callers cannot "accidentally"
+  // create new mission flows by writing directly to the mission object.
   const allowed = MISSION_STATE_TRANSITIONS[from];
   if (!allowed || !allowed.has(to)) {
     throw new Error(`Invalid mission transition: ${from} → ${to}`);
@@ -105,6 +107,7 @@ function configure({ baseStation, boundary, cellSizeM = 2.0 } = {}) {
   const prevState = _mission?.state ?? MISSION_STATE.IDLE;
   _assertTransition(prevState, MISSION_STATE.CONFIGURING);
 
+  // We create the DB row up front so every later event has a stable mission id.
   const id = db.createMission({ baseStation, boundary, cellSizeM });
   _mission = {
     id,
@@ -234,6 +237,8 @@ function reset() {
     const prevState = _mission.state;
     _assertTransition(prevState, MISSION_STATE.IDLE);
   }
+  // Reset intentionally clears the in-memory pointer instead of mutating the
+  // existing object so downstream code stops treating the mission as active.
   _mission = null;
   _notify();
 }
@@ -286,6 +291,8 @@ function addNote(text) {
 // Internal
 // ---------------------------------------------------------------------------
 function _applyFinalStats({ coveragePct, faultCount, cmdCount } = {}) {
+  // Final stats are merged selectively so callers can supply only the values
+  // they actually know at transition time.
   if (coveragePct != null) _mission.coveragePct = coveragePct;
   if (faultCount  != null) _mission.faultCount  = faultCount;
   if (cmdCount    != null) _mission.cmdCount     = cmdCount;

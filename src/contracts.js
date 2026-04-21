@@ -15,6 +15,10 @@
 
 'use strict';
 
+// This file is intentionally verbose because it doubles as human-readable
+// protocol documentation. Most other modules import from here instead of
+// repeating literals so changes stay synchronized across the stack.
+
 // ---------------------------------------------------------------------------
 // 1. ROBOT STATES  (STM32 state machine, reported in telemetry "state" field)
 // ---------------------------------------------------------------------------
@@ -93,6 +97,9 @@ const CMD_ALIASES = Object.freeze({
   TEST:      CMD.PAUSE,
   TELEMETRY: CMD.PAUSE,
 });
+
+// Aliases are intentionally one-way: the server accepts operator shorthand,
+// but it always emits canonical command tokens back onto the wire.
 
 // ---------------------------------------------------------------------------
 // 3. FAULT CODES  (STM32 → LoRa → server, "fault" field)

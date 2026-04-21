@@ -1,3 +1,10 @@
+/**
+ * supervision.js
+ *
+ * Pure decision helpers for the dashboard and app. This module converts raw
+ * mission/robot state into operator-facing affordances such as allowed actions,
+ * alerts, and workflow steps.
+ */
 const { MISSION_STATE, FAULT_ACTION } = require('./contracts');
 
 function createOperatorState() {
@@ -18,6 +25,8 @@ function isTelemetryStale(robot, staleThresholdMs, now = Date.now()) {
 }
 
 function buildAllowedActions({ missionState, wpPushState, hasCoverage, hasPath, zeroDispersionPath, gpsReady, gpsReason, demoModeEnabled, resetNeeded = false }) {
+  // When telemetry is absent we keep the gate open so operators can still
+  // configure the mission offline instead of locking the whole UI.
   const gpsGateOpen = gpsReady || gpsReason === 'Robot telemetry is unavailable';
 
   return [
@@ -93,6 +102,8 @@ function buildAlerts({
 }) {
   const alerts = [];
 
+  // Order matters here: setup warnings first, then live safety issues. The UI
+  // displays the array directly, so this keeps the operator narrative coherent.
   if (!hasCoverage) {
     alerts.push({ level: 'warning', code: 'AREA_UNCONFIGURED', message: 'Input area has not been configured.' });
   }
@@ -176,6 +187,8 @@ function buildAlerts({
 }
 
 function buildOperatorWorkflows({ missionState, wpPushState, hasArea, hasPath, latestNote, lastFault, getWorkflowAck }) {
+  // These workflows are intentionally derived from current state rather than
+  // persisted as a separate machine, which keeps them resilient to restarts.
   const workflows = [
     {
       id: 'preflight',

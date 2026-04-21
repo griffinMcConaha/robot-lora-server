@@ -1,3 +1,10 @@
+/**
+ * hil.test.js
+ *
+ * End-to-end server tests that exercise HTTP endpoints, mission state, and the
+ * mock base-station transport together. These are the highest-signal checks for
+ * behavior that spans multiple modules.
+ */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
@@ -111,6 +118,8 @@ function createMockBaseStation(port = BASE_PORT, options = {}) {
         const body = Buffer.concat(chunks).toString('utf8');
         commands.push(body);
 
+        // Mirror the ACK vocabulary the real bridge expects so transport tests
+        // can validate server behavior without requiring physical hardware.
         const trimmed = body.trim();
         if (trimmed === LORA_WIRE.WP_CLEAR) {
           lastLoRa = LORA_WIRE.WP_ACK_CLEAR;
@@ -590,6 +599,112 @@ test('Building a demo path auto-commits its waypoints', async () => {
       assert.ok(batchCommands.length >= 1, 'expected demo waypoint upload to use batched packets');
       assert.ok(batchCommands.length < 6, `expected compact batching, saw ${batchCommands.length} waypoint packets`);
     }
+  } finally {
+    await server.stop();
+    await base.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Demo run plays the path with manual turns and stop pulses', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robot-lora-server-hil-demo-playback-'));
+  const base = createMockBaseStation();
+  await base.start();
+
+  const server = startServer(dataDir, {
+    TELEMETRY_FAILSAFE_ENABLED: '0',
+    GEOFENCE_FAILSAFE_ENABLED: '0',
+    GPS_READY_MIN_SAT: '1',
+    GPS_READY_MAX_HDOP: '5',
+    DEMO_PLAYBACK_SPEED_MPS: '50',
+    DEMO_PLAYBACK_TURN_RATE_DEG_PER_S: '720',
+    DEMO_PLAYBACK_STOP_MS: '5',
+    DEMO_PLAYBACK_SETTLE_MS: '0',
+  });
+
+  try {
+    await waitForHealthy(SERVER_URL);
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/demo-mode`, {
+        enabled: true,
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200);
+    }
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'PAUSE',
+        gps: { lat: 41.0, lon: -81.0, fix: 1, sat: 8, hdop: 0.9 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 0.0, pitch: 0.0 },
+        disp: { salt: 20, brine: 30 },
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    await postJson(`${SERVER_URL}/api/demo-mode/spot`, { kind: 'start', source: 'test-suite' });
+
+    {
+      const { res } = await postJson(`${SERVER_URL}/api/telemetry`, {
+        state: 'PAUSE',
+        gps: { lat: 41.00012, lon: -80.9998, fix: 1, sat: 8, hdop: 0.9 },
+        motor: { m1: 0, m2: 0 },
+        heading: { yaw: 10.0, pitch: 0.0 },
+        disp: { salt: 20, brine: 30 },
+        prox: { left: 120, right: 118 },
+      });
+      assert.equal(res.status, 200);
+    }
+
+    await postJson(`${SERVER_URL}/api/demo-mode/spot`, { kind: 'end', source: 'test-suite' });
+
+    {
+      const { res, json, text } = await postJson(`${SERVER_URL}/api/demo-mode/path`, {
+        source: 'test-suite',
+        saltPct: 25,
+        brinePct: 75,
+      });
+      assert.equal(res.status, 200, `expected demo path build to succeed, got ${res.status}: ${text}`);
+      assert.equal(json.ok, true);
+      assert.ok(json.path.pointCount >= 2);
+    }
+
+    {
+      const { res, json, text } = await postJson(`${SERVER_URL}/api/demo-mode/run`, {
+        source: 'test-suite',
+      });
+      assert.equal(res.status, 200, `expected demo run to succeed, got ${res.status}: ${text}`);
+      assert.equal(json.ok, true);
+      assert.equal(json.playback?.status, 'starting');
+      assert.ok((json.playback?.plan?.segmentCount ?? 0) >= 1);
+    }
+
+    await waitForCondition(() => base.commands.includes('M'), {
+      timeoutMs: 1500,
+      intervalMs: 20,
+      label: 'demo playback manual mode',
+    });
+
+    await waitForCondition(() => base.commands.includes('F'), {
+      timeoutMs: 1500,
+      intervalMs: 20,
+      label: 'demo playback forward motion',
+    });
+
+    await waitForCondition(() => base.commands.includes('L') || base.commands.includes('R'), {
+      timeoutMs: 2500,
+      intervalMs: 20,
+      label: 'demo playback turn command',
+    });
+
+    await waitForCondition(() => base.commands.filter((command) => command === 'S').length >= 2, {
+      timeoutMs: 2500,
+      intervalMs: 20,
+      label: 'demo playback stop pulses',
+    });
   } finally {
     await server.stop();
     await base.stop();

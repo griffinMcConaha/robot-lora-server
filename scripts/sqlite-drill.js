@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 'use strict';
 
+/**
+ * sqlite-drill.js
+ *
+ * Simple backup/restore validation for the local mission database. It forces a
+ * checkpoint, creates a backup, copies it to a restore candidate, and compares
+ * row counts to catch obviously broken backup procedures.
+ */
+
 const fs = require('node:fs');
 const path = require('node:path');
 const Database = require('better-sqlite3');
@@ -46,6 +54,7 @@ async function main() {
 
   const liveDb = new Database(DB_PATH);
   try {
+    // Flush WAL state into the main database file before taking the backup.
     liveDb.pragma('wal_checkpoint(FULL)');
     await liveDb.backup(backupPath);
   } finally {

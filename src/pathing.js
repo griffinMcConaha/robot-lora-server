@@ -1,3 +1,10 @@
+/**
+ * pathing.js
+ *
+ * Path planning helpers built on top of the coverage grid. The functions here
+ * intentionally favor predictable, inspectable behavior over algorithmic
+ * sophistication because operators need routes they can reason about quickly.
+ */
 const { worldToGrid, gridToWorld, withinGrid } = require('./coverage');
 
 function key(row, col) {
@@ -27,6 +34,7 @@ function nearestWalkable(map, fromRow, fromCol) {
     return { row: fromRow, col: fromCol };
   }
 
+  // Expand outward in rings until we find a valid interior cell.
   const maxRadius = Math.max(map.height, map.width);
   for (let radius = 1; radius <= maxRadius; radius++) {
     const minRow = fromRow - radius;
@@ -66,6 +74,8 @@ function findGridPath(map, start, goal) {
   const fScore = new Map([[key(start.row, start.col), heuristic(start, goal)]]);
 
   while (open.length) {
+    // A sorted array keeps the implementation straightforward; map sizes in
+    // this project are small enough that a heap is unnecessary.
     open.sort((a, b) => (fScore.get(key(a.row, a.col)) ?? Infinity) - (fScore.get(key(b.row, b.col)) ?? Infinity));
     const current = open.shift();
     openSet.delete(key(current.row, current.col));
@@ -175,6 +185,8 @@ function buildCoverageArrows(points = [], options = {}) {
   let segmentStartDistM = 0;
   const arrows = [];
 
+  // Space arrows by traveled distance so the UI remains legible even when the
+  // underlying waypoint density changes after fitting/truncation.
   for (let targetDistM = initialOffsetM; targetDistM < totalLenM; targetDistM += spacingM) {
     while (
       segmentIndex < segments.length - 1
@@ -241,6 +253,7 @@ function fitWaypointsToLimit(points = [], maxWaypoints = Infinity) {
   const fitted = [];
 
   for (let slot = 0; slot < limit; slot++) {
+    // Preserve the route span instead of trimming only from the middle or end.
     const index = slot === limit - 1
       ? lastIndex
       : Math.floor((slot * lastIndex) / (limit - 1));
@@ -255,6 +268,7 @@ function findPath(map, startLatLon, goalLatLon) {
   let goal = worldToGrid(map, goalLatLon);
 
   if (!isWalkable(map, start.row, start.col)) {
+    // GPS and UI-picked points often land just outside a valid cell.
     const snappedStart = nearestWalkable(map, start.row, start.col);
     if (!snappedStart) {
       return { ok: false, reason: 'Start is outside mapped boundary and no valid start cell found', points: [] };
@@ -365,6 +379,7 @@ function findCoveragePath(map, options = {}) {
       const orderedRuns = forward ? runs : runs.slice().reverse();
 
       for (const run of orderedRuns) {
+        // Alternate run direction to create the snake pattern operators expect.
         const startCol = forward ? run.start : run.end;
         const endCol = forward ? run.end : run.start;
         const step = startCol <= endCol ? 1 : -1;
@@ -402,6 +417,7 @@ function findCoveragePath(map, options = {}) {
       const orderedRuns = forward ? runs : runs.slice().reverse();
 
       for (const run of orderedRuns) {
+        // Same snake pattern, but oriented by columns for tall/narrow areas.
         const startRow = forward ? run.start : run.end;
         const endRow = forward ? run.end : run.start;
         const step = startRow <= endRow ? 1 : -1;

@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 'use strict';
 
+/**
+ * phase1-transport-check.js
+ *
+ * Manual field diagnostic for validating the base-station HTTP bridge and the
+ * LoRa acknowledgement loop outside the full server runtime.
+ */
+
 const http = require('http');
 const https = require('https');
 
@@ -99,6 +106,7 @@ async function run() {
 
   printSection('Waypoint Transport');
   const waypointProbe = [{
+    // A single waypoint is enough to exercise WPCLEAR/WPB/WPLOAD end-to-end.
     lat: Number(process.env.PHASE1_TEST_LAT ?? 41.706392),
     lon: Number(process.env.PHASE1_TEST_LON ?? -81.514196),
     salt: Number(process.env.PHASE1_TEST_SALT ?? 10),

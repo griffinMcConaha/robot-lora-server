@@ -1,3 +1,10 @@
+/**
+ * coverage.js
+ *
+ * Translates the operator boundary into a grid the server can reason about.
+ * That grid becomes the shared primitive for coverage accounting, geofence
+ * checks, and path planning.
+ */
 const { latLonToLocal, localToLatLon, pointInPolygon } = require('./geo');
 
 function magnitude(vector) {
@@ -30,6 +37,8 @@ function resolveCoverageFrame(localPolygon) {
     x: localPolygon[1].x - localPolygon[0].x,
     y: localPolygon[1].y - localPolygon[0].y,
   };
+  // Use the first edge as the map's primary axis so rotated rectangles still
+  // produce a compact grid instead of a wasteful axis-aligned bounding box.
   const axisU = normalize(magnitude(rawU) > 0 ? rawU : {
     x: localPolygon[2].x - localPolygon[0].x,
     y: localPolygon[2].y - localPolygon[0].y,
@@ -109,6 +118,8 @@ function buildCoverageMap(boundaryLatLon, cellSizeM = 2.0) {
 
   for (let row = 0; row < height; row++) {
     for (let col = 0; col < width; col++) {
+      // The center-point test is enough here because the operator boundary is
+      // treated as a coarse occupancy map, not a sub-cell geometry model.
       const center = {
         x: frame.minX + (col + 0.5) * cellSizeM,
         y: frame.minY + (row + 0.5) * cellSizeM,
@@ -182,6 +193,8 @@ function markCoverage(map, pointLatLon, radiusM = 1.5, timestampMs = Date.now())
       const cell = map.cells[row][col];
       if (!cell.inside) continue;
 
+      // We approximate the brush as a circle in grid space so the covered
+      // footprint remains stable even when telemetry arrives unevenly.
       const distance = Math.hypot(dr * map.cellSizeM, dc * map.cellSizeM);
       if (distance <= radiusM) {
         cell.covered = true;

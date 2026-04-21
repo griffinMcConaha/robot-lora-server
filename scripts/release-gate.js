@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 'use strict';
 
+/**
+ * release-gate.js
+ *
+ * Lightweight release checklist runner. It combines syntax checks, automated
+ * tests, and optional live endpoint verification into one CI-friendly command.
+ */
+
 const { execSync } = require('node:child_process');
 
 const BASE_URL = process.env.RELEASE_GATE_BASE_URL || process.env.BASE_URL || '';
@@ -30,6 +37,7 @@ async function fetchJson(url, headers = {}) {
 }
 
 async function runEndpointChecks() {
+  // Reuse the same app-facing checks operators rely on after deploy.
   const headers = APP_API_KEY ? { 'x-api-key': APP_API_KEY } : {};
 
   const health = await fetchJson(`${BASE_URL}/api/health`, headers);

@@ -120,6 +120,14 @@ const REMOTE_COMMAND_MAX_MOTION_LEASE_AGE_MS = Number(process.env.REMOTE_COMMAND
 const BASE_STATION_LORA_POLL_MS = Number(process.env.BASE_STATION_LORA_POLL_MS ?? 120);
 const DRIVE_DUPLICATE_SUPPRESS_MS = Number(process.env.DRIVE_DUPLICATE_SUPPRESS_MS ?? 35);
 const MANUAL_DRIVE_WS_FLUSH_MS = Number(process.env.MANUAL_DRIVE_WS_FLUSH_MS ?? 30);
+const DEMO_PLAYBACK_DRIVE_PCT = Number(process.env.DEMO_PLAYBACK_DRIVE_PCT ?? 55);
+const DEMO_PLAYBACK_TURN_PCT = Number(process.env.DEMO_PLAYBACK_TURN_PCT ?? 45);
+const DEMO_PLAYBACK_SPEED_MPS = Number(process.env.DEMO_PLAYBACK_SPEED_MPS ?? 0.55);
+const DEMO_PLAYBACK_TURN_RATE_DEG_PER_S = Number(process.env.DEMO_PLAYBACK_TURN_RATE_DEG_PER_S ?? 115);
+const DEMO_PLAYBACK_STOP_MS = Number(process.env.DEMO_PLAYBACK_STOP_MS ?? 180);
+const DEMO_PLAYBACK_SETTLE_MS = Number(process.env.DEMO_PLAYBACK_SETTLE_MS ?? 120);
+const DEMO_PLAYBACK_MIN_SEGMENT_M = Number(process.env.DEMO_PLAYBACK_MIN_SEGMENT_M ?? 0.20);
+const DEMO_PLAYBACK_MIN_TURN_DEG = Number(process.env.DEMO_PLAYBACK_MIN_TURN_DEG ?? 10);
 
 function parseKeyList(value) {
   if (typeof value !== 'string') return [];
@@ -214,6 +222,21 @@ const state = {
       cooldownUntil: 0,
       note: null,
     },
+    // Playback state lets demo mode run as a server-driven command script
+    // instead of assuming the firmware will interpret waypoints autonomously.
+    playback: {
+      active: false,
+      runId: 0,
+      status: 'idle',
+      startedAt: 0,
+      finishedAt: 0,
+      completedSteps: 0,
+      totalSteps: 0,
+      currentStep: null,
+      reason: null,
+      source: null,
+      plan: null,
+    },
     spots: {
       start: null,
       end: null,
@@ -249,6 +272,7 @@ let latestWsManualDrive = null;
 let latestWsManualDriveQueuedAt = 0;
 let manualDriveWsDispatchInFlight = false;
 let lastMotorTelemetryLogMs = 0;
+let activeDemoPlaybackRunId = 0;
 
 const DRIVE_COMMANDS = new Set([
   CMD.FORWARD,
@@ -911,6 +935,14 @@ function getDemoConfig() {
   const obstacleSidestepCm = Number(current.obstacleSidestepCm ?? DEMO_OBSTACLE_SIDESTEP_CM);
   const obstacleCooldownMs = Number(current.obstacleCooldownMs ?? DEMO_OBSTACLE_COOLDOWN_MS);
   const obstacleSidestepMs = Number(current.obstacleSidestepMs ?? DEMO_OBSTACLE_SIDESTEP_MS);
+  const playbackDrivePct = Number(current.playbackDrivePct ?? DEMO_PLAYBACK_DRIVE_PCT);
+  const playbackTurnPct = Number(current.playbackTurnPct ?? DEMO_PLAYBACK_TURN_PCT);
+  const playbackSpeedMps = Number(current.playbackSpeedMps ?? DEMO_PLAYBACK_SPEED_MPS);
+  const playbackTurnRateDegPerS = Number(current.playbackTurnRateDegPerS ?? DEMO_PLAYBACK_TURN_RATE_DEG_PER_S);
+  const playbackStopMs = Number(current.playbackStopMs ?? DEMO_PLAYBACK_STOP_MS);
+  const playbackSettleMs = Number(current.playbackSettleMs ?? DEMO_PLAYBACK_SETTLE_MS);
+  const playbackMinSegmentM = Number(current.playbackMinSegmentM ?? DEMO_PLAYBACK_MIN_SEGMENT_M);
+  const playbackMinTurnDeg = Number(current.playbackMinTurnDeg ?? DEMO_PLAYBACK_MIN_TURN_DEG);
 
   return {
     laneWidthM: Number.isFinite(laneWidthM) && laneWidthM > 0 ? laneWidthM : 3.0,
@@ -925,6 +957,14 @@ function getDemoConfig() {
     obstacleSidestepCm: Number.isFinite(obstacleSidestepCm) && obstacleSidestepCm > 0 ? obstacleSidestepCm : DEMO_OBSTACLE_SIDESTEP_CM,
     obstacleCooldownMs: Number.isFinite(obstacleCooldownMs) && obstacleCooldownMs >= 0 ? obstacleCooldownMs : DEMO_OBSTACLE_COOLDOWN_MS,
     obstacleSidestepMs: Number.isFinite(obstacleSidestepMs) && obstacleSidestepMs > 0 ? obstacleSidestepMs : DEMO_OBSTACLE_SIDESTEP_MS,
+    playbackDrivePct: Number.isFinite(playbackDrivePct) ? clampNumber(Math.round(playbackDrivePct), 20, 100) : DEMO_PLAYBACK_DRIVE_PCT,
+    playbackTurnPct: Number.isFinite(playbackTurnPct) ? clampNumber(Math.round(playbackTurnPct), 20, 100) : DEMO_PLAYBACK_TURN_PCT,
+    playbackSpeedMps: Number.isFinite(playbackSpeedMps) && playbackSpeedMps > 0 ? playbackSpeedMps : DEMO_PLAYBACK_SPEED_MPS,
+    playbackTurnRateDegPerS: Number.isFinite(playbackTurnRateDegPerS) && playbackTurnRateDegPerS > 0 ? playbackTurnRateDegPerS : DEMO_PLAYBACK_TURN_RATE_DEG_PER_S,
+    playbackStopMs: Number.isFinite(playbackStopMs) && playbackStopMs >= 0 ? Math.round(playbackStopMs) : DEMO_PLAYBACK_STOP_MS,
+    playbackSettleMs: Number.isFinite(playbackSettleMs) && playbackSettleMs >= 0 ? Math.round(playbackSettleMs) : DEMO_PLAYBACK_SETTLE_MS,
+    playbackMinSegmentM: Number.isFinite(playbackMinSegmentM) && playbackMinSegmentM > 0 ? playbackMinSegmentM : DEMO_PLAYBACK_MIN_SEGMENT_M,
+    playbackMinTurnDeg: Number.isFinite(playbackMinTurnDeg) && playbackMinTurnDeg >= 0 ? playbackMinTurnDeg : DEMO_PLAYBACK_MIN_TURN_DEG,
   };
 }
 
@@ -2170,6 +2210,7 @@ function buildSupervisionSummary() {
       spots: state.demo?.spots ?? { start: null, end: null },
       spotGpsStatus: getDemoSpotStatuses(),
       obstacle: state.demo?.obstacle ?? null,
+      playback: state.demo?.playback ?? null,
       readiness: demoReadiness,
       diagnostics: {
         missionState: currentMissionState(),
@@ -2576,6 +2617,23 @@ function arbitrateCommand(cmd) {
 }
 
 function syncMissionToCommand(cmd) {
+  if (state.demo?.playback?.active && (
+    cmd === CMD.PAUSE
+    || cmd === CMD.STOP
+    || cmd === CMD.ESTOP
+    || cmd === CMD.RESET
+    || cmd === CMD.MANUAL
+    || DRIVE_COMMANDS.has(cmd)
+  )) {
+    stopDemoPlayback(`Interrupted by ${cmd}`, {
+      sendStop: cmd !== CMD.STOP,
+      finalizeMission: false,
+      source: `command.${String(cmd).toLowerCase()}`,
+    }).catch((error) => {
+      console.warn('[DEMO] failed to stop playback after command interrupt:', error?.message ?? error);
+    });
+  }
+
   if (cmd === CMD.ESTOP) {
     if (mission.isActive()) {
       try {
@@ -2698,6 +2756,16 @@ async function waitForRobotState(expectedState, options = {}) {
 }
 
 function setDemoMode(enabled, source = 'operator', configPatch = null) {
+  if (!enabled && state.demo?.playback?.active) {
+    stopDemoPlayback('Demo mode disabled', {
+      sendStop: true,
+      finalizeMission: false,
+      source: 'demo-mode.disable',
+    }).catch((error) => {
+      console.warn('[DEMO] failed to stop playback while disabling demo mode:', error?.message ?? error);
+    });
+  }
+
   const currentConfig = getDemoConfig();
   const mergedConfig = configPatch && typeof configPatch === 'object'
     ? {
@@ -2918,6 +2986,319 @@ function buildIndoorDemoSnakePath(geometry, options = {}) {
       laneWidthM: geometry.laneWidthM,
     },
   };
+}
+
+function normalizeHeadingDegrees(value) {
+  if (!Number.isFinite(Number(value))) return null;
+  const normalized = Number(value) % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function shortestHeadingDeltaDeg(fromDeg, toDeg) {
+  const from = normalizeHeadingDegrees(fromDeg);
+  const to = normalizeHeadingDegrees(toDeg);
+  if (from == null || to == null) return 0;
+  let delta = to - from;
+  if (delta > 180) delta -= 360;
+  if (delta < -180) delta += 360;
+  return delta;
+}
+
+// Demo playback converts a waypoint polyline into timed manual-drive actions.
+// This is intentionally simple and explainable so we can tune it in the field
+// without introducing another opaque navigation stack on the server.
+function createDemoPlaybackSnapshot(patch = {}) {
+  const previous = state.demo?.playback ?? {};
+  return {
+    active: Boolean(patch.active ?? previous.active ?? false),
+    runId: Number(patch.runId ?? previous.runId ?? 0) || 0,
+    status: patch.status ?? previous.status ?? 'idle',
+    startedAt: Number(patch.startedAt ?? previous.startedAt ?? 0) || 0,
+    finishedAt: Number(patch.finishedAt ?? previous.finishedAt ?? 0) || 0,
+    completedSteps: Number(patch.completedSteps ?? previous.completedSteps ?? 0) || 0,
+    totalSteps: Number(patch.totalSteps ?? previous.totalSteps ?? 0) || 0,
+    currentStep: patch.currentStep === undefined ? (previous.currentStep ?? null) : patch.currentStep,
+    reason: patch.reason === undefined ? (previous.reason ?? null) : patch.reason,
+    source: patch.source === undefined ? (previous.source ?? null) : patch.source,
+    plan: patch.plan === undefined ? (previous.plan ?? null) : patch.plan,
+  };
+}
+
+function setDemoPlaybackState(patch = {}, saveReason = null) {
+  state.demo = {
+    ...state.demo,
+    playback: createDemoPlaybackSnapshot(patch),
+  };
+  publishSupervision();
+  publishOperator();
+  if (saveReason) {
+    scheduleRuntimeStateSave(saveReason, { immediate: true });
+  }
+  return state.demo.playback;
+}
+
+function buildDemoPlaybackPlan(points = state.lastPath, options = {}) {
+  if (!Array.isArray(points) || points.length < 2) {
+    return { ok: false, reason: 'Build a demo path with at least two points first.' };
+  }
+
+  const origin = normalizeLatLonPoint(state.baseStation ?? state.homePoint ?? points[0], points[0]);
+  if (!origin) {
+    return { ok: false, reason: 'Demo playback could not determine a local origin.' };
+  }
+
+  const config = getDemoConfig();
+  const drivePct = clampNumber(Math.round(coerceFiniteNumber(options.drivePct, config.playbackDrivePct, DEMO_PLAYBACK_DRIVE_PCT) ?? DEMO_PLAYBACK_DRIVE_PCT), 20, 100);
+  const turnPct = clampNumber(Math.round(coerceFiniteNumber(options.turnPct, config.playbackTurnPct, DEMO_PLAYBACK_TURN_PCT) ?? DEMO_PLAYBACK_TURN_PCT), 20, 100);
+  const speedMps = Math.max(0.05, coerceFiniteNumber(options.speedMps, config.playbackSpeedMps, DEMO_PLAYBACK_SPEED_MPS) ?? DEMO_PLAYBACK_SPEED_MPS);
+  const turnRateDegPerS = Math.max(10, coerceFiniteNumber(options.turnRateDegPerS, config.playbackTurnRateDegPerS, DEMO_PLAYBACK_TURN_RATE_DEG_PER_S) ?? DEMO_PLAYBACK_TURN_RATE_DEG_PER_S);
+  const stopMs = Math.max(0, Math.round(coerceFiniteNumber(options.stopMs, config.playbackStopMs, DEMO_PLAYBACK_STOP_MS) ?? DEMO_PLAYBACK_STOP_MS));
+  const settleMs = Math.max(0, Math.round(coerceFiniteNumber(options.settleMs, config.playbackSettleMs, DEMO_PLAYBACK_SETTLE_MS) ?? DEMO_PLAYBACK_SETTLE_MS));
+  const minSegmentM = Math.max(0.05, coerceFiniteNumber(options.minSegmentM, config.playbackMinSegmentM, DEMO_PLAYBACK_MIN_SEGMENT_M) ?? DEMO_PLAYBACK_MIN_SEGMENT_M);
+  const minTurnDeg = Math.max(0, coerceFiniteNumber(options.minTurnDeg, config.playbackMinTurnDeg, DEMO_PLAYBACK_MIN_TURN_DEG) ?? DEMO_PLAYBACK_MIN_TURN_DEG);
+
+  const localPoints = points.map((point) => ({
+    point,
+    local: latLonToLocal(point, origin),
+  }));
+
+  const actions = [];
+  let currentHeading = normalizeHeadingDegrees(state.robot?.heading);
+  let segmentCount = 0;
+  let turnCount = 0;
+  let totalDistanceM = 0;
+
+  for (let i = 1; i < localPoints.length; i++) {
+    const previous = localPoints[i - 1];
+    const current = localPoints[i];
+    const dx = current.local.x - previous.local.x;
+    const dy = current.local.y - previous.local.y;
+    const distanceM = Math.hypot(dx, dy);
+    if (!Number.isFinite(distanceM) || distanceM < minSegmentM) {
+      continue;
+    }
+
+    const targetHeading = normalizeHeadingDegrees((Math.atan2(dy, dx) * 180) / Math.PI);
+    const turnDeltaDeg = currentHeading == null ? 0 : shortestHeadingDeltaDeg(currentHeading, targetHeading);
+
+    if (Math.abs(turnDeltaDeg) >= minTurnDeg) {
+      // Turn first, then force a stop pulse so the next forward segment begins
+      // from a clean state even on simple motor controllers.
+      const turnDurationMs = Math.max(80, Math.round((Math.abs(turnDeltaDeg) / turnRateDegPerS) * 1000));
+      actions.push({
+        kind: 'turn',
+        command: turnDeltaDeg >= 0 ? CMD.LEFT : CMD.RIGHT,
+        powerPct: turnPct,
+        durationMs: turnDurationMs,
+        headingDeltaDeg: Number(turnDeltaDeg.toFixed(1)),
+        targetHeadingDeg: Number(targetHeading.toFixed(1)),
+      });
+      if (stopMs > 0) {
+        actions.push({
+          kind: 'stop',
+          command: CMD.STOP,
+          durationMs: stopMs,
+          reason: 'turn_settle',
+        });
+      }
+      turnCount += 1;
+    }
+
+    const driveDurationMs = Math.max(120, Math.round((distanceM / speedMps) * 1000));
+    actions.push({
+      kind: 'drive',
+      command: CMD.FORWARD,
+      powerPct: drivePct,
+      durationMs: driveDurationMs,
+      distanceM: Number(distanceM.toFixed(2)),
+      headingDeg: Number(targetHeading.toFixed(1)),
+      segmentIndex: segmentCount,
+    });
+    if (stopMs > 0) {
+      actions.push({
+        kind: 'stop',
+        command: CMD.STOP,
+        durationMs: stopMs,
+        reason: 'segment_complete',
+      });
+    }
+
+    currentHeading = targetHeading;
+    segmentCount += 1;
+    totalDistanceM += distanceM;
+  }
+
+  if (!actions.length) {
+    return { ok: false, reason: 'Demo path is too short to generate timed playback commands.' };
+  }
+
+  return {
+    ok: true,
+    actions,
+    meta: {
+      segmentCount,
+      turnCount,
+      totalDistanceM: Number(totalDistanceM.toFixed(2)),
+      estimatedDurationMs: actions.reduce((sum, action) => sum + Math.max(0, Number(action.durationMs) || 0), 0) + settleMs,
+      drivePct,
+      turnPct,
+      speedMps,
+      turnRateDegPerS,
+      stopMs,
+      settleMs,
+      minSegmentM,
+      minTurnDeg,
+    },
+  };
+}
+
+async function stopDemoPlayback(reason = 'stopped', options = {}) {
+  const { sendStop = true, finalizeMission = false, source = 'demo.playback.stop' } = options;
+  const playback = state.demo?.playback ?? null;
+  if (!playback?.active) {
+    return { ok: true, active: false };
+  }
+
+  activeDemoPlaybackRunId = Math.max(activeDemoPlaybackRunId, Number(playback.runId ?? 0)) + 1;
+  // Bumping the run id invalidates any in-flight async loop without needing a
+  // separate cancellation token object.
+  setDemoPlaybackState({
+    active: false,
+    status: finalizeMission ? 'completed' : 'stopped',
+    finishedAt: Date.now(),
+    currentStep: null,
+    reason,
+  }, 'demo.playback.stop');
+
+  if (sendStop) {
+    await dispatchCommand(CMD.STOP, {
+      syncMission: false,
+      source,
+      waitForAck: false,
+      waitForState: false,
+    });
+  }
+
+  if (finalizeMission && currentMissionState() === MISSION_STATE.RUNNING) {
+    await completeMissionAction(source);
+  }
+
+  return { ok: true, active: true };
+}
+
+function launchDemoPlayback(plan, source = 'demo-mode.run') {
+  const runId = activeDemoPlaybackRunId + 1;
+  activeDemoPlaybackRunId = runId;
+  const startedAt = Date.now();
+  setDemoPlaybackState({
+    active: true,
+    runId,
+    status: 'starting',
+    startedAt,
+    finishedAt: 0,
+    completedSteps: 0,
+    totalSteps: plan.actions.length,
+    currentStep: null,
+    reason: null,
+    source,
+    plan: plan.meta,
+  }, 'demo.playback.start');
+
+  const missionState = currentMissionState();
+  const runner = (async () => {
+    try {
+      const manual = await dispatchCommand(CMD.MANUAL, {
+        syncMission: false,
+        source: `${source}.manual`,
+        waitForAck: false,
+        waitForState: false,
+      });
+      if (!manual.ok) {
+        throw new Error(manual.error ?? 'Failed to enter MANUAL mode for demo playback.');
+      }
+
+      if (missionState === MISSION_STATE.PAUSED) {
+        mission.resume();
+      } else {
+        mission.start();
+      }
+
+      setDemoPlaybackState({
+        active: true,
+        runId,
+        status: 'running',
+        startedAt,
+      }, 'demo.playback.running');
+
+      if (plan.meta.settleMs > 0) {
+        await sleep(plan.meta.settleMs);
+      }
+
+      for (let index = 0; index < plan.actions.length; index++) {
+        if (activeDemoPlaybackRunId !== runId) {
+          return;
+        }
+        if (!state.demo?.enabled || currentMissionState() !== MISSION_STATE.RUNNING) {
+          throw new Error('Demo playback was interrupted before completion.');
+        }
+
+        const action = plan.actions[index];
+        // Expose the current step to the UI so operators can see what the
+        // scripted demo runner thinks it is doing right now.
+        setDemoPlaybackState({
+          active: true,
+          runId,
+          status: 'running',
+          currentStep: {
+            index,
+            kind: action.kind,
+            command: action.command,
+            durationMs: action.durationMs,
+          },
+          completedSteps: index,
+        });
+
+        const dispatched = await dispatchCommand(action.command, {
+          syncMission: false,
+          source: `${source}.${action.kind}.${index}`,
+          waitForAck: false,
+          waitForState: false,
+        });
+        if (!dispatched.ok) {
+          throw new Error(dispatched.error ?? `Failed to send ${action.command}`);
+        }
+
+        if (action.durationMs > 0) {
+          await sleep(action.durationMs);
+        }
+      }
+
+      if (activeDemoPlaybackRunId !== runId) {
+        return;
+      }
+
+      await stopDemoPlayback('completed', {
+        sendStop: true,
+        finalizeMission: true,
+        source: `${source}.complete`,
+      });
+    } catch (error) {
+      if (activeDemoPlaybackRunId !== runId) {
+        return;
+      }
+      await stopDemoPlayback(error?.message ?? 'Demo playback failed', {
+        sendStop: true,
+        finalizeMission: false,
+        source: `${source}.error`,
+      });
+    }
+  })();
+
+  runner.catch((error) => {
+    console.error('[DEMO] playback crash:', error?.message ?? error);
+  });
+
+  return state.demo.playback;
 }
 
 function configureActiveArea(baseStation, boundary, cellSizeM, homePoint = null) {
@@ -5002,6 +5383,12 @@ app.post(API.DEMO_PATH, requireApp, async (req, res) => {
   state.coverage = buildCoverageMap(geometry.boundary, cellPlan.effectiveCellSizeM);
   const coverageSummary = coverageStats(state.coverage);
 
+  await stopDemoPlayback('Demo path rebuilt', {
+    sendStop: true,
+    finalizeMission: false,
+    source: 'demo-mode.path.rebuild',
+  });
+
   bridge.resetWpState();
   if (mission.isActive()) {
     const activeMissionState = mission.publicMission()?.state;
@@ -5185,6 +5572,12 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
   }
 
   try {
+    await stopDemoPlayback('Demo run restarted', {
+      sendStop: true,
+      finalizeMission: false,
+      source: 'demo-mode.run.restart',
+    });
+
     const pushed = await pushPathWaypoints(state.lastPath, 'demo-mode.run', { allowWhenDemo: true });
     if (!pushed.ok) {
       return res.status(pushed.status ?? 500).json({
@@ -5195,61 +5588,18 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
       });
     }
 
-    const preferRemoteDemoQueue = getRemoteCommandFallbackReadiness().ok && !bridge.getStatus().baseStation?.statusOk;
-    let demoOn = preferRemoteDemoQueue
-      ? queueDispatchedRemoteCommand({
-          commandId: createCommandId(),
-          cmd: 'DEMOON',
-          wireCommand: 'DEMOON',
-          source: 'demo-mode.run',
-          syncMission: false,
-        })
-      : await bridge.sendCommand('DEMOON', {
-          waitForAck: false,
-          commandId: createCommandId(),
-          commandSource: 'demo-mode.run',
-        });
-
-    if (!demoOn.ok && !preferRemoteDemoQueue) {
-      const remoteFallbackAfterFailure = getRemoteCommandFallbackReadiness();
-      if (remoteFallbackAfterFailure.ok && !bridge.getStatus().baseStation?.statusOk) {
-        demoOn = queueDispatchedRemoteCommand({
-          commandId: createCommandId(),
-          cmd: 'DEMOON',
-          wireCommand: 'DEMOON',
-          source: 'demo-mode.run',
-          syncMission: false,
-        });
-      }
-    }
-
-    if (!demoOn.ok) {
-      return res.status(demoOn.status ?? 500).json({
+    const plan = buildDemoPlaybackPlan(state.lastPath, req.body ?? {});
+    if (!plan.ok) {
+      return res.status(400).json({
         ok: false,
-        error: demoOn.error ?? 'Failed to enable indoor demo mode on robot',
+        error: plan.reason ?? 'Unable to build a demo playback plan',
         readiness: resolveDemoReadiness(),
         lora: bridge.getStatus(),
       });
     }
 
-    const auto = await dispatchCommand(CMD.AUTO, {
-      syncMission: false,
-      source: 'demo-mode.run',
-      waitForAck: false,
-      waitForState: false,
-    });
-    if (!auto.ok) {
-      return res.status(auto.status ?? 500).json({
-        ok: false,
-        error: auto.error ?? 'Failed to send AUTO',
-        readiness: resolveDemoReadiness(),
-        lora: bridge.getStatus(),
-      });
-    }
-
-    const current = missionState === MISSION_STATE.PAUSED
-      ? mission.resume()
-      : mission.start();
+    const playback = launchDemoPlayback(plan, 'demo-mode.run');
+    const current = mission.publicMission();
 
     state.automation = {
       ...state.automation,
@@ -5274,7 +5624,11 @@ app.post(API.DEMO_RUN, requireApp, async (req, res) => {
         mode: 'demo-indoor-snake',
         pointCount: state.lastPath.length,
       },
-      commands: ['WPCLEAR/WPLOAD', 'DEMOON', 'AUTO'],
+      playback: {
+        ...playback,
+        plan: plan.meta,
+      },
+      commands: ['WPCLEAR/WPLOAD', 'MANUAL', 'LEFT/RIGHT', 'FORWARD', 'STOP'],
     });
   } catch (err) {
     return res.status(500).json({

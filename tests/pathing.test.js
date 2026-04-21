@@ -1,3 +1,10 @@
+/**
+ * pathing.test.js
+ *
+ * Focused geometry/path-planning regression tests. These cases intentionally
+ * use tiny synthetic maps so failures point to planner logic rather than
+ * external transport or runtime state.
+ */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
@@ -18,6 +25,8 @@ function createRectBoundary(origin, widthM, heightM) {
 }
 
 function createRotatedRectBoundary(origin, widthM, heightM, angleDeg) {
+  // Build the shape in local meters first, then convert back to lat/lon so the
+  // test can control geometry precisely without relying on map imports.
   const angle = (angleDeg * Math.PI) / 180;
   const cos = Math.cos(angle);
   const sin = Math.sin(angle);

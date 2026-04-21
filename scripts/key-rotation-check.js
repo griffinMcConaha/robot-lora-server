@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 'use strict';
 
+/**
+ * key-rotation-check.js
+ *
+ * Verifies the expected overlap/revocation behavior during API-key rotation.
+ * This keeps auth cutovers repeatable instead of relying on ad hoc curl checks.
+ */
+
 const args = new Set(process.argv.slice(2));
 const EXPECT_OLD_REVOKED = args.has('--expect-old-revoked');
 
@@ -37,6 +44,8 @@ function assert(condition, message) {
 }
 
 async function verifyKeyWorks(label, key) {
+  // Metrics is a strict auth check, while health also proves the backend is
+  // reachable enough to answer real requests after the rotation.
   const metrics = await call('/api/metrics', key);
   assert(metrics.status === 200 && metrics.body?.ok, `${label} key failed /api/metrics auth (status ${metrics.status})`);
 

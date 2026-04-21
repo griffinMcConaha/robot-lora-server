@@ -30,6 +30,8 @@ const db = new Database(DB_PATH);
 // Enable WAL mode for better concurrent read performance
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// Missions store some structured fields as JSON text. That keeps the schema
+// simple while still letting higher layers persist the full boundary payload.
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -138,6 +140,9 @@ const stmts = {
     SELECT 1 as ok
   `),
 };
+
+// Prepared statements are defined once so hot paths such as telemetry updates
+// and event logging avoid reparsing SQL on every call.
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -281,6 +286,8 @@ function ping() {
 // Internal helpers
 // ---------------------------------------------------------------------------
 function _parseMissionRow(row) {
+  // Rows are normalized at the DB boundary so the rest of the app can work
+  // with plain JS objects instead of raw SQLite JSON strings.
   return {
     ...row,
     base_station: row.base_station ? JSON.parse(row.base_station) : null,
