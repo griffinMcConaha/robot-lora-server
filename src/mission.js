@@ -1,5 +1,5 @@
 /**
- * mission.js — Phase B: mission lifecycle state machine
+ * mission.js
  *
  * Owns the authoritative in-memory mission record and exposes clean
  * transition methods.  All transitions are validated against
