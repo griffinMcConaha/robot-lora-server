@@ -1,5 +1,5 @@
 /**
- * contracts.js — Phase A + C: frozen message contracts + IDs/sequences
+ * contracts.js
  *
  * Single source of truth for every token, event name, field name, and
  * protocol constant shared across the full robot stack:
