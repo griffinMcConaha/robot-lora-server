@@ -1,5 +1,5 @@
 /**
- * lora_bridge.js  —  Phase C
+ * lora_bridge.js
  *
  * Outbound command path: server → base station (ESP32) → LoRa → STM32.
  *
