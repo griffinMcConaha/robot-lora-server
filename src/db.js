@@ -1,5 +1,5 @@
 /**
- * db.js — Phase B: SQLite persistence layer
+ * db.js
  *
  * Manages two tables:
  *   missions   — one row per mission lifecycle (start → end)
